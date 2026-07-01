@@ -101,7 +101,16 @@ class MusicScanner:
         self._scan_time: Optional[float] = None
         self._auto_scan_task: Optional["asyncio.Task"] = None  # type: ignore
         self._auto_scan_interval: int = 0  # 0 = 禁用
-        self._lock = threading.Lock()
+        # 使用 asyncio.Lock 避免在 async 函数中阻塞事件循环
+        # 延迟初始化：asyncio.Lock() 需在事件循环内创建
+        self._lock: Optional[asyncio.Lock] = None
+        self._thread_lock = threading.Lock()  # 仅用于 _songs 列表的同步访问保护
+
+    def _get_async_lock(self) -> asyncio.Lock:
+        """获取 asyncio.Lock（惰性初始化，确保在事件循环内创建）"""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def _load_cache(self) -> bool:
         """从缓存文件加载歌曲列表。成功返回 True"""
@@ -139,7 +148,7 @@ class MusicScanner:
 
     async def scan(self) -> list[dict]:
         """扫描音乐目录，返回歌曲列表"""
-        with self._lock:
+        async with self._get_async_lock():
             songs: list[dict] = []
             root = Path(self._music_path)
 
@@ -268,7 +277,7 @@ class MusicScanner:
 
     async def scan_new(self, filepaths: list[str]) -> int:
         """增量扫描指定路径，将新文件合并到现有缓存"""
-        with self._lock:
+        async with self._get_async_lock():
             root = Path(self._music_path)
             new_songs = []
             existing_paths = {s["filepath"] for s in self._songs}

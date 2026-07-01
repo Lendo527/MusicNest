@@ -200,8 +200,8 @@ async def search(
     stype = type_map.get(search_type, 1)
     # 逐个网关尝试，直到返回的结果匹配关键词
     import time as _time
-    stype = type_map.get(search_type, 1)
-    
+
+    res_data = None
     for base_url in NETEASE_API_BASE_URLS:
         result = await _netease_request(
             "/cloudsearch",
@@ -216,19 +216,21 @@ async def search(
             timeout=timeout,
             base_url_override=base_url,
         )
-        
+
         if result.get("code") == 200:
             res_data = result.get("result", {})
             songs = res_data.get("songs", []) if search_type == "music" else []
-            
+
             # 校验：歌曲搜索结果的第一首歌标题是否包含关键词
             if songs and search_type == "music":
                 first_title = songs[0].get("name", "")
                 if keyword.lower() not in first_title.lower():
                     logger.warning("[Netease] 网关 %s 返回结果不匹配('%s'≠'%s')，尝试下一个",
                                    base_url, keyword, first_title[:20])
+                    # 重置 res_data 以便继续尝试下一个网关
+                    res_data = None
                     continue
-            
+
             logger.info("[Netease] 搜索 '%s' → %s 返回 %d 条, 首条: %s",
                          keyword, base_url, len(songs),
                          songs[0].get("name", "?") if songs else "(无)")
@@ -236,6 +238,9 @@ async def search(
     else:
         # 所有网关都失败或无匹配结果
         logger.warning("[Netease] 所有网关搜索 '%s' 均失败或无匹配结果", keyword)
+        return []
+
+    if not res_data:
         return []
 
     # 根据搜索类型解析不同字段

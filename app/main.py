@@ -70,11 +70,29 @@ logger = logging.getLogger("musicnest")
 
 # ===== 调试日志 =====
 _DEBUG_LOG_PATH = "/data/debug.log"
+_debug_fh: Optional[logging.FileHandler] = None
 
 def _setup_debug_logging():
-    """设置调试日志文件，输出所有 DEBUG 级别日志"""
+    """设置调试日志文件，输出所有 DEBUG 级别日志
+
+    幂等：重复调用不会重复添加 handler，避免日志重复输出。
+    """
+    global _debug_fh
+    root = logging.getLogger()
+
+    # 如果已存在 handler，先移除（避免重复添加 + 支持重新配置）
+    if _debug_fh is not None:
+        try:
+            root.removeHandler(_debug_fh)
+            _debug_fh.close()
+        except Exception:
+            pass
+        _debug_fh = None
+
     if not config.get("debug_logging", True):
+        logger.info("[DebugLog] 调试日志已关闭")
         return
+
     try:
         fh = logging.FileHandler(_DEBUG_LOG_PATH, mode="a", encoding="utf-8")
         fh.setLevel(logging.DEBUG)
@@ -83,14 +101,21 @@ def _setup_debug_logging():
             datefmt="%Y-%m-%d %H:%M:%S"
         ))
         # 给 root logger 添加文件 handler（捕获所有模块的日志）
-        root = logging.getLogger()
         root.addHandler(fh)
+        _debug_fh = fh
         # 设置所有 musicnest 相关 logger 到 DEBUG 级别
         for name in ["musicnest", "musicnest.voice", "musicnest.monitor",
                       "musicnest.player", "musicnest.miot", "musicnest.kuwo",
                       "musicnest.kuwo.search", "musicnest.kuwo.format",
-                      "musicnest.auth", "musicnest.config"]:
+                      "musicnest.auth", "musicnest.config", "musicnest.netease",
+                      "musicnest.token_refresh", "musicnest.download"]:
             logging.getLogger(name).setLevel(logging.DEBUG)
+        # 确保第三方库的 ERROR 级别日志也能被捕获（web 端报错的关键来源）
+        # 设置 propagate=True 使 uvicorn/fastapi 日志传播到 root logger（写入 debug.log）
+        for name in ["uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"]:
+            lg = logging.getLogger(name)
+            lg.setLevel(logging.INFO)
+            lg.propagate = True
         logger.info("[DebugLog] 调试日志已启用: %s", _DEBUG_LOG_PATH)
     except Exception as e:
         logger.warning("[DebugLog] 调试日志设置失败: %s", e)
@@ -117,6 +142,32 @@ app = FastAPI(title="MusicNest", version="0.0.28")
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+
+# ===== 全局异常处理（确保未捕获异常也输出到 debug.log） =====
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    """捕获所有未处理的异常，记录到 debug.log 并返回 500"""
+    logger.error(f"[Unhandled] {request.method} {request.url.path} 异常: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"code": 1, "msg": f"服务器内部错误: {exc}"},
+    )
+
+
+@app.middleware("http")
+async def _log_http_errors(request: Request, call_next):
+    """记录所有 5xx 响应到 debug.log，便于排查 web 端报错"""
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        # call_next 抛出的异常（已被 exception_handler 捕获的不会到这里，这里兜底）
+        logger.error(f"[HTTP] {request.method} {request.url.path} 中间件异常: {exc}", exc_info=True)
+        raise
+    if response.status_code >= 500:
+        logger.error(f"[HTTP] {request.method} {request.url.path} → {response.status_code}")
+    return response
 
 
 # ===== 播放状态（全局） =====
@@ -316,7 +367,10 @@ def _restore_alarms():
     for alarm in alarms:
         if not alarm.get("enabled", True):
             continue
-        aid = alarm["id"]
+        aid = alarm.get("id")
+        if not aid:
+            logger.warning(f"[Alarm] 跳过无 id 的闹钟配置: {alarm}")
+            continue
         hour = alarm.get("hour", 8)
         minute = alarm.get("minute", 0)
         days = alarm.get("days", [])
@@ -353,7 +407,8 @@ def _init_voice_engine() -> None:
                     if cmd_type in _default_params:
                         cmd.param = _default_params[cmd_type]
                 commands.append(cmd)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[VoiceCmd] 跳过格式错误的指令配置: {item}, err={e}")
                 continue
         if commands:
             # 确保 play_song 包含 "播放" 关键词
@@ -863,13 +918,28 @@ def _parse_timer_minutes(query: str) -> Optional[int]:
 
 
 def _parse_alarm_from_query(query: str) -> Optional[tuple[int, int, Optional[str]]]:
-    """从语音文本中解析闹钟时间，如 '每天早上8点播放' -> (8, 0, None)"""
+    """从语音文本中解析闹钟时间，如 '每天早上8点播放' -> (8, 0, None)
+
+    支持 12 小时制：下午/晚上 X 点 → hour + 12（13~23 点）。
+    中午 X 点视为 12 点（中午12点 = 12:00，中午1点 = 13:00）。
+    """
+    # 检测时段修饰词
+    period_match = re.search(r'(早上|上午|中午|下午|晚上|傍晚|清晨)', query)
+    period = period_match.group(1) if period_match else ""
+
     # 模式: 每天早上X点Y分播放 或 X点Y分播放XXX
-    m = re.search(r'每[天日](?:早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*(?:播放|放)(?:歌曲?\s*)?(.+)?', query)
+    m = re.search(r'每[天日](?:早上|上午|中午|下午|晚上|傍晚|清晨)?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*(?:播放|放)(?:歌曲?\s*)?(.+)?', query)
     if m:
         hour = int(m.group(1))
         minute = int(m.group(2)) if m.group(2) else 0
         song = m.group(3).strip() if m.group(3) else None
+        # 时段转换
+        if period in ("下午", "晚上", "傍晚") and 1 <= hour <= 11:
+            hour += 12
+        elif period == "中午" and hour == 12:
+            hour = 12  # 中午12点 = 12:00
+        elif period == "中午" and 1 <= hour <= 11:
+            hour += 12  # 中午1点 = 13:00
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return (hour, minute, song)
     # 简单模式: X点播放
@@ -877,6 +947,13 @@ def _parse_alarm_from_query(query: str) -> Optional[tuple[int, int, Optional[str
     if m:
         hour = int(m.group(1))
         minute = int(m.group(2)) if m.group(2) else 0
+        # 时段转换
+        if period in ("下午", "晚上", "傍晚") and 1 <= hour <= 11:
+            hour += 12
+        elif period == "中午" and hour == 12:
+            hour = 12
+        elif period == "中午" and 1 <= hour <= 11:
+            hour += 12
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return (hour, minute, None)
     return None
@@ -888,6 +965,17 @@ def _parse_alarm_from_query(query: str) -> Optional[tuple[int, int, Optional[str
 async def lifespan(app: FastAPI):
     """应用启动/关闭"""
     logger.info("musicnest 启动中...")
+
+    # uvicorn 启动时会重新配置日志（dictConfig），可能覆盖我们在 _setup_debug_logging
+    # 中设置的 propagate。此处重新确保 uvicorn/fastapi logger 传播到 root logger，
+    # 使其错误日志也能写入 debug.log 文件。
+    if config.get("debug_logging", True) and _debug_fh is not None:
+        for name in ["uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"]:
+            lg = logging.getLogger(name)
+            lg.propagate = True
+            if not lg.handlers:
+                lg.setLevel(logging.INFO)
+        logger.debug("[DebugLog] 已重新应用 uvicorn/fastapi 日志 propagate 设置")
 
     # 初始化语音引擎
     _init_voice_engine()
@@ -1155,6 +1243,7 @@ async def api_devices() -> dict:
     except ValueError:
         return {"code": 1, "msg": "未配置小米账号", "data": []}
     except Exception as e:
+        logger.error(f"[API] /api/devices 获取设备列表失败: {e}", exc_info=True)
         return {"code": 1, "msg": str(e), "data": []}
 
 
@@ -1415,6 +1504,7 @@ async def api_music_proxy(url_hash: str) -> Response:
 
         return StreamingResponse(_stream_and_close(), media_type=media_type)
     except Exception as e:
+        logger.error(f"[API] /api/music/proxy 代理音频流失败: {e}", exc_info=True)
         await client.aclose()
         return JSONResponse({"code": 1, "msg": str(e)}, status_code=502)
 
@@ -1568,14 +1658,18 @@ _AUDIO_EXTS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".wma", ".aac"}
 
 
 def _is_safe_path(path: str) -> bool:
-    """校验路径是否在音乐库目录下，防止误删系统文件"""
+    """校验路径是否在音乐库目录下，防止误删系统文件
+
+    使用 Path.is_relative_to() 替代字符串前缀匹配，
+    避免 /music_evil 这类前缀攻击绕过校验。
+    """
     if not path:
         return False
     try:
         music_root = Path(config.get("music_path", "/music")).resolve()
         target = Path(path).resolve()
-        # 检查 target 是否在 music_root 下
-        return str(target).startswith(str(music_root))
+        # is_relative_to 在 Python 3.9+ 可用，正确判断父子目录关系
+        return target.is_relative_to(music_root)
     except Exception:
         return False
 
@@ -1745,6 +1839,7 @@ async def api_device_play(body: dict) -> dict:
         ok = await client.play_url(device_id, url)
         return {"code": 0, "data": {"success": ok, "api": "play_url"}}
     except Exception as e:
+        logger.error(f"[API] /api/device/play 播放失败: {e}", exc_info=True)
         return {"code": 1, "msg": str(e)}
 
 
@@ -1781,6 +1876,7 @@ async def api_device_control(body: dict) -> dict:
 
         return {"code": 0, "data": {"success": ok}}
     except Exception as e:
+        logger.error(f"[API] /api/device/control 控制失败(action={body.get('action', '?')}): {e}", exc_info=True)
         return {"code": 1, "msg": str(e)}
 
 
@@ -2034,6 +2130,7 @@ async def api_player_toggle_play(body: dict) -> dict:
 
         return {"code": 0, "data": play_state.get_state_dict()}
     except Exception as e:
+        logger.error(f"[API] /api/player/toggle_play 切换播放失败: {e}", exc_info=True)
         return {"code": 1, "msg": str(e)}
 
 
@@ -2159,7 +2256,8 @@ async def api_player_progress() -> dict:
                     final_duration = int(sd)
 
         return {"code": 0, "data": {"position": position, "duration": final_duration}}
-    except Exception:
+    except Exception as e:
+        logger.error(f"[API] /api/player/progress 获取进度失败: {e}", exc_info=True)
         return {"code": 0, "data": {"position": 0, "duration": play_state.duration}}
 
 
@@ -2174,6 +2272,7 @@ async def api_player_seek(body: dict) -> dict:
         ok = await client.seek(play_state.device_id, position)
         return {"code": 0, "data": {"success": ok}}
     except Exception as e:
+        logger.error(f"[API] /api/player/seek 跳转失败: {e}", exc_info=True)
         return {"code": 1, "msg": str(e)}
 
 
@@ -2193,6 +2292,7 @@ async def api_player_volume(body: dict) -> dict:
             play_state.volume = volume
         return {"code": 0, "data": {"success": ok}}
     except Exception as e:
+        logger.error(f"[API] /api/player/volume 设置音量失败: {e}", exc_info=True)
         return {"code": 1, "msg": str(e)}
 
 
