@@ -334,7 +334,8 @@ class MusicScanner:
 
     def remove_song(self, index: int) -> Optional[dict]:
         """移除指定索引的歌曲并保存缓存"""
-        with self._lock:
+        # 注意：self._lock 是 asyncio.Lock（不能用于同步 with），同步操作用 _thread_lock
+        with self._thread_lock:
             if 0 <= index < len(self._songs):
                 removed = self._songs.pop(index)
                 self._save_cache()

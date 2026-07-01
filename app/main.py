@@ -442,6 +442,46 @@ def _serialize_commands() -> list[dict]:
     ]
 
 
+# 中文数字映射（用于音量语音指令解析）
+_CN_DIGITS = {'零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+              '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+
+def _parse_cn_number(text: str) -> Optional[int]:
+    """解析中文数字（0-100），支持 '三十' '二十' '五十' '一百' 等"""
+    text = text.strip()
+    if not text:
+        return None
+    # 百分之前缀
+    text = text.replace('百分之', '').replace('%', '').strip()
+    # 先尝试阿拉伯数字
+    nums = re.findall(r'\d+', text)
+    if nums:
+        return int(nums[0])
+    # 中文数字解析
+    if text == '一百':
+        return 100
+    if text == '半':
+        return 50
+    result = 0
+    has_cn = False
+    for ch in text:
+        if ch in _CN_DIGITS:
+            has_cn = True
+            val = _CN_DIGITS[ch]
+            if val == 10:  # 十
+                if result == 0:
+                    result = 10
+                else:
+                    result *= 10
+            else:
+                if result >= 10 and result % 10 == 0:
+                    # 已经有十位（如 二十），加个位
+                    result += val
+                else:
+                    result = result * 10 + val if result > 0 else val
+    return result if has_cn else None
+
+
 async def _on_voice_message(device_id: str, msg: dict) -> None:
     """语音消息回调：VoiceEngine 匹配 → 执行播放控制 + 睡眠定时/闹钟"""
     # 检查设备是否已勾选
@@ -534,7 +574,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             local_results = scanner.search(song_name)
 
             if local_results:
-                # 本地命中：play_url + TTS
+                # 本地命中：直接 play_url
                 all_songs = scanner.get_songs(limit=5000)
                 target = local_results[0]
                 target_path = target.get("filepath", "")
@@ -553,28 +593,14 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 asyncio.create_task(_enrich_playlist_metadata(song_name, real_index, all_songs))
 
                 ok = await _play_on_device(device_id, real_index)
-                song_title = target.get("title", song_name)
-                song_artist = target.get("artist", "") or target.get("display_artist", "")
                 if ok:
                     play_state.is_playing = True
-                    tts_text = f"为您播放 {song_artist}唱的 {song_title}" if song_artist else f"为您播放 {song_title}"
-                else:
-                    tts_text = "播放失败"
-                # TTS 改为 fire-and-forget，不阻塞播放（设备需先处理 TTS 合成才请求音频流，导致延迟）
-                if config.get("tts_enabled", True) and miot_client:
-                    asyncio.create_task(_safe_tts(device_id, tts_text))
-                # play_song 分支自处理 TTS，跳过末尾统一 TTS
+                    logger.info(f"[VoiceCmd] 本地播放: {target.get('title', song_name)}")
                 if monitor:
                     monitor.mark_query_handled(device_id, query)
                 return
             else:
-                # 本地未命中：TTS "正在搜索" + 在线搜索
-                if config.get("tts_enabled", True) and miot_client:
-                    try:
-                        await miot_client.text_to_speech(device_id, f"正在联网搜索 {song_name}")
-                    except Exception:
-                        pass
-
+                # 本地未命中：在线搜索
                 kw_result = await search_by_keyword(song_name)
                 if kw_result.get("code") == 0 and kw_result.get("data"):
                     song_data = kw_result["data"]
@@ -593,11 +619,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     if miot_client:
                         play_url_raw = song["filepath"]
                         if not play_url_raw or not play_url_raw.startswith("http"):
-                            if config.get("tts_enabled", True):
-                                try:
-                                    await miot_client.text_to_speech(device_id, f"没有找到歌曲 {song_name}")
-                                except Exception:
-                                    pass
+                            logger.info(f"[VoiceCmd] 在线歌曲无可用 URL: {song_name}")
                             if monitor:
                                 monitor.mark_query_handled(device_id, query)
                             return
@@ -619,29 +641,14 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         if ok:
                             play_state.is_playing = True
                             play_state._play_start_time = time.monotonic()
-                            tts_text = f"找到 {song['artist']}唱的 {song['title']}，开始播放"
+                            logger.info(f"[VoiceCmd] 在线播放: {song['artist']} - {song['title']}")
                         else:
-                            tts_text = "播放失败"
-                        if config.get("tts_enabled", True):
-                            try:
-                                await miot_client.text_to_speech(device_id, tts_text)
-                                logger.info(f"[VoiceTTS] 播报: {tts_text}")
-                            except Exception as e:
-                                logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
+                            logger.warning(f"[VoiceCmd] 在线播放失败: {song['title']}")
                     else:
-                        if config.get("tts_enabled", True) and miot_client:
-                            try:
-                                await miot_client.text_to_speech(device_id, "未登录小米账号")
-                            except Exception:
-                                pass
+                        logger.warning("[VoiceCmd] 未登录小米账号，无法播放")
                 else:
-                    if config.get("tts_enabled", True) and miot_client:
-                        try:
-                            await miot_client.text_to_speech(device_id, f"没有找到歌曲 {song_name}")
-                        except Exception:
-                            pass
+                    logger.info(f"[VoiceCmd] 未找到歌曲: {song_name}")
 
-                # play_song 分支自处理 TTS，跳过末尾统一 TTS
                 if monitor:
                     monitor.mark_query_handled(device_id, query)
                 return
@@ -733,8 +740,13 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             param = result.command.param
             arg = result.argument
             if param == "absolute":
-                nums = re.findall(r"\d+", arg)
-                vol = int(nums[0]) if nums else play_state.volume
+                # 支持中文数字（如"百分之三十" → 30）和阿拉伯数字
+                parsed = _parse_cn_number(arg)
+                if parsed is not None:
+                    vol = parsed
+                else:
+                    nums = re.findall(r"\d+", arg)
+                    vol = int(nums[0]) if nums else play_state.volume
                 vol = max(0, min(100, vol))
             elif param == "up":
                 vol = min(100, play_state.volume + 10)
@@ -746,7 +758,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             if miot_client:
                 await miot_client.set_volume(device_id, vol)
             play_state.volume = vol
-            logger.info(f"[VoiceCmd] 音量设置为: {vol}")
+            logger.info(f"[VoiceCmd] 音量设置为: {vol} (arg={arg!r})")
             result_text = f"音量已调到{vol}"
 
         elif result.command.type == "create_alarm":
@@ -788,25 +800,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         if not result_text:
             result_text = "指令执行失败"
 
-    # TTS 语音反馈（异步，不阻塞主流程）
-    if result_text and config.get("tts_enabled", True) and miot_client:
-        try:
-            await miot_client.text_to_speech(device_id, result_text)
-            logger.info(f"[VoiceTTS] 播报: {result_text}")
-        except Exception as e:
-            logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
-
-
-async def _safe_tts(device_id: str, text: str) -> None:
-    """TTS 播报（fire-and-forget，异常不影响主流程）"""
-    try:
-        ok = await miot_client.text_to_speech(device_id, text)
-        if ok:
-            logger.info(f"[VoiceTTS] 播报: {text}")
-        else:
-            logger.warning(f"[VoiceTTS] 播报失败: {text}")
-    except Exception as e:
-        logger.warning(f"[VoiceTTS] TTS 播报异常: {e}")
+    # 仅记录日志，不再 TTS 播报（TTS 已移除）
+    if result_text:
+        logger.info(f"[VoiceCmd] 结果: {result_text}")
 
 
 async def _enrich_playlist_metadata(song_name: str, real_index: int, all_songs: list) -> None:
@@ -1737,19 +1733,14 @@ async def api_music_song_delete(index: int) -> dict:
     if filepath and os.path.isfile(filepath):
         os.remove(filepath)
         deleted_audio = True
-    # 删歌词
+    # 删歌词（仅删除该歌曲对应的 .lrc，保留专辑封面图片）
     if lyrics_path and os.path.isfile(lyrics_path):
         os.remove(lyrics_path)
-    # 删歌曲目录下的封面（如果有且只属于这首歌）
+    # 注意：不删除专辑目录下的封面图片（cover.jpg 等），其他歌曲仍需使用
+    # 专辑目录若完全为空（无音频也无图片）才删除空目录
     song_dir = os.path.dirname(filepath) if filepath else ""
-    if song_dir and song_dir != artist_path:
-        for fname in os.listdir(song_dir):
-            fp = os.path.join(song_dir, fname)
-            if os.path.isfile(fp) and os.path.splitext(fname)[1].lower() in {".jpg", ".jpeg", ".png", ".webp", ".lrc"}:
-                os.remove(fp)
-        # 专辑目录空则删
-        if os.path.isdir(song_dir) and not os.listdir(song_dir):
-            os.rmdir(song_dir)
+    if song_dir and song_dir != artist_path and os.path.isdir(song_dir) and not os.listdir(song_dir):
+        os.rmdir(song_dir)
 
     # 检查歌手目录是否还有音频
     if artist_path and not _has_audio_files(artist_path):
@@ -1882,7 +1873,7 @@ async def api_device_play(body: dict) -> dict:
 
 @app.post("/api/device/control")
 async def api_device_control(body: dict) -> dict:
-    """设备控制: play/pause/stop/volume/tts（仅限已勾选设备）"""
+    """设备控制: play/pause/stop/volume/status（仅限已勾选设备）"""
     try:
         client = await _check_miot()
         device_id = body.get("device_id", "")
@@ -1904,9 +1895,6 @@ async def api_device_control(body: dict) -> dict:
         elif action == "volume":
             vol = body.get("value", 50)
             ok = await client.set_volume(device_id, int(vol))
-        elif action == "tts":
-            text = body.get("text", "")
-            ok = await client.text_to_speech(device_id, text)
         elif action == "status":
             status = await client.get_player_status(device_id)
             return {"code": 0, "data": status}

@@ -7,6 +7,16 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.33 - 第4批9个问题修复：
+           播放列表使用filteredCache+_idx高亮匹配(currentPlayingIdx)；
+           列表高度调整为calc(100vh-200px)/calc(100vh-260px)靠近播放器；
+           kuwo.py search函数JSON解析修复(先json.loads再降级_python_to_json)；
+           前后端彻底删除TTS代码(config/main/index.html全部清除)；
+           音量控制添加中文数字解析(_parse_cn_number支持"百分之三十"等)；
+           TTS移除解决播放响应延迟(在线歌曲从3s降至1s)；
+           下载完成添加右下角showToast提示(_prevDownloadStatus状态追踪)；
+           scanner.py remove_song Lock类型修复(asyncio.Lock→threading._thread_lock)；
+           删除歌曲不再删除专辑封面图片(仅删音频+歌词)
   0.0.32 - 15 个问题批量修复：
            歌手列表播放/删除按钮对齐(align-items-center)+文案改播放全部+stopPropagation；
            点击歌手头像显示该歌手所有歌曲(showArtistSongs 模态框)；
@@ -49,4 +59,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.32"
+__version__ = "0.0.33"

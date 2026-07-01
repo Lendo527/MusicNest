@@ -190,13 +190,17 @@ async def search(
         resp.raise_for_status()
         raw_text = resp.text
 
-        json_text = _python_to_json(raw_text)
-
+        # 优先按标准 JSON 解析（PC 端返回双引号标准 JSON）；
+        # 失败再降级用 _python_to_json 处理移动端单引号格式
         try:
-            data = json.loads(json_text)
+            data = json.loads(raw_text)
         except json.JSONDecodeError:
-            logger.error(f"[Kuwo] JSON解析失败: {json_text[:200]}")
-            return []
+            json_text = _python_to_json(raw_text)
+            try:
+                data = json.loads(json_text)
+            except json.JSONDecodeError:
+                logger.error(f"[Kuwo] JSON解析失败: {json_text[:200]}")
+                return []
 
         abslist = data.get("abslist")
         # 专辑搜索返回 albumlist 而非 abslist

@@ -717,7 +717,7 @@
                     <div class="card-body p-0">
                         <table class="table table-dark mb-0">
                             <thead>
-                                <tr><th>启用</th><th>设备</th><th>型号</th><th>状态</th><th style="width:80px">操作</th></tr>
+                                <tr><th>启用</th><th>设备</th><th>型号</th><th>状态</th></tr>
                             </thead>
                             <tbody id="deviceTableBody">
                                 <tr><td colspan="5" class="text-muted text-center">请先授权小米账号</td></tr>
@@ -768,7 +768,7 @@
                     </span>
                 </span>
             </div>
-            <div class="card-body p-0" style="max-height:calc(100vh - 280px);overflow-y:auto;will-change:transform;">
+            <div class="card-body p-0" style="max-height:calc(100vh - 200px);overflow-y:auto;will-change:transform;">
                 <table class="table table-dark mb-0" style="table-layout:fixed;">
                     <thead>
                         <tr>
@@ -803,7 +803,7 @@
                 </span>
                 <span id="albumListSearchSlot"></span>
             </div>
-            <div class="card-body p-0">
+            <div class="card-body p-0" style="max-height:calc(100vh - 200px);overflow-y:auto;">
                 <div id="albumGridView" class="row row-cols-2 row-cols-md-3 row-cols-lg-5 row-cols-xl-5 g-3">
                     <!-- JS 动态渲染 -->
                 </div>
@@ -824,7 +824,7 @@
                 </span>
                 <span id="artistListSearchSlot"></span>
             </div>
-            <div class="card-body p-0">
+            <div class="card-body p-0" style="max-height:calc(100vh - 200px);overflow-y:auto;">
                 <div id="artistGridView" class="row row-cols-2 row-cols-md-3 row-cols-lg-5 row-cols-xl-5 g-3">
                 </div>
             </div>
@@ -920,10 +920,6 @@
                         启用调试日志
                         <span style="font-size:11px;color:#c8ccd4;margin-left:8px;">输出详细日志到 /data/debug.log，排查问题时开启</span>
                     </label>
-                </div>
-                <div class="form-check form-switch mb-3">
-                    <input class="form-check-input" type="checkbox" role="switch" id="cfgTtsEnabled" checked onchange="onConfigFieldChanged()">
-                    <label class="form-check-label" for="cfgTtsEnabled">启用 TTS 语音反馈</label>
                 </div>
                 <hr style="border-color:var(--border-color);">
                 <h6 class="text-white mb-2">音源绑定</h6>
@@ -1038,7 +1034,7 @@
             <div class="card-header d-flex justify-content-between align-items-center">
                 <span>搜索结果 <span class="text-info small" id="onlineResultCount"></span></span>
             </div>
-            <div class="card-body p-0" id="onlineScrollContainer" style="max-height:calc(100vh - 280px);overflow-y:auto;">
+            <div class="card-body p-0" id="onlineScrollContainer" style="max-height:calc(100vh - 200px);overflow-y:auto;">
                 <table class="table table-dark mb-0" style="table-layout:fixed;">
                     <thead>
                         <tr>
@@ -1082,7 +1078,7 @@
                 <small style="color:#aaa;" id="albumArtist"></small>
             </div>
                 </div>
-                <div class="card-body p-0" style="max-height:calc(100vh - 280px);overflow-y:auto;">
+                <div class="card-body p-0" style="max-height:calc(100vh - 200px);overflow-y:auto;">
                     <table class="table table-dark mb-0" style="table-layout:fixed;">
                         <thead><tr><th style="width:40px;">#</th><th>标题</th><th style="width:120px;">歌手</th><th style="width:60px;">音源</th><th style="width:90px;">音质</th><th style="width:60px;">操作</th></tr></thead>
                         <tbody id="albumTrackBody"></tbody>
@@ -1112,7 +1108,7 @@
             <button class="btn btn-sm btn-outline-danger ms-2" onclick="clearDownloadTasks()">清空已完成</button>
         </div>
         <div class="card-dark">
-            <div class="card-body p-0" style="max-height:500px;overflow-y:auto;">
+            <div class="card-body p-0" style="max-height:calc(100vh - 260px);overflow-y:auto;">
                 <table class="table table-dark mb-0">
                     <thead>
                         <tr>
@@ -1562,14 +1558,14 @@ async function logoutMiot() {
     });
     checkAuthStatus();
     document.getElementById('deviceTableBody').innerHTML =
-        '<tr><td colspan="5" class="text-muted text-center">请先授权小米账号</td></tr>';
+        '<tr><td colspan="4" class="text-muted text-center">请先授权小米账号</td></tr>';
 }
 
 async function refreshDevices() {
     const r = await api('/api/devices');
     const tb = document.getElementById('deviceTableBody');
     if (r.code !== 0 || !r.data || r.data.length === 0) {
-        tb.innerHTML = '<tr><td colspan="5" class="text-muted text-center">未发现设备</td></tr>';
+        tb.innerHTML = '<tr><td colspan="4" class="text-muted text-center">未发现设备</td></tr>';
         return;
     }
     tb.innerHTML = r.data.map(d => `
@@ -1586,11 +1582,6 @@ async function refreshDevices() {
             <td><strong>${escHtml(d.name)}</strong><br><small class="text-muted">${escHtml(d.deviceID?.slice(0,12))}...</small></td>
             <td><span class="badge bg-secondary">${escHtml(d.hardware || d.model || '-')}</span></td>
             <td><span class="badge ${d.presence === 'online' ? 'badge-online' : 'badge-offline'}">${d.presence || 'unknown'}</span></td>
-            <td>
-                <button class="btn btn-sm btn-outline-accent" onclick="testTTS('${d.deviceID}')" title="TTS测试">
-                    <i class="bi bi-volume-up"></i>
-                </button>
-            </td>
         </tr>
     `).join('');
 }
@@ -1607,17 +1598,6 @@ async function toggleDeviceSelect(cb) {
         alert('保存失败: ' + (r.msg || '未知错误'));
         cb.checked = !selected; // 回滚
     }
-}
-
-async function testTTS(deviceId) {
-    const text = prompt('输入 TTS 文字:', '你好，这是测试消息');
-    if (!text) return;
-    const r = await api('/api/device/control', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({device_id: deviceId, action: 'tts', text})
-    });
-    alert(r.code === 0 ? 'TTS 已发送' : '发送失败: ' + r.msg);
 }
 
 // ===== 音乐库 =====
@@ -2022,9 +2002,18 @@ async function playSong(index) {
     }
 
     try {
-        // 获取当前歌曲列表数据
-        const songsR = await api('/api/music/songs?limit=5000');
-        const songs = songsR.data?.songs || [];
+        // 使用当前显示的歌曲列表（filteredCache），而非全库
+        const songs = filteredCache || [];
+        if (songs.length === 0) {
+            alert('没有可播放的歌曲');
+            return;
+        }
+        // index 是库索引（_idx），需转换为在 filteredCache 中的位置
+        const playIndex = songs.findIndex(s => s._idx === index);
+        if (playIndex === -1) {
+            alert('歌曲不在当前列表中');
+            return;
+        }
 
         // 获取设备列表，找到第一个在线且已勾选的设备
         const devR = await api('/api/devices');
@@ -2040,12 +2029,12 @@ async function playSong(index) {
             return;
         }
 
-        // 调用播放器 API
+        // 调用播放器 API（songs 非空时整体替换播放列表）
         const r = await api('/api/player/play', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
-                song_index: index,
+                song_index: playIndex,
                 songs: songs,
                 device_id: targetDevice.deviceID
             })
@@ -2124,7 +2113,8 @@ let currentDuration = 0;
 let localPosition = 0;
 let localTimer = null;
 let apiStarted = false;  // API position 是否开始走了
-let currentPlayingIndex = null;  // 追踪当前播放歌曲索引，用于检测歌曲切换
+let currentPlayingIndex = null;  // 追踪当前播放歌曲在播放列表中的索引（用于检测歌曲切换）
+let currentPlayingIdx = null;    // 追踪当前播放歌曲在音乐库中的 _idx（用于高亮行匹配）
 function updatePlayerUI(state) {
     if (!state) return;
 
@@ -2136,10 +2126,19 @@ function updatePlayerUI(state) {
     }
 
     // 检测歌曲切换：仅在歌曲变化时重启进度轮询，避免每 5 秒重复重启
-    const songChanged = hasSong && state.current_index !== currentPlayingIndex;
-    if (hasSong) currentPlayingIndex = state.current_index;
-
     const song = state.song;
+    const songChanged = hasSong && state.current_index !== currentPlayingIndex;
+    if (hasSong) {
+        currentPlayingIndex = state.current_index;
+        // 更新高亮用的 _idx：优先用 song._idx，否则用 filepath 匹配
+        if (song && song._idx !== undefined && song._idx !== null) {
+            currentPlayingIdx = song._idx;
+        } else if (song && song.filepath && songsCache.length > 0) {
+            const matched = songsCache.find(s => s.filepath === song.filepath);
+            if (matched) currentPlayingIdx = matched._idx;
+        }
+    }
+
     const songTitle = hasSong ? (song ? (song.display_title || song.title || '未知歌曲') : '未知歌曲') : '音箱正在播放';
     document.getElementById('playerSongName').textContent = songTitle;
     document.getElementById('playerSongArtist').textContent = hasSong ? (song ? (song.display_artist || song.artist || '-') : '-') : '（非 MusicNest 发起的播放）';
@@ -2197,8 +2196,8 @@ function highlightCurrentSong() {
     document.querySelectorAll('#songTableBody tr').forEach(tr => {
         tr.classList.remove('table-active');
     });
-    if (currentPlayingIndex !== null && currentPlayingIndex !== undefined) {
-        const row = document.getElementById('songRow_' + currentPlayingIndex);
+    if (currentPlayingIdx !== null && currentPlayingIdx !== undefined) {
+        const row = document.getElementById('songRow_' + currentPlayingIdx);
         if (row) row.classList.add('table-active');
     }
 }
@@ -2484,7 +2483,6 @@ async function loadConfig() {
         document.getElementById('cfgMonitorEnabled').checked = r.data.conversation_monitor_enabled || false;
         document.getElementById('cfgVoiceEnabled').checked = r.data.voice_engine_enabled !== false;
         document.getElementById('cfgDebugLogging').checked = r.data.debug_logging !== false;
-        document.getElementById('cfgTtsEnabled').checked = r.data.tts_enabled !== false;
         document.getElementById('cfgNeteaseCookie').value = r.data.netease_cookie || '';
         document.getElementById('cfgFlacPriority').checked = r.data.flac_priority !== false;
     }
@@ -2502,7 +2500,6 @@ async function saveConfig() {
         conversation_monitor_enabled: document.getElementById('cfgMonitorEnabled').checked,
         voice_engine_enabled: document.getElementById('cfgVoiceEnabled').checked,
         debug_logging: document.getElementById('cfgDebugLogging').checked,
-        tts_enabled: document.getElementById('cfgTtsEnabled').checked,
         netease_cookie: document.getElementById('cfgNeteaseCookie').value,
         flac_priority: document.getElementById('cfgFlacPriority').checked,
     };
@@ -2531,7 +2528,6 @@ function takeConfigSnapshot() {
         monitorEnabled: document.getElementById('cfgMonitorEnabled').checked,
         voiceEnabled: document.getElementById('cfgVoiceEnabled').checked,
         debugLogging: document.getElementById('cfgDebugLogging').checked,
-        ttsEnabled: document.getElementById('cfgTtsEnabled').checked,
         neteaseCookie: document.getElementById('cfgNeteaseCookie').value,
         flacPriority: document.getElementById('cfgFlacPriority').checked,
     };
@@ -2550,7 +2546,6 @@ function checkConfigChanged() {
         monitorEnabled: document.getElementById('cfgMonitorEnabled').checked,
         voiceEnabled: document.getElementById('cfgVoiceEnabled').checked,
         debugLogging: document.getElementById('cfgDebugLogging').checked,
-        ttsEnabled: document.getElementById('cfgTtsEnabled').checked,
         neteaseCookie: document.getElementById('cfgNeteaseCookie').value,
         flacPriority: document.getElementById('cfgFlacPriority').checked,
     };
@@ -2562,7 +2557,6 @@ function checkConfigChanged() {
         || cur.monitorEnabled !== snap.monitorEnabled
         || cur.voiceEnabled !== snap.voiceEnabled
         || cur.debugLogging !== snap.debugLogging
-        || cur.ttsEnabled !== snap.ttsEnabled
         || cur.neteaseCookie !== snap.neteaseCookie
         || cur.flacPriority !== snap.flacPriority;
     document.getElementById('btnSaveConfig').disabled = !changed;
@@ -3805,11 +3799,25 @@ function stopDownloadPolling() {
     if (downloadPollTimer) { clearInterval(downloadPollTimer); downloadPollTimer = null; }
 }
 
+// 下载任务状态追踪（用于检测任务完成并弹出提示）
+let _prevDownloadStatus = {}; // task_id -> previous status
+
 async function refreshDownloadTasks() {
     const r = await api('/api/download/tasks?status=' + downloadFilterStatus + '&limit=100');
     const data = r.data || {};
     const tasks = data.tasks || [];
     const stats = data.stats || {};
+
+    // 检测刚完成的任务（loading → success）并弹出提示
+    for (const t of tasks) {
+        const prev = _prevDownloadStatus[t.task_id];
+        if (prev === 'loading' && t.status === 'success') {
+            showToast(`下载完成: ${t.title}`);
+        } else if (prev === 'loading' && t.status === 'error') {
+            showToast(`下载失败: ${t.title}`);
+        }
+        _prevDownloadStatus[t.task_id] = t.status;
+    }
 
     document.getElementById('statDownloadWaiting').textContent = stats.waiting || 0;
     document.getElementById('statDownloadLoading').textContent = stats.loading || 0;
@@ -3991,7 +3999,6 @@ loadConfig = async function() {
     document.getElementById('cfgMonitorEnabled').checked = cfg.conversation_monitor_enabled || false;
     document.getElementById('cfgVoiceEnabled').checked = cfg.voice_engine_enabled !== false;
     document.getElementById('cfgDebugLogging').checked = cfg.debug_logging !== false;
-    document.getElementById('cfgTtsEnabled').checked = cfg.tts_enabled !== false;
     // 新增字段
     if (document.getElementById('cfgFlacPriority')) {
         document.getElementById('cfgFlacPriority').checked = (cfg.download && cfg.download.flac_priority !== false);
@@ -4013,7 +4020,6 @@ saveConfig = async function() {
         conversation_monitor_enabled: document.getElementById('cfgMonitorEnabled').checked,
         voice_engine_enabled: document.getElementById('cfgVoiceEnabled').checked,
         debug_logging: document.getElementById('cfgDebugLogging').checked,
-        tts_enabled: document.getElementById('cfgTtsEnabled').checked,
     };
     // 新增字段
     if (document.getElementById('cfgFlacPriority')) {
