@@ -7,6 +7,10 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.31 - TTS 修复：text_to_speech 优先使用 MiNA API TTS 端点
+           (/miv1/device/:id/text_to_speech)，失败回退 UBus player_play_tts；
+           之前只检查返回值 is not None，未检查 code 字段，设备返回错误码也报成功；
+           _safe_tts 根据 text_to_speech 返回值记录成功/失败日志
   0.0.30 - 前端 UI 优化 + 后端修复：
            在线下载搜索结果列表样式对齐音乐库(table-layout:fixed+垂直居中)；
            歌手详情页头像(onerror兜底+后端从PC端API获取)；
@@ -35,4 +39,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.30"
+__version__ = "0.0.31"

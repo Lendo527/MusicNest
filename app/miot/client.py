@@ -202,9 +202,44 @@ class MinaHTTPClient:
         return await self._ubus_request(device_id, "player_set_volume", "mediaplayer", message) is not None
 
     async def text_to_speech(self, device_id: str, text: str) -> bool:
-        """TTS 文字转语音"""
+        """TTS 文字转语音
+
+        优先使用 MiNA API 的 TTS 端点（/miv1/device/:id/text_to_speech），
+        失败时回退到 UBus player_play_tts 方法。
+        """
+        # 方式 1: MiNA API TTS 端点（POST JSON，大部分小爱音箱支持）
+        try:
+            url = f"{MINA_API_BASE}/miv1/device/{device_id}/text_to_speech"
+            headers = {
+                "User-Agent": self._user_agent,
+                "Content-Type": "application/json",
+                "Cookie": _build_cookies(self._user_id, self._service_token),
+            }
+            resp = await self._client.post(url, headers=headers, json={"text": text})
+            if resp.status_code == 401:
+                # 尝试刷新 token 后重试
+                if await self._try_refresh_token():
+                    headers["Cookie"] = _build_cookies(self._user_id, self._service_token)
+                    resp = await self._client.post(url, headers=headers, json={"text": text})
+            if resp.status_code == 200:
+                logger.info("[MIoT] TTS (MiNA) 成功: %s", text[:40])
+                return True
+            logger.warning("[MIoT] TTS (MiNA) 失败: status=%s body=%s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("[MIoT] TTS (MiNA) 异常: %s", e)
+
+        # 方式 2: UBus player_play_tts（部分设备支持）
         message = {"text": text}
-        return await self._ubus_request(device_id, "player_play_tts", "mediaplayer", message) is not None
+        result = await self._ubus_request(device_id, "player_play_tts", "mediaplayer", message)
+        if result is None:
+            logger.warning("[MIoT] TTS (UBus) 失败: 无响应")
+            return False
+        code = result.get("code", -1)
+        if code != 0:
+            logger.warning("[MIoT] TTS (UBus) 失败: code=%s data=%s", code, result.get("data", ""))
+            return False
+        logger.info("[MIoT] TTS (UBus) 成功: %s", text[:40])
+        return True
 
     async def get_player_status(self, device_id: str) -> Optional[dict]:
         """获取播放器状态"""

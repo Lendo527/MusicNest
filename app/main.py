@@ -798,10 +798,13 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
 async def _safe_tts(device_id: str, text: str) -> None:
     """TTS 播报（fire-and-forget，异常不影响主流程）"""
     try:
-        await miot_client.text_to_speech(device_id, text)
-        logger.info(f"[VoiceTTS] 播报: {text}")
+        ok = await miot_client.text_to_speech(device_id, text)
+        if ok:
+            logger.info(f"[VoiceTTS] 播报: {text}")
+        else:
+            logger.warning(f"[VoiceTTS] 播报失败: {text}")
     except Exception as e:
-        logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
+        logger.warning(f"[VoiceTTS] TTS 播报异常: {e}")
 
 
 async def _enrich_playlist_metadata(song_name: str, real_index: int, all_songs: list) -> None:
