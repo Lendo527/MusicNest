@@ -463,12 +463,16 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
         resp = await client.get(songs_url, timeout=httpx.Timeout(timeout))
         resp.raise_for_status()
 
-        json_text = _python_to_json(resp.text)
+        # PC 端 API 返回标准 JSON（双引号），直接解析；移动端返回 Python 风格（单引号）需 _python_to_json
         try:
-            data = json.loads(json_text)
+            data = json.loads(resp.text)
         except json.JSONDecodeError:
-            logger.error(f"[Kuwo] 歌手歌曲JSON解析失败")
-            return result
+            # 降级：尝试 Python 风格转 JSON
+            try:
+                data = json.loads(_python_to_json(resp.text))
+            except json.JSONDecodeError:
+                logger.error(f"[Kuwo] 歌手歌曲JSON解析失败")
+                return result
 
         # PC 端 artist 字段在顶层，musiclist 是歌曲列表
         result["name"] = (data.get("artist") or "").strip()
@@ -543,12 +547,15 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
         resp2 = await client.get(albums_url, timeout=httpx.Timeout(timeout))
         resp2.raise_for_status()
 
-        json_text2 = _python_to_json(resp2.text)
+        # PC 端标准 JSON，直接解析；降级用 _python_to_json
         try:
-            album_data = json.loads(json_text2)
+            album_data = json.loads(resp2.text)
         except json.JSONDecodeError:
-            logger.error(f"[Kuwo] 歌手专辑JSON解析失败")
-            return result
+            try:
+                album_data = json.loads(_python_to_json(resp2.text))
+            except json.JSONDecodeError:
+                logger.error(f"[Kuwo] 歌手专辑JSON解析失败")
+                return result
 
         # PC 端返回 albumlist，字段：albumid/name/artist/artistid/pic/pub
         album_list = album_data.get("albumlist", [])
@@ -621,12 +628,15 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
         resp = await client.get(songs_url, timeout=httpx.Timeout(timeout))
         resp.raise_for_status()
 
-        json_text = _python_to_json(resp.text)
+        # PC 端标准 JSON，直接解析；降级用 _python_to_json
         try:
-            data = json.loads(json_text)
+            data = json.loads(resp.text)
         except json.JSONDecodeError:
-            logger.error(f"[Kuwo] 专辑歌曲JSON解析失败")
-            return result
+            try:
+                data = json.loads(_python_to_json(resp.text))
+            except json.JSONDecodeError:
+                logger.error(f"[Kuwo] 专辑歌曲JSON解析失败")
+                return result
 
         # PC 端专辑元信息在顶层：name/artist/aartist/img/pic/albumid
         result["name"] = (data.get("name") or "").strip()

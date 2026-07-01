@@ -36,8 +36,8 @@ logger = logging.getLogger(__name__)
 # 默认轮询间隔（秒）— 200ms 平衡了响应速度和服务器压力
 DEFAULT_WATCH_INTERVAL = 0.2
 
-# "自己触发的播放"判定窗口（秒）— 3 秒
-OWN_PLAY_WINDOW_SEC = 3.0
+# "自己触发的播放"判定窗口（秒）— 10 秒（覆盖播放缓冲和切歌延迟，避免误判）
+OWN_PLAY_WINDOW_SEC = 10.0
 
 # 反查对话记录的窗口（秒）
 RECENT_QUERY_WINDOW_SEC = 5.0
@@ -234,31 +234,28 @@ class MediaWatcher:
             )
             return
 
-        # 检测到原生播放！
+        # 检测到原生播放！先反查对话记录，确认需要拦截才 stop（避免误杀自己的播放）
         self._device_states[device_id] = DevicePlayState.NATIVE_PLAYING
         logger.warning(
-            "[MediaWatcher] ⚠️ 检测到设备 %s 原生播放！立即拦截",
+            "[MediaWatcher] ⚠️ 检测到设备 %s 疑似原生播放，反查对话确认...",
             device_id[:12]
         )
 
-        # 1. 立即 stop（不等返回，fire-and-forget）
-        asyncio.create_task(self._client.stop_all_media(device_id))
-
-        # 2. 反查最近对话记录
+        # 1. 反查最近对话记录（先查，不立即 stop）
         recent_query = self._monitor.get_last_query(
             device_id, within_sec=RECENT_QUERY_WINDOW_SEC
         )
 
         if not recent_query:
-            # 没有最近的对话记录，可能是用户主动唤醒的，不干预
+            # 没有最近的对话记录，可能是用户主动唤醒的，不干预也不 stop
             logger.info(
-                "[MediaWatcher] 设备 %s 原生播放但无最近对话，视为用户主动唤醒，不触发拦截",
+                "[MediaWatcher] 设备 %s 原生播放但无最近对话，视为用户主动唤醒，不干预",
                 device_id[:12]
             )
             self._last_intercept_at[device_id] = now
             return
 
-        # 3. 检查是否已被轨道1 处理过
+        # 2. 检查是否已被轨道1 处理过
         if self._monitor.is_query_handled(device_id, recent_query):
             logger.info(
                 "[MediaWatcher] 设备 %s 原生播放，但 query %r 已被轨道1处理，跳过",
@@ -267,11 +264,14 @@ class MediaWatcher:
             self._last_intercept_at[device_id] = now
             return
 
-        # 4. 触发拦截回调
+        # 3. 确认需要拦截：立即 stop（此时才发出 stop 命令）
         logger.info(
-            "[MediaWatcher] 设备 %s 触发拦截回调: query=%r",
+            "[MediaWatcher] 设备 %s 确认拦截: query=%r",
             device_id[:12], recent_query[:80]
         )
+        asyncio.create_task(self._client.stop_all_media(device_id))
+
+        # 4. 触发拦截回调
         self._last_intercept_at[device_id] = now
         for name, cb in self._intercept_callbacks:
             try:
