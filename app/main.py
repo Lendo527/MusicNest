@@ -34,6 +34,7 @@ def _render_template(name: str, request: Request) -> HTMLResponse:
 
 
 from app.config import config
+from app.version import __version__
 from app.miot.auth import MiAuth, _generate_device_id
 from app.miot.client import MinaHTTPClient
 from app.miot.hardware import needs_music_api, needs_mp3
@@ -136,7 +137,7 @@ media_watcher: MediaWatcher | None = None
 scanner = MusicScanner(config.get("music_path", "/music"))
 voice_engine = VoiceEngine()
 
-app = FastAPI(title="MusicNest", version="0.0.28")
+app = FastAPI(title="MusicNest", version=__version__)
 
 # 静态文件（默认封面等）
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -1224,7 +1225,7 @@ async def api_status() -> dict:
         "monitor_running": monitor.is_running if monitor else False,
         "voice_engine_enabled": voice_engine.enabled,
         "voice_commands_count": len(voice_engine.commands),
-        "version": "0.1.0",
+        "version": __version__,
     }
 
 
