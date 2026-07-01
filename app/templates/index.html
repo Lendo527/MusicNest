@@ -4087,7 +4087,7 @@ async function renderArtistList() {
             + '<img src="' + coverUrl + '" style="width:80px;height:80px;border-radius:50%;object-fit:cover;margin:0 auto 8px;" onerror="this.src=\'/static/vinyl.svg\'">'
             + '<div style="font-size:14px;color:#fff;font-weight:500;">' + escHtml(a.name) + '</div>'
             + '<small class="text-muted">' + a.song_count + ' 首歌曲</small>'
-            + '<div class="mt-2"><button class="btn btn-sm btn-outline-danger" onclick="deleteArtist('' + encodeURIComponent(a.name) + '')"><i class="bi bi-trash"></i> 删除</button></div>'
+            + '<div class="mt-2"><button class="btn btn-sm btn-outline-danger" onclick="deleteArtist(\'' + encodeURIComponent(a.name) + '\')"><i class="bi bi-trash"></i> 删除</button></div>'
             + '</div></div>';
     }).join('');
 }

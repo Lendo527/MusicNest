@@ -16,8 +16,10 @@ DEFAULT_CONFIG = {
     "miot_device_id": "",
     "miot_ssecurity": "",
     "music_path": os.environ.get("MUSIC_PATH", "/music"),
-    "poll_interval": 0.5,
+    "poll_interval": 0.2,                       # 对话轮询间隔（轨道1）— 0.2s 快速捕获
     "conversation_monitor_enabled": False,
+    "media_watcher_enabled": True,              # 轨道2：播放状态高频轮询兜底
+    "media_watcher_interval": 0.2,              # 轨道2 轮询间隔（秒）
     "log_lines": 200,
     "auto_scan_interval": 0,
     "voice_engine_enabled": True,

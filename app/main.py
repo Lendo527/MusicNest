@@ -38,6 +38,7 @@ from app.miot.auth import MiAuth, _generate_device_id
 from app.miot.client import MinaHTTPClient
 from app.miot.hardware import needs_music_api, needs_mp3
 from app.engine.monitor import ConversationMonitor
+from app.engine.media_watcher import MediaWatcher
 from app.engine.voice import VoiceEngine, VoiceCommand, _default_commands
 from app.search.kuwo import search_by_keyword, search as kuwo_search
 from app.search.netease import (
@@ -106,10 +107,11 @@ else:
 miauth = MiAuth()
 miot_client: MinaHTTPClient | None = None
 monitor: ConversationMonitor | None = None
+media_watcher: MediaWatcher | None = None
 scanner = MusicScanner(config.get("music_path", "/music"))
 voice_engine = VoiceEngine()
 
-app = FastAPI(title="MusicNest", version="0.0.27")
+app = FastAPI(title="MusicNest", version="0.0.28")
 
 # 静态文件（默认封面等）
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -393,6 +395,12 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
     if not query:
         return
 
+    # 去重：如果该 query 已被处理过（轨道2 先拦截 → 轨道1 后到，或反之），跳过
+    # 时间窗口 5 秒，避免用户连续说两次相同指令被漏处理
+    if monitor and monitor.is_query_handled(device_id, query, within_sec=5.0):
+        logger.debug(f"[VoiceCmd] query 已被处理，跳过: device={device_id[:12]}... query={query[:40]!r}")
+        return
+
     # === 睡眠定时 / 闹钟 指令（正则匹配，优先级高于通用语音引擎） ===
     timer_minutes = _parse_timer_minutes(query)
     if timer_minutes is not None:
@@ -459,14 +467,16 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
 
     try:
         if result.command.type == "play_song":
-            # 先停掉音箱所有媒体通道，确保完全接管
+            # 立即 stop_all_media（fire-and-forget，不等返回）
+            # 这是"抢先劫持"的核心：尽快打断小爱原生播放
             if miot_client and device_id:
-                await miot_client.stop_all_media(device_id)
-            # 搜索本地歌曲并播放第一首
+                asyncio.create_task(miot_client.stop_all_media(device_id))
+
             song_name = result.argument or query
             local_results = scanner.search(song_name)
+
             if local_results:
-                # 映射到 scanner 全量列表中的真实索引（避免 URL 索引错位）
+                # 本地命中：play_url + TTS
                 all_songs = scanner.get_songs(limit=5000)
                 target = local_results[0]
                 target_path = target.get("filepath", "")
@@ -474,44 +484,42 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     (i for i, s in enumerate(all_songs) if s.get("filepath") == target_path), None
                 )
                 if real_index is None:
-                    # fallback: 直接播放第一个搜索结果
                     real_index = 0
                     play_state.playlist = list(local_results)
                 else:
-                    play_state.playlist = list(all_songs)  # 拷贝，不引用 scanner._songs
+                    play_state.playlist = list(all_songs)
                 play_state.current_index = real_index
                 play_state.device_id = device_id
-                
-                # 异步查询在线元数据（不阻塞播放）
-                try:
-                    kw_search = await search_by_keyword(song_name)
-                    if kw_search.get("code") == 0 and kw_search.get("data"):
-                        online = kw_search["data"]
-                        song_entry = all_songs[real_index] if real_index is not None and real_index < len(all_songs) else None
-                        if song_entry and real_index is not None and real_index < len(play_state.playlist):
-                            # 创建副本，不修改 scanner 缓存
-                            play_state.playlist[real_index] = dict(song_entry)
-                            enriched = play_state.playlist[real_index]
-                            # 用在线数据补充显示字段（不覆盖原文件路径）
-                            if online.get("cover_url"):
-                                enriched["cover_url"] = online["cover_url"]
-                            if online.get("artist"):
-                                enriched["display_artist"] = online["artist"]
-                            if online.get("title"):
-                                enriched["display_title"] = online["title"]
-                            logger.info(f"[VoiceCmd] 在线元数据已补充: title={online.get('title')} artist={online.get('artist')}")
-                except Exception as e:
-                    logger.debug(f"[VoiceCmd] 在线元数据查询失败: {e}")
-                
+
+                # 元数据查询改 fire-and-forget（不阻塞播放）
+                asyncio.create_task(_enrich_playlist_metadata(song_name, real_index, all_songs))
+
                 ok = await _play_on_device(device_id, real_index)
+                song_title = target.get("title", song_name)
+                song_artist = target.get("artist", "") or target.get("display_artist", "")
                 if ok:
                     play_state.is_playing = True
-                    song_title = target.get("title", song_name)
-                    result_text = f"正在播放《{song_title}》"
+                    tts_text = f"为您播放 {song_artist}唱的 {song_title}" if song_artist else f"为您播放 {song_title}"
                 else:
-                    result_text = "播放失败"
+                    tts_text = "播放失败"
+                if config.get("tts_enabled", True) and miot_client:
+                    try:
+                        await miot_client.text_to_speech(device_id, tts_text)
+                        logger.info(f"[VoiceTTS] 播报: {tts_text}")
+                    except Exception as e:
+                        logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
+                # play_song 分支自处理 TTS，跳过末尾统一 TTS
+                if monitor:
+                    monitor.mark_query_handled(device_id, query)
+                return
             else:
-                # 尝试在线搜索（酷我）
+                # 本地未命中：TTS "正在搜索" + 在线搜索
+                if config.get("tts_enabled", True) and miot_client:
+                    try:
+                        await miot_client.text_to_speech(device_id, f"正在联网搜索 {song_name}")
+                    except Exception:
+                        pass
+
                 kw_result = await search_by_keyword(song_name)
                 if kw_result.get("code") == 0 and kw_result.get("data"):
                     song_data = kw_result["data"]
@@ -528,22 +536,19 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     play_state.device_id = device_id
                     play_state.duration = int(song_data.get("duration", 0))
                     if miot_client:
-                        # 在线搜索成功，有 URL
                         play_url_raw = song["filepath"]
                         if not play_url_raw or not play_url_raw.startswith("http"):
-                            # URL 无效 → 仅 TTS 告知
-                            try:
-                                await miot_client.text_to_speech(device_id, f"没有找到歌曲《{song_name}》")
-                            except Exception:
-                                logger.debug("[VoiceCmd] TTS 失败: 找不到歌曲提示")
-                                pass
-                            result_text = f"未找到可播放的歌曲《{song_name}》"
+                            if config.get("tts_enabled", True):
+                                try:
+                                    await miot_client.text_to_speech(device_id, f"没有找到歌曲 {song_name}")
+                                except Exception:
+                                    pass
+                            if monitor:
+                                monitor.mark_query_handled(device_id, query)
                             return
 
                         server_host = config.get("server_host", "http://localhost:58092")
-                        # 通过 MusicNest 代理 KUWO 音频（带上 Referer/UA 头）
                         url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
-                        # LRU 防泄漏
                         _online_urls[url_hash] = play_url_raw
                         _online_urls.move_to_end(url_hash)
                         if len(_online_urls) > 1000:
@@ -551,7 +556,6 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
                         logger.info(f"[VoiceCmd] 在线歌曲代理: {play_url_raw[:60]}... -> /api/music/proxy/{url_hash}")
 
-                        # 播放代理 URL
                         hardware = await _get_device_hardware(device_id)
                         if needs_music_api(hardware):
                             ok = await miot_client.play_music_url(device_id, proxied_url)
@@ -560,19 +564,32 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         if ok:
                             play_state.is_playing = True
                             play_state._play_start_time = time.monotonic()
-                            # TTS 播报
-                            try:
-                                await miot_client.text_to_speech(device_id, f"开始播放{song['artist']}唱的{song['title']}")
-                            except Exception:
-                                logger.debug("[VoiceCmd] TTS 失败: 播放提示")
-                                pass
-                            result_text = f"正在播放《{song['title']}》"
+                            tts_text = f"找到 {song['artist']}唱的 {song['title']}，开始播放"
                         else:
-                            result_text = "播放失败"
+                            tts_text = "播放失败"
+                        if config.get("tts_enabled", True):
+                            try:
+                                await miot_client.text_to_speech(device_id, tts_text)
+                                logger.info(f"[VoiceTTS] 播报: {tts_text}")
+                            except Exception as e:
+                                logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
                     else:
-                        result_text = "未登录小米账号"
+                        if config.get("tts_enabled", True) and miot_client:
+                            try:
+                                await miot_client.text_to_speech(device_id, "未登录小米账号")
+                            except Exception:
+                                pass
                 else:
-                    result_text = f"未找到歌曲《{song_name}》"
+                    if config.get("tts_enabled", True) and miot_client:
+                        try:
+                            await miot_client.text_to_speech(device_id, f"没有找到歌曲 {song_name}")
+                        except Exception:
+                            pass
+
+                # play_song 分支自处理 TTS，跳过末尾统一 TTS
+                if monitor:
+                    monitor.mark_query_handled(device_id, query)
+                return
 
         elif result.command.type == "next":
             if miot_client and device_id:
@@ -723,6 +740,49 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             logger.info(f"[VoiceTTS] 播报: {result_text}")
         except Exception as e:
             logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
+
+
+async def _enrich_playlist_metadata(song_name: str, real_index: int, all_songs: list) -> None:
+    """后台补全播放列表中的在线元数据（fire-and-forget，不阻塞播放）
+
+    从酷我/网易云获取封面、歌手、标题等显示字段，写入 play_state.playlist[real_index]。
+    失败静默，不影响播放。
+    """
+    try:
+        kw_search = await search_by_keyword(song_name)
+        if kw_search.get("code") == 0 and kw_search.get("data"):
+            online = kw_search["data"]
+            if (real_index is not None
+                and real_index < len(all_songs)
+                and real_index < len(play_state.playlist)):
+                play_state.playlist[real_index] = dict(all_songs[real_index])
+                enriched = play_state.playlist[real_index]
+                if online.get("cover_url"):
+                    enriched["cover_url"] = online["cover_url"]
+                if online.get("artist"):
+                    enriched["display_artist"] = online["artist"]
+                if online.get("title"):
+                    enriched["display_title"] = online["title"]
+                logger.info(
+                    f"[VoiceCmd] 在线元数据已补充: title={online.get('title')} artist={online.get('artist')}"
+                )
+    except Exception as e:
+        logger.debug(f"[VoiceCmd] 在线元数据查询失败: {e}")
+
+
+async def _on_native_playback_intercept(device_id: str, query: Optional[str]) -> None:
+    """轨道2（media_watcher）检测到原生播放时的拦截回调
+
+    Args:
+        device_id: 设备 ID
+        query: 反查到的最近对话 query（可能为 None）
+    """
+    if not query:
+        return
+
+    # 复用 _on_voice_message 的逻辑
+    logger.info(f"[MediaWatcher] 触发拦截: device={device_id[:12]}... query={query!r}")
+    await _on_voice_message(device_id, {"query": query, "answer": ""})
 
 
 async def _smart_resume_playback(device_id: str, timeout: int = 30) -> None:
@@ -936,6 +996,8 @@ async def lifespan(app: FastAPI):
     _alarm_tasks.clear()
     if monitor:
         await monitor.stop()
+    if media_watcher:
+        await media_watcher.stop()
     if miot_client:
         await miot_client.close()
     await miauth.close()
@@ -960,11 +1022,11 @@ async def _init_miot_client(user_id: str, service_token: str) -> None:
 
 
 async def _start_monitor() -> None:
-    global monitor
+    global monitor, media_watcher
     if not miot_client:
         return
 
-    poll_interval = config.get("poll_interval", 0.5)
+    poll_interval = config.get("poll_interval", 0.2)
     monitor = ConversationMonitor(miot_client, poll_interval)
 
     # 注册日志回调
@@ -982,6 +1044,14 @@ async def _start_monitor() -> None:
     if devices:
         logger.info(f"发现 {len(devices)} 个设备，启动对话监控 (poll_interval={poll_interval}s)")
         await monitor.start(devices)
+
+        # 启动轨道2：媒体状态高频轮询（兜底机制）
+        if config.get("media_watcher_enabled", True):
+            watcher_interval = config.get("media_watcher_interval", 0.2)
+            media_watcher = MediaWatcher(miot_client, monitor, watcher_interval)
+            media_watcher.register_intercept_callback("voice", _on_native_playback_intercept)
+            await media_watcher.start(devices)
+            logger.info(f"[MediaWatcher] 轨道2 已启动 (interval={watcher_interval}s)")
     else:
         logger.warning("未发现设备，跳过对话监控")
 
@@ -1209,13 +1279,16 @@ async def api_devices_auth(body: dict) -> dict:
         # 停止 token 自动刷新
         from app.miot.token_refresh import stop_refresh_loop
         stop_refresh_loop()
-        global miot_client, monitor
+        global miot_client, monitor, media_watcher
         if miot_client:
             await miot_client.close()
             miot_client = None
         if monitor:
             await monitor.stop()
             monitor = None
+        if media_watcher:
+            await media_watcher.stop()
+            media_watcher = None
         return {"code": 0, "msg": "已登出"}
 
     return {"code": 1, "msg": f"未知操作: {action}"}

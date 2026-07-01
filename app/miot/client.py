@@ -1,5 +1,6 @@
 """小爱音箱 API 客户端 - 从 songloft-plugin-miot TS 移植"""
 
+import asyncio
 import json
 import logging
 import random
@@ -46,6 +47,17 @@ class MinaHTTPClient:
         self._client = httpx.AsyncClient(timeout=15.0)
         # 401 过期回调（由 token_refresh 模块注入）
         self._on_token_expired = None
+        # 最近一次 musicnest 自己触发的播放时间戳（供轨道2区分"自己触发"vs"小爱原生播放"）
+        # 在 play_url / play_music_url 成功后立即写入
+        self._last_own_play_at: float = 0.0
+
+    def mark_own_play(self) -> None:
+        """标记最近一次播放是 musicnest 自己触发的（供 media_watcher 判断）"""
+        self._last_own_play_at = time.time()
+
+    def is_own_play_recent(self, within_sec: float = 3.0) -> bool:
+        """检查最近 within_sec 秒内是否自己触发过播放"""
+        return (time.time() - self._last_own_play_at) < within_sec
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -91,7 +103,10 @@ class MinaHTTPClient:
         result = await self._ubus_request(device_id, "player_play_url", "mediaplayer", message)
         logger.info(f"[MIoT] play_url 响应: {str(result)[:200] if result else 'None'}")
         logger.debug("[MIoT] play_url 完整响应: %s", result)
-        return result is not None
+        ok = result is not None
+        if ok:
+            self.mark_own_play()  # 标记为 musicnest 自己触发的播放
+        return ok
 
     async def play_music_url(self, device_id: str, audio_url: str, keep_light: bool = False) -> bool:
         """通过 player_play_music 播放 URL（部分设备型号使用）"""
@@ -132,7 +147,10 @@ class MinaHTTPClient:
         logger.debug("[MIoT] play_music_url: device=%s audio_url=%s message=%s", device_id[:12], audio_url[:80], message)
         result = await self._ubus_request(device_id, "player_play_music", "mediaplayer", message)
         logger.debug("[MIoT] play_music_url 响应: %s", result)
-        return result is not None
+        ok = result is not None
+        if ok:
+            self.mark_own_play()  # 标记为 musicnest 自己触发的播放
+        return ok
 
     async def player_play(self, device_id: str) -> bool:
         """播放"""
@@ -151,25 +169,30 @@ class MinaHTTPClient:
         return await self._ubus_request(device_id, "player_play_operation", "mediaplayer", message) is not None
 
     async def stop_all_media(self, device_id: str) -> None:
-        """停止音箱所有媒体通道的播放"""
-        # 1. 先暂停主播放器
-        await self.player_pause(device_id)
-        # 2. 停止多种媒体类型（覆盖 app_ios、TTS、系统音、闹钟等通道）
-        for media_type in ["app_ios", "1", "2", ""]:
-            try:
-                await self._ubus_request(
-                    device_id, "player_play_operation", "mediaplayer",
-                    {"action": "stop", "media": media_type}
-                )
-            except Exception:
-                pass
-        # 3. 停止 TTS（如果有正在播的 TTS）
-        try:
-            await self._ubus_request(
+        """停止音箱所有媒体通道的播放（并发发送，最快停止）"""
+        tasks = [
+            self.player_pause(device_id),
+            self._ubus_request(
+                device_id, "player_play_operation", "mediaplayer",
+                {"action": "stop", "media": "app_ios"}
+            ),
+            self._ubus_request(
+                device_id, "player_play_operation", "mediaplayer",
+                {"action": "stop", "media": "1"}
+            ),
+            self._ubus_request(
+                device_id, "player_play_operation", "mediaplayer",
+                {"action": "stop", "media": "2"}
+            ),
+            self._ubus_request(
+                device_id, "player_play_operation", "mediaplayer",
+                {"action": "stop", "media": ""}
+            ),
+            self._ubus_request(
                 device_id, "player_play_tts", "mediaplayer", {"text": ""}
-            )
-        except Exception:
-            pass
+            ),
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.info(f"[MIoT] 已停止设备所有媒体通道: {device_id[:12]}...")
 
     async def set_volume(self, device_id: str, volume: int) -> bool:
