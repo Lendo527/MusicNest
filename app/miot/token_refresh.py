@@ -47,6 +47,11 @@ def register_client_callback(cb) -> None:
     _client_callbacks.append(cb)
 
 
+def clear_client_callbacks() -> None:
+    """清空所有 client 回调（重新初始化 client 时调用，避免旧回调累积）"""
+    _client_callbacks.clear()
+
+
 def start_refresh_loop(miauth: MiAuth) -> None:
     """启动 token 刷新定时任务"""
     global _refresh_task

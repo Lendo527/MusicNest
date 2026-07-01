@@ -473,9 +473,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                             cover_url=track.cover or "",
                             format_type=fmt,
                         )
-                        # 若任务已存在且处于 error/loading 状态，重置为 waiting（UPSERT 兜底）
-                        if added.status in ("error", "loading"):
-                            update_task_status(task_id, "waiting")
+                        # add_task 的 ON CONFLICT 已自动将 error/loading 状态重置为 waiting
                         record_sync(source, pl_id, track.id)
                         new_count += 1
                     except Exception as e:

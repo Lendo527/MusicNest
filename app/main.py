@@ -1056,6 +1056,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"定时扫描已启动: 每 {auto_scan} 分钟")
 
     # 首次启动自动扫描（检测曲库是否为空，避免空库）
+    _bg_scan_task: Optional[asyncio.Task] = None
     stats = scanner.get_stats()
     if stats["total_songs"] == 0:
         # 先尝试从缓存加载
@@ -1137,11 +1138,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     # 取消首次扫描后台任务
-    try:
-        _bg_scan_task
-    except NameError:
-        pass
-    else:
+    if _bg_scan_task is not None and not _bg_scan_task.done():
         _bg_scan_task.cancel()
         try:
             await _bg_scan_task
@@ -1162,6 +1159,12 @@ async def lifespan(app: FastAPI):
     if miot_client:
         await miot_client.close()
     await miauth.close()
+    # 关闭 kuwo 共享 httpx 客户端，避免连接池泄漏
+    try:
+        from app.search.kuwo import close_client as kuwo_close
+        await kuwo_close()
+    except Exception:
+        pass
     logger.info("musicnest 已停止")
 
 
@@ -1172,6 +1175,15 @@ app.router.lifespan_context = lifespan
 
 async def _init_miot_client(user_id: str, service_token: str) -> None:
     global miot_client
+    # 关闭旧 client（重新登录场景），避免 httpx 连接池泄漏和 callback 累积
+    if miot_client is not None:
+        try:
+            await miot_client.close()
+        except Exception:
+            pass
+    # 清空 token_refresh 中累积的旧回调，避免对新 client 重复调用
+    from app.miot.token_refresh import clear_client_callbacks
+    clear_client_callbacks()
     ssecurity = config.get("miot_ssecurity", "")
     device_id = config.get("miot_device_id", "")
     miot_client = MinaHTTPClient(user_id, service_token, device_id, ssecurity)
@@ -1630,7 +1642,20 @@ async def api_music_cover(song_index: int) -> Response:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=10)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                # 超时必须 kill 子进程，否则 ffmpeg 成为孤儿进程占用资源
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+                logger.warning(f"[Cover] ffmpeg 提取封面超时: {filepath}")
+                default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")
+                if os.path.isfile(default_svg):
+                    return FileResponse(default_svg, media_type="image/svg+xml")
+                return Response(status_code=404)
             if proc.returncode != 0 or not cache_path.exists():
                 # 无封面 → 返回默认黑胶唱片图
                 default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")

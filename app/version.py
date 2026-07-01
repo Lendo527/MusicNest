@@ -7,6 +7,14 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.37 - 手动深度审阅修复（跨模块联动一致性 + 修复后新引入问题）：
+           main: 封面提取ffmpeg超时未kill子进程(孤儿进程修复)；
+           main: _init_miot_client重新登录时关闭旧client(防httpx连接池泄漏)；
+           main: _init_miot_client清空token_refresh旧回调(防callback累积)；
+           main: lifespan shutdown调用kuwo.close_client()(防连接池泄漏)；
+           main: _bg_scan_task初始化为None(消除NameError隐患)；
+           worker: 移除add_task返回值死代码(ON CONFLICT已处理重置)；
+           token_refresh: 新增clear_client_callbacks()函数；
   0.0.36 - 全代码库深度审阅修复（CRITICAL 12 + HIGH 19 + MEDIUM 30+）：
            main: 流式转码finally加proc.kill()防僵尸进程；
            main: 删除歌曲改按filepath定位(消除误删风险)；
@@ -154,4 +162,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.36"
+__version__ = "0.0.37"
