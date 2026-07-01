@@ -12,7 +12,7 @@ venv/
 data/
 .oci_build/
 
-# Planning / Tracking
+# Planning / Tracking (local only, not in repo)
 .hermes/
 TRACKING.md
 PLAN.md
