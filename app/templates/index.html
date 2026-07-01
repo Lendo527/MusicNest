@@ -1268,7 +1268,7 @@
 <div id="playlistPanel" class="playlist-panel d-none">
   <div class="playlist-header d-flex justify-content-between align-items-center">
     <span>播放列表</span>
-    <span class="text-muted small" id="playlistCount"></span>
+    <span class="small" id="playlistCount" style="color:#b0b6c1;"></span>
   </div>
   <ul class="playlist-list" id="playlistItems"></ul>
 </div>
@@ -1605,10 +1605,10 @@ async function refreshMusicStats() {
     const r = await api('/api/music/stats');
     if (r.data && r.data.total_songs > 0) {
         document.getElementById('scanStatus').innerHTML = `
-            <div class="d-flex gap-4">
-                <span><strong class="text-primary">${r.data.total_songs}</strong> 首歌曲</span>
-                <span><strong class="text-success">${r.data.total_artists}</strong> 位艺术家</span>
-                <span><strong class="text-warning">${r.data.total_albums}</strong> 张专辑</span>
+            <div class="d-flex gap-4 align-items-center">
+                <span><strong style="font-size:1.1rem;color:var(--accent);">${r.data.total_songs}</strong> 首歌曲</span>
+                <span><strong style="font-size:1.1rem;color:var(--accent);">${r.data.total_artists}</strong> 位艺术家</span>
+                <span><strong style="font-size:1.1rem;color:var(--accent);">${r.data.total_albums}</strong> 张专辑</span>
                 ${r.data.last_scan ? `<span class="text-muted small">上次扫描: ${new Date(r.data.last_scan*1000).toLocaleString('zh-CN')}</span>` : ''}
             </div>
         `;
@@ -1634,7 +1634,7 @@ async function scanMusic() {
 async function loadSongList() {
     const r = await api('/api/music/songs?limit=5000');
     songsCache = (r.data?.songs || []).map((s, i) => ({...s, _idx: i}));
-    document.getElementById('songCount').textContent = `(共 ${r.data?.total || 0} 首)`;
+    document.getElementById('songCount').textContent = `共 ${r.data?.total || 0} 首`;
     document.getElementById('viewToggleGroup').style.display = songsCache.length > 0 ? '' : 'none';
     if (songsCache.length === 0) {
         document.getElementById('songTableBody').innerHTML = '<tr><td colspan="7" class="text-muted text-center">暂无歌曲</td></tr>';
@@ -2425,9 +2425,8 @@ async function refreshPlaylistPanel() {
     document.getElementById('playlistCount').textContent =
         state.playlist_length ? `共 ${state.playlist_length} 首` : '';
 
-    // 需要获取完整的歌单列表
-    const songsR = await api('/api/music/songs?limit=5000');
-    const songs = songsR.data?.songs || [];
+    // 使用 play_state 中的播放列表（而非全库歌曲），确保播放1首专辑时只显示1首
+    const songs = state.playlist || [];
     const currentIdx = state.current_index;
 
     if (songs.length === 0) {
@@ -3398,7 +3397,7 @@ function renderSongResults() {
     const container = document.getElementById('onlineSearchResults');
     const tb = document.getElementById('onlineSearchTableBody');
     container.classList.remove('d-none');
-    document.getElementById('onlineResultCount').textContent = '(' + onlineSearchResults.length + ' 个)';
+    document.getElementById('onlineResultCount').textContent = '共 ' + onlineSearchResults.length + ' 首';
 
     if (onlineSearchResults.length === 0) {
         tb.innerHTML = '<tr><td colspan="7" class="text-muted text-center">未找到歌曲</td></tr>';
@@ -3442,7 +3441,7 @@ function renderArtistResults() {
     const container = document.getElementById('onlineSearchResults');
     const tb = document.getElementById('onlineSearchTableBody');
     container.classList.remove('d-none');
-    document.getElementById('onlineResultCount').textContent = '(' + onlineSearchResults.length + ' 个)';
+    document.getElementById('onlineResultCount').textContent = '共 ' + onlineSearchResults.length + ' 个';
 
     if (onlineSearchResults.length === 0) {
         tb.innerHTML = '<tr><td colspan="7" class="text-muted text-center">未找到歌手</td></tr>';
@@ -3466,7 +3465,7 @@ function renderAlbumResults() {
     const container = document.getElementById('onlineSearchResults');
     const tb = document.getElementById('onlineSearchTableBody');
     container.classList.remove('d-none');
-    document.getElementById('onlineResultCount').textContent = '(' + onlineSearchResults.length + ' 个)';
+    document.getElementById('onlineResultCount').textContent = '共 ' + onlineSearchResults.length + ' 张';
 
     if (onlineSearchResults.length === 0) {
         tb.innerHTML = '<tr><td colspan="7" class="text-muted text-center">未找到专辑</td></tr>';
@@ -3900,11 +3899,11 @@ async function refreshPlaylistSync() {
     tb.innerHTML = playlists.map((pl, i) => {
         const sourceBadge = pl.source === 'netease' ? '<span class="badge bg-danger">网易云</span>' : '<span class="badge bg-secondary">' + escHtml(pl.source) + '</span>';
         return '<tr>' +
-            '<td>' + sourceBadge + '</td>' +
-            '<td><strong>' + escHtml(pl.name) + '</strong></td>' +
-            '<td>' + (pl.track_count || '?') + '</td>' +
-            '<td>' + (pl.synced_count || 0) + '</td>' +
-            '<td>' +
+            '<td style="vertical-align:middle;">' + sourceBadge + '</td>' +
+            '<td style="vertical-align:middle;"><strong>' + escHtml(pl.name) + '</strong></td>' +
+            '<td style="vertical-align:middle;">' + (pl.track_count || '?') + '</td>' +
+            '<td style="vertical-align:middle;">' + (pl.synced_count || 0) + '</td>' +
+            '<td style="vertical-align:middle;">' +
                 '<button class="btn btn-sm btn-accent me-1" onclick="syncPlaylistNow(' + i + ')"><i class="bi bi-arrow-repeat"></i> 同步</button>' +
                 '<button class="btn btn-sm btn-outline-danger" onclick="removePlaylistSync(' + i + ')"><i class="bi bi-trash"></i></button>' +
             '</td>' +

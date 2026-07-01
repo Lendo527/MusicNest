@@ -220,10 +220,16 @@ async def search(
         if result.get("code") == 200:
             res_data = result.get("result", {})
             songs = res_data.get("songs", []) if search_type == "music" else []
+            artists = res_data.get("artists", []) if search_type == "artist" else []
+            albums = res_data.get("albums", []) if search_type == "album" else []
+
+            # 各类型的结果列表
+            type_results = {"music": songs, "artist": artists, "album": albums}
+            current_results = type_results.get(search_type, [])
 
             # 校验：歌曲搜索结果的第一首歌标题是否包含关键词
-            if songs and search_type == "music":
-                first_title = songs[0].get("name", "")
+            if current_results and search_type == "music":
+                first_title = current_results[0].get("name", "")
                 if keyword.lower() not in first_title.lower():
                     logger.warning("[Netease] 网关 %s 返回结果不匹配('%s'≠'%s')，尝试下一个",
                                    base_url, keyword, first_title[:20])
@@ -231,9 +237,16 @@ async def search(
                     res_data = None
                     continue
 
+            # 0 结果时继续尝试下一个网关（而非直接 break）
+            if not current_results:
+                logger.debug("[Netease] 网关 %s 返回 0 条 %s 结果，尝试下一个",
+                             base_url, search_type)
+                res_data = None
+                continue
+
             logger.info("[Netease] 搜索 '%s' → %s 返回 %d 条, 首条: %s",
-                         keyword, base_url, len(songs),
-                         songs[0].get("name", "?") if songs else "(无)")
+                         keyword, base_url, len(current_results),
+                         current_results[0].get("name", "?") if current_results else "(无)")
             break  # 找到有效结果，跳出循环
     else:
         # 所有网关都失败或无匹配结果
@@ -331,12 +344,23 @@ async def get_download_url(
     else:
         params["br"] = br
 
+    # 先尝试 /song/download/url，失败再尝试 /song/url（不同网关端点不同）
     result = await _netease_request(
         "/song/download/url",
         params=params,
         cookie=cookie,
         timeout=timeout,
     )
+
+    # 如果 /song/download/url 全部网关失败，尝试 /song/url
+    if result.get("code") != 200:
+        logger.debug("[Netease] /song/download/url 失败，尝试 /song/url 端点")
+        result = await _netease_request(
+            "/song/url",
+            params={"id": song_id, "br": br},
+            cookie=cookie,
+            timeout=timeout,
+        )
 
     if result.get("code") != 200:
         logger.warning(f"[Netease] 下载链接获取失败: {result.get('msg', '未知错误')}")

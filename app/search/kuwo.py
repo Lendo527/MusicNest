@@ -225,6 +225,9 @@ async def search(
                 # 补全图片 URL
                 if pic and not pic.startswith("http"):
                     pic = f"https://star.kuwo.cn/star/starheads/{pic.lstrip('/')}"
+                # 兜底：PICPATH 为空时用 artist_id 构造头像 URL
+                if not pic:
+                    pic = f"https://star.kuwo.cn/star/starheads/180/{artist_id}.jpg"
                 results.append(SearchResult(
                     id=f"kuwo_artist_{artist_id}",
                     title=artist_name or "未知歌手",
@@ -242,12 +245,15 @@ async def search(
         # ===== 专辑搜索 =====
         if search_type == "album":
             for item in abslist:
-                album_id_raw = item.get("ALBUMID", "")
+                # 尝试多种字段名（移动端/PC端字段名可能不同）
+                album_id_raw = (item.get("ALBUMID") or item.get("albumid") or
+                               item.get("ALBUMID_STR") or item.get("id") or "")
                 album_id = str(album_id_raw).strip() if album_id_raw else ""
                 if not album_id:
                     continue
-                album_name = (item.get("NAME") or item.get("ALBUM") or "").strip()
-                artist_name = (item.get("ARTIST") or "").strip()
+                album_name = (item.get("NAME") or item.get("ALBUM") or
+                             item.get("name") or item.get("album") or "").strip()
+                artist_name = (item.get("ARTIST") or item.get("artist") or "").strip()
                 # 专辑封面
                 cover = None
                 if album_id != "0":

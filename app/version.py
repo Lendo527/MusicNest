@@ -7,6 +7,19 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.34 - 第5批12个问题修复：
+           播放列表右上角文本可见性修复(text-muted→#b0b6c1)；
+           播放列表显示play_state.playlist而非全库(get_state_dict添加playlist字段)；
+           kuwo歌手搜索添加artist_id兜底头像URL；
+           kuwo专辑搜索字段名增加多种尝试(albumid/id等)；
+           歌单监听列表td垂直居中(vertical-align:middle)；
+           歌单同步前检查本地是否已有(scanner.search匹配跳过下载)；
+           网易云搜索0结果继续下一网关+下载URL添加/song/url回退端点；
+           歌手/专辑/歌曲列表统计文本统一为"共XX首/个/张"格式；
+           扫描统计数字字号统一(font-size:1.1rem;color:var(--accent))；
+           本地歌曲转码改为流式边转边播(asyncio subprocess+StreamingResponse)；
+           下一曲在SINGLE模式强制切到下一首(不再返回None)；
+           拦截失败副作用修复(下一曲bug修复后不再出现)
   0.0.33 - 第4批9个问题修复：
            播放列表使用filteredCache+_idx高亮匹配(currentPlayingIdx)；
            列表高度调整为calc(100vh-200px)/calc(100vh-260px)靠近播放器；
@@ -59,4 +72,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.33"
+__version__ = "0.0.34"

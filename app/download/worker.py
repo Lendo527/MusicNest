@@ -359,6 +359,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
     )
     from app.search.netease import get_playlist_tracks, get_playlist_detail
     from app.search.kuwo import search as kuwo_search
+    from app.music.scanner import MusicScanner
 
     while RUNNING:
         await asyncio.sleep(sync_interval)
@@ -406,9 +407,31 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                 # 已同步 ID
                 synced = get_synced_ids(source, pl_id)
 
+                # 本地扫描器（用于检查歌曲是否已存在）
+                _scanner = MusicScanner(config.get("music_path", "/music"))
+
                 new_count = 0
                 for track in tracks:
                     if track.id in synced:
+                        continue
+
+                    # 先检查本地是否已有该歌曲（按标题+歌手匹配）
+                    local_songs = _scanner.search(track.title)
+                    already_local = False
+                    for ls in local_songs:
+                        local_artist = (ls.get("artist") or "").strip()
+                        track_artist = (track.artist or "").strip()
+                        # 标题匹配 + 歌手名包含匹配（本地可能多了分隔符等）
+                        if local_artist and track_artist and (
+                            local_artist in track_artist or track_artist in local_artist
+                        ):
+                            already_local = True
+                            break
+
+                    if already_local:
+                        # 本地已有，直接标记为已同步，不重复下载
+                        record_sync(source, pl_id, track.id)
+                        logger.info(f"[PlaylistSync] 跳过已存在本地的歌曲: {track.artist} - {track.title}")
                         continue
 
                     # 加入下载队列

@@ -259,6 +259,7 @@ class PlayState:
             "current_index": self.current_index,
             "song": song,
             "playlist_length": len(self.playlist),
+            "playlist": self.playlist,
             "mode": self.mode.value,
             "mode_icon": PLAY_MODE_ICONS.get(self.mode, "bi-music-note"),
             "is_playing": self.is_playing,
@@ -657,6 +658,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             if miot_client and device_id:
                 await miot_client.stop_all_media(device_id)
             next_idx = play_state._get_next_index()
+            # SINGLE 模式下 _get_next_index 返回 None，但用户明确要求"下一首"时应强制切到下一首
+            if next_idx is None and play_state.mode == PlayMode.SINGLE and play_state.playlist:
+                nxt = (play_state.current_index or 0) + 1
+                if nxt < len(play_state.playlist):
+                    next_idx = nxt
             if next_idx is not None and play_state.device_id:
                 play_state.current_index = next_idx
                 ok = await _play_on_device(play_state.device_id, next_idx)
@@ -1465,29 +1471,28 @@ async def api_music_play(song_index: int, request: Request) -> Response:
     # 根据请求参数决定是否转码 MP3（针对仅支持 MP3 的音箱）
     transcode = request.query_params.get("transcode", "0") == "1"
     if transcode and not filepath.lower().endswith('.mp3'):
-        import hashlib
-        import subprocess
+        # 流式转码：边转边播，无需等待整个文件转码完成
+        # 使用 asyncio subprocess 避免阻塞事件循环
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", filepath,
+            "-codec:a", "libmp3lame", "-b:a", "192k",
+            "-f", "mp3", "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
 
-        cache_dir = Path("/tmp/musicnest_audio")
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_key = hashlib.md5(filepath.encode()).hexdigest()
-        cache_path = cache_dir / f"{cache_key}.mp3"
-
-        if not cache_path.exists():
+        async def _stream_transcode():
             try:
-                subprocess.run([
-                    "ffmpeg", "-i", filepath,
-                    "-codec:a", "libmp3lame", "-b:a", "192k",
-                    "-y", str(cache_path),
-                ], check=True, capture_output=True)
-                logger.info(f"[Transcode] {filepath} -> {cache_path}")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"[Transcode] 转码失败: {filepath}, stderr={e.stderr.decode(errors='replace')[:200]}")
-                # 回退：直接返回原文件
-                return FileResponse(filepath, media_type=mime, filename=os.path.basename(filepath))
+                while True:
+                    chunk = await proc.stdout.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                await proc.wait()
 
-        # 转码成功用 MPEG 返回
-        return FileResponse(str(cache_path), media_type="audio/mpeg", filename=os.path.basename(filepath))
+        logger.info(f"[Transcode] 流式转码: {filepath}")
+        return StreamingResponse(_stream_transcode(), media_type="audio/mpeg")
 
     return FileResponse(filepath, media_type=mime, filename=os.path.basename(filepath))
 
