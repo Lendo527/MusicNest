@@ -849,6 +849,38 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             else:
                 result_text = "没听清闹钟时间，试试说「设置闹钟 每天早上8点播放」"
 
+        elif result.command.type == "download_current":
+            # 下载当前播放的歌曲：判断是否本地，非本地走下载流程
+            song = play_state.current_song()
+            if not song:
+                result_text = "没有正在播放的歌曲"
+            else:
+                filepath = song.get("filepath", "")
+                # 判断是否本地歌曲：filepath 在 scanner 中存在
+                is_local = bool(filepath) and scanner.get_index_by_filepath(filepath) is not None
+                if is_local:
+                    result_text = "当前歌曲已在本地，无需下载"
+                else:
+                    # 在线播放的歌曲，从标题+歌手构建搜索词
+                    title = song.get("title") or song.get("display_title") or ""
+                    artist = song.get("artist") or song.get("display_artist") or ""
+                    keyword = f"{artist} {title}".strip() if artist else title
+                    if not keyword:
+                        result_text = "无法获取当前歌曲信息"
+                    else:
+                        # 后台执行避免阻塞语音回调链
+                        _create_background_task(_download_via_kuwo(keyword), "voice_download_current")
+                        result_text = f"正在后台下载: {keyword}"
+
+        elif result.command.type == "download":
+            # 直接下载指定歌曲：argument 为搜索词
+            keyword = result.argument
+            if not keyword:
+                result_text = "请告诉我要下载哪首歌，比如「下载 周杰伦 青花瓷」"
+            else:
+                _create_background_task(_download_via_kuwo(keyword), "voice_download")
+                result_text = f"正在后台下载: {keyword}"
+
     except Exception as e:
         logger.error(f"[VoiceCmd] 指令执行异常: {e}", exc_info=True)
         if not result_text:
@@ -885,6 +917,53 @@ async def _enrich_playlist_metadata(song_name: str, real_index: int, all_songs: 
                 )
     except Exception as e:
         logger.debug(f"[VoiceCmd] 在线元数据查询失败: {e}")
+
+
+async def _download_via_kuwo(keyword: str) -> str:
+    """通过酷我搜索并加入下载队列（语音指令复用）
+
+    流程：搜索 keyword → 取首个匹配 → add_task 入库 → worker 自动处理下载（图片/歌词/最佳音质）
+    使用 skip_formats=True 加速搜索，具体格式由 worker 调 query_song_by_id 精确查询时获取。
+
+    Args:
+        keyword: 搜索关键词（歌名或"歌手 歌名"）
+
+    Returns:
+        结果消息（用于日志记录）
+    """
+    if not keyword:
+        return "请告诉我要下载哪首歌"
+    try:
+        results = await kuwo_search(keyword, limit=1, skip_formats=True)
+    except Exception as e:
+        logger.error(f"[VoiceCmd] 酷我搜索失败: {e}", exc_info=True)
+        return f"搜索失败: {e}"
+    if not results:
+        return f"没找到歌曲: {keyword}"
+    r = results[0]
+    pure_id = r.id.replace("kuwo_", "")
+    if not pure_id:
+        return "歌曲 ID 无效"
+    task_id = f"kuwo_voice_{pure_id}_{int(time.time())}"
+    # 音质选择：默认 flac（worker 内部会回退到 mp3 如果 flac 不可用）
+    flac_priority = config.get("download", {}).get("flac_priority", True)
+    fmt = "flac" if flac_priority else "mp3"
+    try:
+        add_task(
+            task_id=task_id,
+            source="kuwo",
+            music_id=pure_id,
+            title=r.title,
+            artist=r.artist,
+            album=r.album,
+            cover_url=r.cover or "",
+            format_type=fmt,
+        )
+        logger.info(f"[VoiceCmd] 已加入下载队列: {r.artist} - {r.title} (task_id={task_id}, fmt={fmt})")
+        return f"已加入下载: {r.artist} - {r.title}"
+    except Exception as e:
+        logger.error(f"[VoiceCmd] 加入下载队列失败: {e}", exc_info=True)
+        return f"下载失败: {e}"
 
 
 async def _on_native_playback_intercept(device_id: str, query: Optional[str]) -> None:

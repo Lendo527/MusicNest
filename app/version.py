@@ -7,6 +7,17 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.38 - 新增下载语音指令（酷我搜索+复用worker下载流程）：
+           voice: 新增download_current/download指令类型+优先级8/9；
+           voice: download_current keywords=["下载当前歌曲","下载这首歌","下载当前","下载此歌"]；
+           voice: download keywords=["下载歌曲","下载"]（argument作为搜索词）；
+           config: DEFAULT_CONFIG加入两条download指令默认配置；
+           main: 新增_download_via_kuwo()辅助函数(搜索+add_task入库)；
+           main: _on_voice_message加download_current分支(判断本地/在线→构建搜索词)；
+           main: _on_voice_message加download分支(argument为搜索词)；
+           main: 后台执行避免阻塞语音回调链(_create_background_task)；
+           index.html: 语音指令管理下拉框加download_current/download选项；
+           复用worker._process_task(下载最佳音质+封面+歌词+ID3标签)；
   0.0.37 - 手动深度审阅修复（跨模块联动一致性 + 修复后新引入问题）：
            main: 封面提取ffmpeg超时未kill子进程(孤儿进程修复)；
            main: _init_miot_client重新登录时关闭旧client(防httpx连接池泄漏)；
@@ -162,4 +173,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.37"
+__version__ = "0.0.38"

@@ -61,6 +61,8 @@ _COMMAND_PRIORITY: dict[str, int] = {
     "next": 5,
     "previous": 6,
     "stop": 7,
+    "download_current": 8,
+    "download": 9,
 }
 
 
@@ -137,6 +139,16 @@ def _default_commands() -> list[VoiceCommand]:
         VoiceCommand(
             type="stop",
             keywords=["停止播放", "停止", "别播了", "关掉音乐", "关机"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="download_current",
+            keywords=["下载当前歌曲", "下载这首歌", "下载当前", "下载此歌"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="download",
+            keywords=["下载歌曲", "下载"],
             enabled=True,
         ),
         VoiceCommand(

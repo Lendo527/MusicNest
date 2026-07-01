@@ -40,6 +40,8 @@ DEFAULT_CONFIG = {
         {"type": "next", "keywords": ["下一首", "切歌", "换一首", "下一曲"], "enabled": True},
         {"type": "previous", "keywords": ["上一首", "上一曲"], "enabled": True},
         {"type": "stop", "keywords": ["停止播放", "停止", "别播了", "关掉音乐", "关机"], "enabled": True},
+        {"type": "download_current", "keywords": ["下载当前歌曲", "下载这首歌", "下载当前", "下载此歌"], "enabled": True},
+        {"type": "download", "keywords": ["下载歌曲", "下载"], "enabled": True},
     ],
     "alarms": [],
     "playlists": [],  # [{"id", "name", "songs": [索引列表], "created_at"}]
