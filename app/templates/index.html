@@ -815,12 +815,13 @@
             <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
                 <span>歌手列表 <span class="text-info small" id="artistCount"></span></span>
                 <span>
-                    <select class="form-select form-select-dark form-select-sm" style="width:auto;display:inline-block;" id="artistSortSelect" onchange="renderArtistList();localStorage.setItem('musicnest_artistSortBy', this.value)">
+                    <select class="form-select form-select-dark form-select-sm" style="width:auto;display:inline-block;" id="artistSortSelect" onchange="renderArtistList(document.getElementById('searchKeyword').value);localStorage.setItem('musicnest_artistSortBy', this.value)">
                         <option value="name-asc">歌手名 (A-Z)</option>
                         <option value="name-desc">歌手名 (Z-A)</option>
                         <option value="songs-desc">歌曲数 (多→少)</option>
                     </select>
                 </span>
+                <span id="artistListSearchSlot"></span>
             </div>
             <div class="card-body p-0">
                 <div id="artistGridView" class="row row-cols-2 row-cols-md-3 row-cols-lg-5 row-cols-xl-5 g-3">
@@ -1638,12 +1639,14 @@ async function loadSongList() {
     const savedSortOrder = localStorage.getItem('musicnest_songSortOrder') || 'asc';
     sortOrder = savedSortOrder;
     document.getElementById('sortTitleBtn').innerHTML = `<i class="bi bi-arrow-${sortOrder === 'asc' ? 'down' : 'up'}"></i>`;
+    allArtistsCache = []; // 歌曲库变更，清空歌手缓存
     filterSongs(document.getElementById('searchKeyword').value);
 }
 
 let sortOrder = 'asc';
 let songsCache = [];
 let filteredCache = [];
+let allArtistsCache = []; // 全量歌手缓存（用于前端搜索过滤，避免每次按键都请求 API）
 let currentPage = 1;
 let songPageSize = parseInt(localStorage.getItem('songPageSize')) || 300;
 const SONG_PAGE_SIZES = [100, 200, 300, 400, 500];
@@ -1739,6 +1742,9 @@ function renderCurrentSongPage() {
                 <button class="btn btn-sm btn-outline-accent add-to-pl-btn" data-filepath="${escAttr(s.filepath)}" onclick="showAddToPlaylist(this.dataset.filepath, event)" title="加入歌单">
                     <i class="bi bi-plus-circle"></i>
                 </button>
+                <button class="btn btn-sm btn-outline-danger del-song-btn" onclick="deleteSong(${s._idx})" title="删除">
+                    <i class="bi bi-trash"></i>
+                </button>
                 </div>
             </td>
         </tr>
@@ -1812,9 +1818,10 @@ function setSongView(view) {
 
     // Move search box to the appropriate header slot
     const searchGroup = document.getElementById('searchGroup');
-    const targetSlot = view === 'list'
-        ? document.getElementById('songListSearchSlot')
-        : document.getElementById('albumListSearchSlot');
+    let targetSlot;
+    if (view === 'list') targetSlot = document.getElementById('songListSearchSlot');
+    else if (view === 'grid') targetSlot = document.getElementById('albumListSearchSlot');
+    else targetSlot = document.getElementById('artistListSearchSlot');
     if (searchGroup.parentElement !== targetSlot) {
         targetSlot.appendChild(searchGroup);
     }
@@ -1823,7 +1830,7 @@ function setSongView(view) {
     document.getElementById('searchKeyword').placeholder = placeholders[view] || '搜索...';
 
     if (view === 'artist') {
-        renderArtistList();
+        renderArtistList(document.getElementById('searchKeyword').value);
     } else {
         filterSongs(document.getElementById('searchKeyword').value);
     }
@@ -2026,6 +2033,8 @@ function filterSongs(kw) {
     currentPage = 1;
     if (currentView === 'grid') {
         renderAlbumGrid();
+    } else if (currentView === 'artist') {
+        renderArtistList(kw);
     } else {
         renderCurrentSongPage();
     }
@@ -3963,21 +3972,31 @@ async function init() {
 
 init();
 
-async function renderArtistList() {
-    const r = await api('/api/music/artists');
-    const artists = r.data || [];
+async function renderArtistList(kw) {
+    kw = (kw || '').toLowerCase().trim();
+    // 仅在缓存为空时拉取（删除歌手后会清空缓存触发重新拉取）
+    if (allArtistsCache.length === 0) {
+        const r = await api('/api/music/artists');
+        allArtistsCache = r.data || [];
+    }
+    let artists = [...allArtistsCache];
+    // 应用搜索过滤
+    if (kw) {
+        artists = artists.filter(a => (a.name || '').toLowerCase().includes(kw));
+    }
     document.getElementById('artistCount').textContent = '(' + artists.length + ' 个)';
     const sort = document.getElementById('artistSortSelect').value;
     if (sort === 'name-desc') artists.sort((a,b) => b.name.localeCompare(a.name));
     else if (sort === 'songs-desc') artists.sort((a,b) => b.song_count - a.song_count);
     else artists.sort((a,b) => a.name.localeCompare(b.name));
     document.getElementById('artistGridView').innerHTML = artists.map(a => {
-        const coverUrl = a.cover ? '/api/music/artist_cover?name=' + encodeURIComponent(a.name) : '/static/vinyl.svg';
+        // 始终通过 API 获取封面（后端会 fallback 到 vinyl.svg）
+        const coverUrl = '/api/music/artist_cover?artist=' + encodeURIComponent(a.name);
         return '<div class="col"><div class="album-card card-dark h-100 text-center p-3" style="cursor:default;">'
             + '<img src="' + coverUrl + '" style="width:80px;height:80px;border-radius:50%;object-fit:cover;margin:0 auto 8px;" onerror="this.src=\'/static/vinyl.svg\'">'
             + '<div style="font-size:14px;color:#fff;font-weight:500;">' + escHtml(a.name) + '</div>'
             + '<small class="text-muted">' + a.song_count + ' 首歌曲</small>'
-            + '<div class="mt-2"><button class="btn btn-sm btn-outline-danger" onclick="deleteArtist(\'' + encodeURIComponent(a.name) + '\')"><i class="bi bi-trash"></i> 删除</button></div>'
+            + '<div class="mt-2"><button class="btn btn-sm btn-outline-danger" data-name="' + escAttr(a.name) + '" onclick="deleteArtist(this.dataset.name)"><i class="bi bi-trash"></i> 删除</button></div>'
             + '</div></div>';
     }).join('');
 }
@@ -3993,11 +4012,12 @@ async function deleteSong(idx) {
 }
 
 async function deleteArtist(name) {
-    if (!confirm('确定要删除歌手 "' + decodeURIComponent(name) + '" 及其所有歌曲吗？')) return;
-    const r = await api('/api/music/artist/' + name + '/delete', {method: 'POST'});
+    if (!confirm('确定要删除歌手 "' + name + '" 及其所有歌曲吗？')) return;
+    const r = await api('/api/music/artist/' + encodeURIComponent(name) + '/delete', {method: 'POST'});
     if (r.code === 0) {
         showToast(r.msg);
-        renderArtistList();
+        allArtistsCache = []; // 清空缓存，下次渲染时重新拉取
+        renderArtistList(document.getElementById('searchKeyword').value);
         loadSongList();
     } else alert('删除失败: ' + (r.msg || '未知错误'));
 }

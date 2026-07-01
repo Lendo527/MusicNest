@@ -144,11 +144,21 @@ async def _do_refresh(miauth: MiAuth) -> bool:
 
 
 async def handle_token_expired(miauth: MiAuth) -> bool:
-    """401 过期回调：尝试刷新 token
+    """401 过期回调：尝试刷新 token（含 60s 节流，避免短时间内重复刷新风暴）
 
     Returns:
         True 表示刷新成功可重试，False 表示无法刷新
     """
+    # 节流：60 秒内不重复刷新（避免每个 401 请求都触发一次刷新尝试）
+    now = time.time()
+    elapsed = now - _last_relogin_at
+    if elapsed < RELOGIN_THROTTLE_SEC:
+        logger.debug(
+            "[TokenRefresh] 401 触发的刷新被节流（距上次 %.1fs < %ds）",
+            elapsed, RELOGIN_THROTTLE_SEC
+        )
+        return False
+
     logger.info("[TokenRefresh] 检测到 401，尝试刷新 token...")
     ok = await _do_refresh(miauth)
     if ok:

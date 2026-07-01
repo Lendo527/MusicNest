@@ -1549,12 +1549,28 @@ async def api_music_cover(song_index: int) -> Response:
 
 @app.get("/api/music/artist_cover")
 async def api_music_artist_cover(artist: str = "") -> Response:
-    """获取歌手封面图片（歌手目录下的 cover.jpg/png）"""
+    """获取歌手封面图片（优先 artist.jpg/png，其次 cover.jpg/png）"""
     if not artist:
         return Response(status_code=404)
     music_path = config.get("music_path", "/music")
     artist_dir = Path(music_path) / artist
-    return _serve_cover_from_dir(artist_dir)
+    if not artist_dir.exists() or not artist_dir.is_dir():
+        default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")
+        if os.path.isfile(default_svg):
+            return FileResponse(default_svg, media_type="image/svg+xml")
+        return Response(status_code=404)
+    # 优先查找 artist.jpg（与扫描器逻辑一致），其次 cover.jpg
+    for prefix in ("artist", "cover"):
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            cover_path = artist_dir / f"{prefix}{ext}"
+            if cover_path.exists():
+                media_type_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                                  ".png": "image/png", ".webp": "image/webp"}
+                return FileResponse(str(cover_path), media_type=media_type_map.get(ext, "image/jpeg"))
+    default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")
+    if os.path.isfile(default_svg):
+        return FileResponse(default_svg, media_type="image/svg+xml")
+    return Response(status_code=404)
 
 
 @app.get("/api/music/album_cover")
