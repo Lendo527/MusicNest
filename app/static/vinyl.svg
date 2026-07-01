@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <defs>
+    <linearGradient id="shine" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2a2a2a"/>
+      <stop offset="30%" style="stop-color:#1a1a1a"/>
+      <stop offset="50%" style="stop-color:#333"/>
+      <stop offset="70%" style="stop-color:#1a1a1a"/>
+      <stop offset="100%" style="stop-color:#2a2a2a"/>
+    </linearGradient>
+  </defs>
+  <!-- 黑胶唱片主体 -->
+  <circle cx="100" cy="100" r="96" fill="#111" stroke="#333" stroke-width="2"/>
+  <circle cx="100" cy="100" r="90" fill="url(#shine)"/>
+  <!-- 唱片纹路 -->
+  <circle cx="100" cy="100" r="80" fill="none" stroke="#2a2a2a" stroke-width="0.5"/>
+  <circle cx="100" cy="100" r="70" fill="none" stroke="#2a2a2a" stroke-width="0.5"/>
+  <circle cx="100" cy="100" r="60" fill="none" stroke="#2a2a2a" stroke-width="0.5"/>
+  <circle cx="100" cy="100" r="50" fill="none" stroke="#2a2a2a" stroke-width="0.5"/>
+  <circle cx="100" cy="100" r="40" fill="none" stroke="#2a2a2a" stroke-width="0.5"/>
+  <!-- 唱片标签 -->
+  <circle cx="100" cy="100" r="28" fill="#1a1a1a" stroke="#444" stroke-width="1"/>
+  <circle cx="100" cy="100" r="24" fill="#222"/>
+  <!-- 中心孔 -->
+  <circle cx="100" cy="100" r="5" fill="#111"/>
+  <circle cx="100" cy="100" r="3" fill="#0a0a0a"/>
+  <!-- 高光效果 -->
+  <ellipse cx="70" cy="70" rx="35" ry="20" fill="rgba(255,255,255,0.03)" transform="rotate(-30,70,70)"/>
+</svg>

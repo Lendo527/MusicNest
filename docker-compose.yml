@@ -1,0 +1,12 @@
+services:
+  musicnest:
+    image: musicnest:latest
+    container_name: musicnest
+    restart: unless-stopped
+    ports:
+      - "58092:58092"
+    volumes:
+      - ./data:/data
+      - /your/music/path:/music
+    environment:
+      - TZ=Asia/Shanghai

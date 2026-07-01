@@ -1,0 +1,17 @@
+[project]
+name = "mimusicplaylocal"
+version = "0.1.0"
+description = "MiMusicPlayLocal - 小米音箱本地音乐播放服务"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "httpx>=0.27.0",
+    "aiofiles>=23.2.0",
+    "pyyaml>=6.0",
+    "jinja2>=3.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

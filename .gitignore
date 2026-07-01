@@ -1,0 +1,39 @@
+# Local build scripts
+build_oci.py
+build_oci_v2.py
+build_oci_v3.py
+build_oci_v4.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Data
+data/
+.oci_build/
+
+# Planning / Tracking
+.hermes/
+TRACKING.md
+PLAN.md
+
+# Test assets
+test_data/
+test_music/
+
+# System
+debootstrap_*.deb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+.env
