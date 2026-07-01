@@ -34,3 +34,12 @@ Thumbs.db
 
 # Docker
 .env
+.env.*
+docker-compose.override.yml
+
+# Logs
+*.log
+
+# Local config overrides
+config.local.*
+config/override.*
