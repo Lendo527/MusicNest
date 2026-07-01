@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -17,6 +18,7 @@ from app.download.tracker import (
     update_task_status,
     get_task_by_id,
     add_task,
+    reset_stale_loading_tasks,
 )
 from app.search.kuwo import search as kuwo_search
 from app.search.netease import get_download_url as netease_download_url
@@ -62,6 +64,12 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                 return True
     except Exception as e:
         logger.warning(f"[Download] 下载文件失败: {url[:80]}... err={e}")
+        # 清理 partial 文件，避免下次误判为成功
+        try:
+            if dest.exists():
+                dest.unlink()
+        except Exception:
+            pass
         return False
 
 
@@ -183,24 +191,34 @@ async def _process_task(task) -> bool:
         resolved_album = album
 
         if source == "kuwo":
-            # 搜一遍获取完整信息（含封面和音质链接）
-            results = await kuwo_search(title, limit=5)
-            matched = None
-            for r in results:
-                rid = r.id.replace("kuwo_", "")
-                if rid == music_id or r.title == title:
-                    matched = r
-                    break
-            if not matched and results:
-                matched = results[0]
+            from app.search.kuwo import query_song_by_id, _get_music_formats
+            import re
+
+            # 优先用 music_id 精确查询，避免搜索匹配到错误歌曲
+            matched = await query_song_by_id(f"kuwo_{music_id}")
+            if not matched:
+                # 退回到搜索匹配
+                results = await kuwo_search(title, limit=5)
+                for r in results:
+                    rid = r.id.replace("kuwo_", "")
+                    if rid == music_id:
+                        matched = r
+                        break
+                if not matched:
+                    # 标题归一化比较（去掉空格和特殊字符后精确匹配）
+                    norm_title = re.sub(r'\s+', '', title)
+                    for r in results:
+                        if re.sub(r'\s+', '', r.title) == norm_title:
+                            matched = r
+                            break
+                if not matched and results:
+                    matched = results[0]
+
+            if not matched:
+                update_task_status(task_id, "error", error_msg="未找到匹配歌曲")
+                return False
 
             if matched:
-                # sqmusic 风格：再用 querySongById 补调详情（更准确的信息）
-                from app.search.kuwo import query_song_by_id, _get_music_formats
-                detail = await query_song_by_id(matched.id)
-                if detail:
-                    matched = detail
-
                 if not resolved_cover and matched.cover:
                     resolved_cover = matched.cover
                 if not resolved_artist or resolved_artist == "未知歌手":
@@ -224,6 +242,10 @@ async def _process_task(task) -> bool:
         elif source == "netease":
             from app.search.netease import get_song_detail as netease_song_detail
             from app.search.netease import get_download_url as netease_download_url
+            from app.config import config
+
+            # 网易云需要 cookie 才能获取 FLAC/Hi-Res 下载链接
+            netease_cookie = config.get("netease_cookie", "") or config.get("netease", {}).get("cookie", "")
 
             # 先拿歌曲详情（含封面）
             detail = await netease_song_detail(music_id)
@@ -235,12 +257,12 @@ async def _process_task(task) -> bool:
                 if not resolved_album or resolved_album == "未知专辑":
                     resolved_album = detail.album
 
-            # 获取下载链接
+            # 获取下载链接（需传 cookie 才能拿到高品质）
             br_map = {"flac": 999000, "mp3": 320000}
             br = br_map.get(format_type, 320000)
-            download_url = await netease_download_url(music_id, br=br)
+            download_url = await netease_download_url(music_id, br=br, cookie=netease_cookie)
             if not download_url:
-                download_url = await netease_download_url(music_id, br=320000)
+                download_url = await netease_download_url(music_id, br=320000, cookie=netease_cookie)
 
         if not download_url:
             update_task_status(task_id, "error", "无法获取下载链接")
@@ -258,8 +280,8 @@ async def _process_task(task) -> bool:
         track_filename = f"{title}.{ext}"
         track_path = album_dir / track_filename
 
-        # 如果已存在同名文件，只补图片
-        if track_path.exists():
+        # 如果已存在同名文件且大小正常（>1KB），只补图片
+        if track_path.exists() and track_path.stat().st_size > 1024:
             logger.info(f"[Download] 文件已存在: {track_path}")
             if resolved_cover:
                 await _download_cover(resolved_cover, artist_dir, album_dir)
@@ -312,6 +334,9 @@ async def download_worker(poll_interval: float = 5.0):
     RUNNING = True
     logger.info("[Download] 下载 Worker 已启动")
 
+    # 启动时重置上次崩溃残留的 loading 任务，避免卡死
+    reset_stale_loading_tasks(timeout_minutes=30)
+
     # 并发限制
     sem = asyncio.Semaphore(2)
 
@@ -361,6 +386,9 @@ async def playlist_sync_worker(sync_interval: int = 1800):
     from app.search.kuwo import search as kuwo_search
     from app.music.scanner import MusicScanner
 
+    # 扫描器在循环外创建，避免每次循环都重新初始化（search 内部会按需刷新缓存）
+    _scanner = MusicScanner(config.get("music_path", "/music"))
+
     while RUNNING:
         await asyncio.sleep(sync_interval)
         try:
@@ -407,50 +435,52 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                 # 已同步 ID
                 synced = get_synced_ids(source, pl_id)
 
-                # 本地扫描器（用于检查歌曲是否已存在）
-                _scanner = MusicScanner(config.get("music_path", "/music"))
-
                 new_count = 0
                 for track in tracks:
                     if track.id in synced:
                         continue
 
-                    # 先检查本地是否已有该歌曲（按标题+歌手匹配）
-                    local_songs = _scanner.search(track.title)
-                    already_local = False
-                    for ls in local_songs:
-                        local_artist = (ls.get("artist") or "").strip()
-                        track_artist = (track.artist or "").strip()
-                        # 标题匹配 + 歌手名包含匹配（本地可能多了分隔符等）
-                        if local_artist and track_artist and (
-                            local_artist in track_artist or track_artist in local_artist
-                        ):
-                            already_local = True
-                            break
+                    try:
+                        # 先检查本地是否已有该歌曲（按标题+歌手集合交集匹配）
+                        local_songs = _scanner.search(track.title)
+                        already_local = False
+                        # 将歌手名按分隔符拆分为集合，用集合交集判断（避免子串误匹配）
+                        track_artists = {p.strip() for p in re.split(r'[,/、;&]', track.artist or "") if p.strip()}
+                        for ls in local_songs:
+                            local_artists = {p.strip() for p in re.split(r'[,/、;&]', ls.get("artist") or "") if p.strip()}
+                            if track_artists and local_artists and (track_artists & local_artists):
+                                already_local = True
+                                break
 
-                    if already_local:
-                        # 本地已有，直接标记为已同步，不重复下载
+                        if already_local:
+                            # 本地已有，直接标记为已同步，不重复下载
+                            record_sync(source, pl_id, track.id)
+                            logger.info(f"[PlaylistSync] 跳过已存在本地的歌曲: {track.artist} - {track.title}")
+                            continue
+
+                        # 加入下载队列
+                        task_id = f"{source}_sync_{pl_id}_{track.id}"
+                        flac_priority = config.get("download", {}).get("flac_priority", True)
+                        fmt = "flac" if flac_priority else "mp3"
+
+                        added = add_task(
+                            task_id=task_id,
+                            source=source,
+                            music_id=track.id.replace(f"{source}_", ""),
+                            title=track.title,
+                            artist=track.artist,
+                            album=track.album,
+                            cover_url=track.cover or "",
+                            format_type=fmt,
+                        )
+                        # 若任务已存在且处于 error/loading 状态，重置为 waiting（UPSERT 兜底）
+                        if added.status in ("error", "loading"):
+                            update_task_status(task_id, "waiting")
                         record_sync(source, pl_id, track.id)
-                        logger.info(f"[PlaylistSync] 跳过已存在本地的歌曲: {track.artist} - {track.title}")
+                        new_count += 1
+                    except Exception as e:
+                        logger.error(f"[PlaylistSync] 处理单曲失败: {track.artist} - {track.title} err={e}", exc_info=True)
                         continue
-
-                    # 加入下载队列
-                    task_id = f"{source}_sync_{pl_id}_{track.id}"
-                    flac_priority = config.get("download", {}).get("flac_priority", True)
-                    fmt = "flac" if flac_priority else "mp3"
-
-                    add_task(
-                        task_id=task_id,
-                        source=source,
-                        music_id=track.id.replace(f"{source}_", ""),
-                        title=track.title,
-                        artist=track.artist,
-                        album=track.album,
-                        cover_url=track.cover or "",
-                        format_type=fmt,
-                    )
-                    record_sync(source, pl_id, track.id)
-                    new_count += 1
 
                 # 无论是否有新曲目，都更新锚点（避免下次重复拉取）
                 if remote_update or remote_track_update:

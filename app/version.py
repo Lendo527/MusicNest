@@ -7,6 +7,18 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.35 - 下载模块 11 个 bug 修复：
+           worker: 下载失败清理 partial 文件 + 文件大小校验(>1KB)；
+           worker: netease 下载链接传 cookie（FLAC/Hi-Res 必需）；
+           worker: 启动时重置卡死 loading 任务(reset_stale_loading_tasks)；
+           worker: kuwo 优先 query_song_by_id 精确查询+标题归一化匹配；
+           worker: 歌单同步歌手匹配改集合交集(避免子串误匹配)；
+           worker: add_task 后检查 error/loading 状态并重置；
+           worker: 歌单同步每首歌曲 try/except 容错；
+           worker: MusicScanner 移到 while 循环外(避免重复初始化)；
+           tracker: 新增 reset_stale_loading_tasks 函数；
+           tracker: add_task 改 ON CONFLICT UPSERT(重置 error/loading)；
+           tracker: _get_conn 改线程局部连接复用(避免频繁 open/close)
   0.0.34 - 第5批12个问题修复：
            播放列表右上角文本可见性修复(text-muted→#b0b6c1)；
            播放列表显示play_state.playlist而非全库(get_state_dict添加playlist字段)；
@@ -72,4 +84,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.34"
+__version__ = "0.0.35"

@@ -1,5 +1,6 @@
 """SQLite 数据库操作 - 下载队列 + 歌单同步记录"""
 
+import logging
 import os
 import sqlite3
 import threading
@@ -12,12 +13,20 @@ DB_PATH = Path(os.environ.get("DB_PATH", "/data/musicnest.db"))
 
 _lock = threading.Lock()
 
+# 线程局部连接：每个线程复用同一个 sqlite 连接，避免频繁 open/close
+_thread_local = threading.local()
+
+logger = logging.getLogger("musicnest.tracker")
+
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        _thread_local.conn = conn
     return conn
 
 
@@ -79,7 +88,7 @@ def init_db():
 
             conn.commit()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 @dataclass
@@ -134,9 +143,12 @@ def add_task(
         conn = _get_conn()
         try:
             cursor = conn.execute(
-                """INSERT OR IGNORE INTO download_queue
+                """INSERT INTO download_queue
                    (task_id, source, music_id, title, artist, album, cover_url, format_type, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)
+                   ON CONFLICT(task_id) DO UPDATE SET
+                   status='waiting', error_msg=NULL, file_path='', updated_at=excluded.updated_at
+                   WHERE download_queue.status IN ('error', 'loading')""",
                 (task_id, source, music_id, title, artist, album, cover_url, format_type, now, now),
             )
             conn.commit()
@@ -163,7 +175,7 @@ def add_task(
                 return DownloadTask(**dict(row))
             return DownloadTask()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def get_waiting_tasks(limit: int = 2) -> List[DownloadTask]:
@@ -177,7 +189,7 @@ def get_waiting_tasks(limit: int = 2) -> List[DownloadTask]:
             ).fetchall()
             return [DownloadTask(**dict(r)) for r in rows]
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def update_task_status(task_id: str, status: str, error_msg: str = "", file_path: str = ""):
@@ -193,7 +205,7 @@ def update_task_status(task_id: str, status: str, error_msg: str = "", file_path
             )
             conn.commit()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def get_task_by_id(task_id: str) -> Optional[DownloadTask]:
@@ -208,7 +220,7 @@ def get_task_by_id(task_id: str) -> Optional[DownloadTask]:
                 return DownloadTask(**dict(row))
             return None
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def get_tasks(
@@ -232,7 +244,7 @@ def get_tasks(
                 ).fetchall()
             return [DownloadTask(**dict(r)) for r in rows]
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def get_download_stats() -> dict:
@@ -259,7 +271,7 @@ def get_download_stats() -> dict:
                 "error": error,
             }
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def delete_task(task_id: str):
@@ -270,7 +282,7 @@ def delete_task(task_id: str):
             conn.execute("DELETE FROM download_queue WHERE task_id = ?", (task_id,))
             conn.commit()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def clear_finished_tasks():
@@ -281,7 +293,35 @@ def clear_finished_tasks():
             conn.execute("DELETE FROM download_queue WHERE status IN ('success', 'error')")
             conn.commit()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
+
+
+def reset_stale_loading_tasks(timeout_minutes: int = 30) -> int:
+    """重置卡在 loading 状态超过指定时长的任务为 waiting
+
+    Args:
+        timeout_minutes: 超时分钟数，默认 30 分钟
+
+    Returns:
+        重置的任务数量
+    """
+    now = time.time()
+    threshold = now - timeout_minutes * 60
+    with _lock:
+        conn = _get_conn()
+        try:
+            cursor = conn.execute(
+                "UPDATE download_queue SET status='waiting', error_msg='', updated_at=? "
+                "WHERE status='loading' AND updated_at < ?",
+                (now, threshold),
+            )
+            conn.commit()
+            count = cursor.rowcount
+            if count > 0:
+                logger.warning(f"[Tracker] 重置 {count} 个卡死的 loading 任务为 waiting")
+            return count
+        finally:
+            pass  # 线程局部连接复用，不主动关闭
 
 
 # ===== 同步历史 =====
@@ -300,7 +340,7 @@ def record_sync(source: str, playlist_id: str, music_id: str):
             )
             conn.commit()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def is_synced(source: str, playlist_id: str, music_id: str) -> bool:
@@ -314,7 +354,7 @@ def is_synced(source: str, playlist_id: str, music_id: str) -> bool:
             ).fetchone()
             return row is not None
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def get_synced_ids(source: str, playlist_id: str) -> set:
@@ -328,7 +368,7 @@ def get_synced_ids(source: str, playlist_id: str) -> set:
             ).fetchall()
             return {r["music_id"] for r in rows}
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def clear_sync_history(source: str = "", playlist_id: str = ""):
@@ -347,7 +387,7 @@ def clear_sync_history(source: str = "", playlist_id: str = ""):
                 conn.execute("DELETE FROM sync_history")
             conn.commit()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def get_playlist_sync_anchor(source: str, playlist_id: str) -> tuple[int, int]:
@@ -368,7 +408,7 @@ def get_playlist_sync_anchor(source: str, playlist_id: str) -> tuple[int, int]:
                 return int(row["update_time"]), int(row["track_update_time"])
             return 0, 0
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
 
 
 def set_playlist_sync_anchor(source: str, playlist_id: str,
@@ -390,4 +430,4 @@ def set_playlist_sync_anchor(source: str, playlist_id: str,
             )
             conn.commit()
         finally:
-            conn.close()
+            pass  # 线程局部连接复用，不主动关闭
