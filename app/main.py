@@ -558,12 +558,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     tts_text = f"为您播放 {song_artist}唱的 {song_title}" if song_artist else f"为您播放 {song_title}"
                 else:
                     tts_text = "播放失败"
+                # TTS 改为 fire-and-forget，不阻塞播放（设备需先处理 TTS 合成才请求音频流，导致延迟）
                 if config.get("tts_enabled", True) and miot_client:
-                    try:
-                        await miot_client.text_to_speech(device_id, tts_text)
-                        logger.info(f"[VoiceTTS] 播报: {tts_text}")
-                    except Exception as e:
-                        logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
+                    asyncio.create_task(_safe_tts(device_id, tts_text))
                 # play_song 分支自处理 TTS，跳过末尾统一 TTS
                 if monitor:
                     monitor.mark_query_handled(device_id, query)
@@ -796,6 +793,15 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             logger.info(f"[VoiceTTS] 播报: {result_text}")
         except Exception as e:
             logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
+
+
+async def _safe_tts(device_id: str, text: str) -> None:
+    """TTS 播报（fire-and-forget，异常不影响主流程）"""
+    try:
+        await miot_client.text_to_speech(device_id, text)
+        logger.info(f"[VoiceTTS] 播报: {text}")
+    except Exception as e:
+        logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
 
 
 async def _enrich_playlist_metadata(song_name: str, real_index: int, all_songs: list) -> None:
@@ -1700,12 +1706,13 @@ def _is_safe_path(path: str) -> bool:
 
 
 def _has_audio_files(dirpath: str) -> bool:
-    """检查目录下是否还有音频文件"""
+    """检查目录下是否还有音频文件（递归检查子目录）"""
     if not dirpath or not os.path.isdir(dirpath):
         return False
-    for fname in os.listdir(dirpath):
-        if os.path.splitext(fname)[1].lower() in _AUDIO_EXTS:
-            return True
+    for root, dirs, files in os.walk(dirpath):
+        for fname in files:
+            if os.path.splitext(fname)[1].lower() in _AUDIO_EXTS:
+                return True
     return False
 
 

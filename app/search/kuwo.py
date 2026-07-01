@@ -476,6 +476,15 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
 
         # PC 端 artist 字段在顶层，musiclist 是歌曲列表
         result["name"] = (data.get("artist") or "").strip()
+        # 歌手头像：PC 端顶层可能有 pic/artistpic/web_artistpic_short 字段
+        artist_pic = (data.get("pic") or data.get("artistpic") or data.get("web_artistpic_short") or "").strip()
+        if artist_pic:
+            if not artist_pic.startswith("http"):
+                artist_pic = f"https://star.kuwo.cn/star/starheads/{artist_pic.lstrip('/')}"
+            result["image"] = artist_pic
+        else:
+            # 兜底：用 artist_id 构造头像 URL
+            result["image"] = f"https://star.kuwo.cn/star/starheads/180/{artist_id}.jpg"
         songs = data.get("musiclist", [])
 
         # 解析热门歌曲（含音质，字段为小写：name/artist/album/musicrid 等）

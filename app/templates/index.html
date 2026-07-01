@@ -102,6 +102,7 @@
             letter-spacing: 0.5px; border-bottom: 2px solid var(--border-color);
         }
         .table-dark tbody tr:hover { background: rgba(255,255,255,0.03); }
+        .table-dark tbody tr.table-active { background: rgba(97,175,239,0.15); border-left: 3px solid var(--accent); }
         /* Stat Card */
         .stat-card {
             background: var(--bg-secondary); border: 1px solid var(--border-color);
@@ -1038,13 +1039,13 @@
                 <span>搜索结果 <span class="text-info small" id="onlineResultCount"></span></span>
             </div>
             <div class="card-body p-0" id="onlineScrollContainer" style="max-height:600px;overflow-y:auto;">
-                <table class="table table-dark mb-0" style="width:auto;max-width:100%;">
+                <table class="table table-dark mb-0" style="table-layout:fixed;">
                     <thead>
                         <tr>
                             <th style="width:50px;">封面</th>
-                            <th style="max-width:300px;">标题</th>
-                            <th style="width:100px;">歌手</th>
-                            <th style="width:100px;">专辑</th>
+                            <th>标题</th>
+                            <th style="width:120px;">歌手</th>
+                            <th style="width:120px;">专辑</th>
                             <th style="width:60px;">音源</th>
                             <th style="width:90px;">音质</th>
                             <th style="width:60px;">操作</th>
@@ -1058,7 +1059,7 @@
         <div id="onlineArtistDetail" class="d-none">
             <div class="card-dark">
                 <div class="card-header d-flex align-items-center gap-3">
-                    <img id="artistImage" src="" style="width:60px;height:60px;border-radius:50%;object-fit:cover;">
+                    <img id="artistImage" src="" style="width:60px;height:60px;border-radius:50%;object-fit:cover;" onerror="this.src='/static/vinyl.svg'">
                     <div>
                         <h5 class="mb-0 text-white" id="artistName"></h5>
                     </div>
@@ -1075,15 +1076,15 @@
         <div id="onlineAlbumDetail" class="d-none">
             <div class="card-dark">
                 <div class="card-header d-flex align-items-center gap-3">
-                    <img id="albumCover" src="" style="width:60px;height:60px;border-radius:4px;object-fit:cover;">
+                    <img id="albumCover" src="" style="width:60px;height:60px;border-radius:4px;object-fit:cover;" onerror="this.src='/static/vinyl.svg'">
                     <div>
                         <h5 class="mb-0 text-white" id="albumName"></h5>
                         <small class="text-muted" id="albumArtist"></small>
                     </div>
                 </div>
                 <div class="card-body p-0" style="max-height:600px;overflow-y:auto;">
-                    <table class="table table-dark mb-0">
-                        <thead><tr><th>#</th><th>标题</th><th>歌手</th><th>音源</th><th>音质</th><th>操作</th></tr></thead>
+                    <table class="table table-dark mb-0" style="table-layout:fixed;">
+                        <thead><tr><th style="width:40px;">#</th><th>标题</th><th style="width:120px;">歌手</th><th style="width:60px;">音源</th><th style="width:90px;">音质</th><th style="width:60px;">操作</th></tr></thead>
                         <tbody id="albumTrackBody"></tbody>
                     </table>
                 </div>
@@ -1315,7 +1316,9 @@ document.querySelectorAll('.sidebar .nav-link').forEach(link => {
         if (page === 'music') refreshMusicStats();
         if (page === 'playlist') loadPlaylists();
         if (page === 'online-download') { /* on-demand */ }
-        if (page === 'download-manager') refreshDownloadTasks();
+        // 下载管理页：启动轮询；其他页：停止轮询
+        if (page === 'download-manager') { refreshDownloadTasks(); startDownloadPolling(); }
+        else { stopDownloadPolling(); }
         if (page === 'playlist-sync') refreshPlaylistSync();
         if (page === 'voice') loadVoiceCommands();
         if (page === 'settings') { loadConfig(); loadAlarms(); }
@@ -1686,7 +1689,7 @@ function formatDuration(seconds) {
 function renderSongs(songs) {
     const tb = document.getElementById('songTableBody');
     tb.innerHTML = songs.map((s, i) => `
-        <tr>
+        <tr id="songRow_${s._idx}">
             <td style="width:40px;vertical-align:middle;color:var(--text-primary);">${i+1}</td>
             <td style="vertical-align:middle;">
                 <div class="d-flex align-items-center gap-2">
@@ -1723,6 +1726,7 @@ function renderSongs(songs) {
             </td>
         </tr>
     `).join('');
+    highlightCurrentSong();
 }
 
 function renderCurrentSongPage() {
@@ -1735,7 +1739,7 @@ function renderCurrentSongPage() {
     const offsetDisplay = start;
     const tb = document.getElementById('songTableBody');
     tb.innerHTML = pageSongs.map((s, i) => `
-        <tr>
+        <tr id="songRow_${s._idx}">
             <td style="width:40px;vertical-align:middle;color:var(--text-primary);">${offsetDisplay + i + 1}</td>
             <td style="vertical-align:middle;">
                 <div class="d-flex align-items-center gap-2">
@@ -1773,6 +1777,7 @@ function renderCurrentSongPage() {
         </tr>
     `).join('');
     renderSongPagination();
+    highlightCurrentSong();
 }
 
 function renderSongPagination() {
@@ -2153,6 +2158,18 @@ function updatePlayerUI(state) {
     // 音量
     if (state.volume !== undefined) {
         document.getElementById('playerVolume').value = state.volume;
+    }
+    // 高亮当前播放歌曲
+    highlightCurrentSong();
+}
+
+function highlightCurrentSong() {
+    document.querySelectorAll('#songTableBody tr').forEach(tr => {
+        tr.classList.remove('table-active');
+    });
+    if (currentPlayingIndex !== null && currentPlayingIndex !== undefined) {
+        const row = document.getElementById('songRow_' + currentPlayingIndex);
+        if (row) row.classList.add('table-active');
     }
 }
 
@@ -3467,16 +3484,19 @@ async function openArtist(source, artistId) {
         // 热门歌曲
         const songs = data.top_songs || [];
         if (songs.length > 0) {
-            let songHtml = '<table class="table table-dark table-sm mb-0"><tbody>';
+            let songHtml = '<table class="table table-dark table-sm mb-0" style="table-layout:fixed;"><tbody>';
             songs.forEach((s, i) => {
                 const fmtOptions = (s.formats || []).map((f, fi) =>
                     '<option value="' + f.type + '|' + f.bitrate + '"' + (fi === 0 ? ' selected' : '') + '>' + f.name + '</option>'
                 ).join('');
+                const songCover = s.cover || '/static/vinyl.svg';
                 songHtml += '<tr>' +
-                    '<td style="width:30px;">' + (i + 1) + '</td>' +
-                    '<td>' + escHtml(s.title || s.name || '') + '</td>' +
-                    '<td style="width:100px;"><select class="form-select form-select-dark form-select-sm" id="asfmt_' + i + '">' + fmtOptions + '</select></td>' +
-                    '<td style="width:60px;"><button class="btn btn-sm btn-accent" onclick="downloadArtistSong(' + i + ')"><i class="bi bi-download"></i></button></td>' +
+                    '<td style="width:30px;vertical-align:middle;color:var(--text-primary);">' + (i + 1) + '</td>' +
+                    '<td style="vertical-align:middle;"><div class="d-flex align-items-center gap-2">' +
+                    '<img src="' + songCover + '" style="width:28px;height:28px;object-fit:cover;border-radius:4px;flex-shrink:0;" onerror="this.style.display=\'none\'" loading="lazy">' +
+                    '<span style="font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(s.title || s.name || '') + '</span></div></td>' +
+                    '<td style="width:90px;vertical-align:middle;"><select class="form-select form-select-dark form-select-sm" id="asfmt_' + i + '">' + fmtOptions + '</select></td>' +
+                    '<td style="width:60px;vertical-align:middle;"><button class="btn btn-sm btn-accent" onclick="downloadArtistSong(' + i + ')"><i class="bi bi-download"></i></button></td>' +
                     '</tr>';
             });
             songHtml += '</tbody></table>';
@@ -3568,13 +3588,16 @@ async function openAlbum(source, albumId) {
                 const fmtOptions = (t.formats || []).map((f, fi) =>
                     '<option value="' + f.type + '|' + f.bitrate + '"' + (fi === 0 ? ' selected' : '') + '>' + f.name + '</option>'
                 ).join('');
+                const trackCover = t.cover || data.cover || '/static/vinyl.svg';
                 trackHtml += '<tr>' +
-                    '<td>' + (i + 1) + '</td>' +
-                    '<td>' + escHtml(t.title || t.name || '') + '</td>' +
-                    '<td><small style="color:#aaa;">' + escHtml(t.artist || '-') + '</small></td>' +
-                    '<td><span class="badge bg-' + (source === 'kuwo' ? 'warning text-dark' : 'danger') + '">' + (source === 'kuwo' ? '酷我' : '网易云') + '</span></td>' +
-                    '<td><select class="form-select form-select-dark form-select-sm" id="atfmt_' + i + '">' + fmtOptions + '</select></td>' +
-                    '<td><button class="btn btn-sm btn-accent" onclick="downloadAlbumTrack(' + i + ')"><i class="bi bi-download"></i></button></td>' +
+                    '<td style="width:40px;vertical-align:middle;color:var(--text-primary);">' + (i + 1) + '</td>' +
+                    '<td style="vertical-align:middle;"><div class="d-flex align-items-center gap-2">' +
+                    '<img src="' + trackCover + '" style="width:28px;height:28px;object-fit:cover;border-radius:4px;flex-shrink:0;" onerror="this.style.display=\'none\'" loading="lazy">' +
+                    '<span style="font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(t.title || t.name || '') + '</span></div></td>' +
+                    '<td style="width:120px;vertical-align:middle;font-size:14px;">' + escHtml(t.artist || '-') + '</td>' +
+                    '<td style="width:60px;vertical-align:middle;"><span class="badge bg-' + (source === 'kuwo' ? 'warning text-dark' : 'danger') + '">' + (source === 'kuwo' ? '酷我' : '网易云') + '</span></td>' +
+                    '<td style="width:90px;vertical-align:middle;"><select class="form-select form-select-dark form-select-sm" id="atfmt_' + i + '">' + fmtOptions + '</select></td>' +
+                    '<td style="width:60px;vertical-align:middle;"><button class="btn btn-sm btn-accent" onclick="downloadAlbumTrack(' + i + ')"><i class="bi bi-download"></i></button></td>' +
                     '</tr>';
             });
             let trackHtmlEnd = '<tr><td colspan="6" class="p-2"><button class="btn btn-outline-accent btn-sm" onclick="downloadAllAlbumTracks()"><i class="bi bi-download"></i> 下载全部</button></td></tr>';
@@ -3632,7 +3655,7 @@ async function downloadAllArtistSongs() {
     const source = window._artistSource || 'kuwo';
     if (songs.length === 0) return;
     let ok = 0, fail = 0;
-    showToast('开始下载 ' + songs.length + ' 首歌曲...');
+    showToast('正在加入下载队列...');
     for (let i = 0; i < songs.length; i++) {
         const s = songs[i];
         const fmtSel = document.getElementById('asfmt_' + i);
@@ -3650,7 +3673,7 @@ async function downloadAllArtistSongs() {
         });
         if (r.code === 0) ok++; else fail++;
     }
-    showToast('下载完成: ' + ok + ' 首成功' + (fail ? ', ' + fail + ' 首失败' : ''));
+    showToast('已加入下载队列: ' + ok + ' 首' + (fail ? ', ' + fail + ' 首失败' : ''));
 }
 
 async function downloadAllAlbumTracks() {
@@ -3658,7 +3681,7 @@ async function downloadAllAlbumTracks() {
     const source = window._albumSource || 'kuwo';
     if (tracks.length === 0) return;
     let ok = 0, fail = 0;
-    showToast('开始下载 ' + tracks.length + ' 首歌曲...');
+    showToast('正在加入下载队列...');
     for (let i = 0; i < tracks.length; i++) {
         const t = tracks[i];
         const fmtSel = document.getElementById('atfmt_' + i);
@@ -3676,7 +3699,7 @@ async function downloadAllAlbumTracks() {
         });
         if (r.code === 0) ok++; else fail++;
     }
-    showToast('下载完成: ' + ok + ' 首成功' + (fail ? ', ' + fail + ' 首失败' : ''));
+    showToast('已加入下载队列: ' + ok + ' 首' + (fail ? ', ' + fail + ' 首失败' : ''));
 }
 
 async function downloadSingleSong(idx) {
@@ -3738,6 +3761,15 @@ async function downloadSong(idx) {
 
 // ===== 下载管理 =====
 let downloadFilterStatus = '';
+let downloadPollTimer = null;
+
+function startDownloadPolling() {
+    if (downloadPollTimer) return;
+    downloadPollTimer = setInterval(refreshDownloadTasks, 3000);
+}
+function stopDownloadPolling() {
+    if (downloadPollTimer) { clearInterval(downloadPollTimer); downloadPollTimer = null; }
+}
 
 async function refreshDownloadTasks() {
     const r = await api('/api/download/tasks?status=' + downloadFilterStatus + '&limit=100');
@@ -4019,9 +4051,23 @@ async function renderArtistList(kw) {
             + '<img src="' + coverUrl + '" style="width:160px;height:160px;border-radius:50%;object-fit:cover;margin:0 auto 8px;" onerror="this.src=\'/static/vinyl.svg\'">'
             + '<div style="font-size:14px;color:#fff;font-weight:500;">' + escHtml(a.name) + '</div>'
             + '<small class="text-muted">' + a.song_count + ' 首歌曲</small>'
-            + '<div class="mt-2"><button class="btn btn-sm btn-outline-danger" data-name="' + escAttr(a.name) + '" onclick="deleteArtist(this.dataset.name)"><i class="bi bi-trash"></i> 删除</button></div>'
-            + '</div></div>';
+            + '<div class="mt-2 d-flex gap-1 justify-content-center">'
+            + '<button class="btn btn-sm btn-outline-accent" data-name="' + escAttr(a.name) + '" onclick="playArtistSongs(this.dataset.name)" title="播放该歌手所有歌曲"><i class="bi bi-play-fill"></i> 播放</button>'
+            + '<button class="btn btn-sm btn-outline-danger" data-name="' + escAttr(a.name) + '" onclick="deleteArtist(this.dataset.name)"><i class="bi bi-trash"></i></button>'
+            + '</div></div></div>';
     }).join('');
+}
+
+async function playArtistSongs(name) {
+    // 获取该歌手的所有歌曲
+    const r = await api('/api/music/songs?limit=5000');
+    const allSongs = r.data || [];
+    const artistSongs = allSongs.filter(s => s.artist === name);
+    if (artistSongs.length === 0) {
+        alert('未找到该歌手的歌曲');
+        return;
+    }
+    playSongByList(artistSongs, 0);
 }
 
 async function deleteSong(idx) {
