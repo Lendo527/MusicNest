@@ -23,7 +23,7 @@ DEFAULT_CONFIG = {
     "log_lines": 200,
     "auto_scan_interval": 0,
     "voice_engine_enabled": True,
-    "tts_enabled": True,            # TTS 语音反馈开关（语音指令执行后播报结果）
+    "tts_enabled": False,           # TTS 语音反馈开关（设备 MiNA API 403 无权限，UBus TTS 被音乐覆盖，默认关闭）
     "auto_music_api": True,         # 自动根据设备型号选择播放 API（play_music_url vs play_url）
     "debug_logging": True,          # 启用调试日志（输出到 /data/debug.log）
     "device_selections": {},  # deviceID -> bool: 勾选的设备才参与拦截和播放

@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 import jinja2
 from jinja2 import Environment, FileSystemLoader
 
+import httpx
+
 templates_dir = Path(__file__).parent / "templates"
 _jinja_env = Environment(loader=FileSystemLoader(str(templates_dir)), autoescape=True)
 

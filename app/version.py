@@ -7,6 +7,16 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.32 - 15 个问题批量修复：
+           歌手列表播放/删除按钮对齐(align-items-center)+文案改播放全部+stopPropagation；
+           点击歌手头像显示该歌手所有歌曲(showArtistSongs 模态框)；
+           播放替换列表非增量(playSongFromList 传歌曲列表给后端替换 playlist)；
+           统一列表垂直居中(模态框/在线下载 td 加 vertical-align:middle)；
+           在线搜索歌手/专辑 id 剥离正则修复(/^(kuwo_artist_|kuwo_album_|kuwo_|netease_)/)；
+           歌手名可见性修复(album-card-artist #7f848e→#b0b6c1，专辑详情用 color:#aaa)；
+           在线下载播放白龙马2秒停住修复(main.py 补 import httpx，代理端点 NameError)；
+           TTS 默认关闭(tts_enabled=False，MiNA API 403 无权限，UBus 被音乐覆盖)；
+           歌曲列表/在线下载列表高度改为 calc(100vh - 280px) 靠近播放器
   0.0.31 - TTS 修复：text_to_speech 优先使用 MiNA API TTS 端点
            (/miv1/device/:id/text_to_speech)，失败回退 UBus player_play_tts；
            之前只检查返回值 is not None，未检查 code 字段，设备返回错误码也报成功；
@@ -39,4 +49,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.31"
+__version__ = "0.0.32"
