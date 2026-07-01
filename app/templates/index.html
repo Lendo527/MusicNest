@@ -658,11 +658,11 @@
         <div class="row">
             <div class="col-md-6">
                 <div class="card-dark">
-                    <div class="card-header">小米账号授权</div>
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>小米账号授权</span>
+                        <span id="authStatusText" class="text-muted small">加载中...</span>
+                    </div>
                     <div class="card-body">
-                        <div id="authStatus">
-                            <p id="authStatusText" class="text-muted">加载中...</p>
-                        </div>
                         <div id="authActions" class="mt-3">
                             <button class="btn btn-accent btn-sm" onclick="getQRCode()" id="btnQrLogin">
                                 <i class="bi bi-qr-code"></i> 扫码登录
@@ -1042,12 +1042,12 @@
                     <thead>
                         <tr>
                             <th style="width:50px;">封面</th>
-                            <th style="width:auto;max-width:250px;">标题</th>
-                            <th style="width:120px;">歌手</th>
+                            <th>标题</th>
+                            <th style="width:100px;">歌手</th>
                             <th style="width:100px;">专辑</th>
-                            <th style="width:80px;">音源</th>
-                            <th style="width:100px;">音质</th>
-                            <th style="width:80px;">操作</th>
+                            <th style="width:60px;">音源</th>
+                            <th style="width:90px;">音质</th>
+                            <th style="width:60px;">操作</th>
                         </tr>
                     </thead>
                     <tbody id="onlineSearchTableBody"></tbody>
@@ -1416,25 +1416,48 @@ async function checkAuthStatus() {
         body: JSON.stringify({action: 'check'})
     });
     const configured = r.data && r.data.configured;
-    document.getElementById('authStatusText').textContent = configured
-        ? `已登录 · 用户ID: ${r.data.userId}`
-        : '未配置小米账号，请扫码登录';
-    document.getElementById('authStatusText').className = configured ? 'text-success' : 'text-muted';
 
-    // 根据登录状态显示/隐藏按钮和表单
-    document.getElementById('btnQrLogin').style.display = configured ? 'none' : '';
-    document.getElementById('btnPwdLogin').style.display = configured ? 'none' : '';
-    document.getElementById('btnLogout').style.display = configured ? '' : 'none';
-
-    // 登出时清理所有登录相关 UI
     if (!configured) {
+        // 未配置小米账号
+        document.getElementById('authStatusText').textContent = '未配置';
+        document.getElementById('authStatusText').className = 'text-muted small';
+        document.getElementById('btnQrLogin').style.display = '';
+        document.getElementById('btnPwdLogin').style.display = '';
+        document.getElementById('btnLogout').style.display = 'none';
         document.getElementById('qrArea').style.display = 'none';
         document.getElementById('pwdLoginForm').style.display = 'none';
         if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
         qrPollData = null;
+        // 清空设备列表
+        document.getElementById('deviceTableBody').innerHTML = '<tr><td colspan="5" class="text-muted text-center">未配置小米账号</td></tr>';
+        return;
     }
 
-    if (configured) refreshDevices();
+    // 已配置，验证 token 是否真的有效（尝试获取设备列表）
+    const dr = await api('/api/devices');
+    const hasDevices = dr.code === 0 && dr.data && dr.data.length > 0;
+
+    if (hasDevices) {
+        // token 有效
+        document.getElementById('authStatusText').textContent = `已登录 · 用户ID: ${r.data.userId}`;
+        document.getElementById('authStatusText').className = 'text-success small';
+        document.getElementById('btnQrLogin').style.display = 'none';
+        document.getElementById('btnPwdLogin').style.display = 'none';
+        document.getElementById('btnLogout').style.display = '';
+        refreshDevices();
+    } else {
+        // token 已过期，显示未登录样式
+        document.getElementById('authStatusText').textContent = 'Token 已过期，请重新登录';
+        document.getElementById('authStatusText').className = 'text-warning small';
+        document.getElementById('btnQrLogin').style.display = '';
+        document.getElementById('btnPwdLogin').style.display = '';
+        document.getElementById('btnLogout').style.display = 'none';
+        document.getElementById('qrArea').style.display = 'none';
+        document.getElementById('pwdLoginForm').style.display = 'none';
+        if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
+        qrPollData = null;
+        document.getElementById('deviceTableBody').innerHTML = '<tr><td colspan="5" class="text-warning text-center">Token 已过期，请重新登录</td></tr>';
+    }
 }
 
 let qrPollTimer = null;
@@ -3363,13 +3386,13 @@ function renderSongResults() {
             : '<small>' + escHtml(s.album || '-') + '</small>';
 
         return '<tr>' +
-            '<td><img src="' + coverSrc + '" style="width:40px;height:40px;object-fit:cover;border-radius:4px;" onerror="this.src=\'/static/vinyl.svg\'"></td>' +
-            '<td><div style="font-size:14px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px;">' + escHtml(s.title || '') + '</div></td>' +
-            '<td>' + artistHtml + '</td>' +
-            '<td>' + albumHtml + '</td>' +
-            '<td>' + sourceBadge + '</td>' +
-            '<td><select class="form-select form-select-dark form-select-sm" id="fmt_' + gi + '_0">' + fmtOptions + '</select></td>' +
-            '<td><button class="btn btn-sm btn-accent" onclick="downloadSingleSong(' + gi + ')"><i class="bi bi-download"></i></button></td>' +
+            '<td style="vertical-align:middle;"><img src="' + coverSrc + '" style="width:40px;height:40px;object-fit:cover;border-radius:4px;" onerror="this.src=\'/static/vinyl.svg\'"></td>' +
+            '<td style="vertical-align:middle;"><div style="font-size:14px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(s.title || '') + '</div></td>' +
+            '<td style="vertical-align:middle;">' + artistHtml + '</td>' +
+            '<td style="vertical-align:middle;">' + albumHtml + '</td>' +
+            '<td style="vertical-align:middle;">' + sourceBadge + '</td>' +
+            '<td style="vertical-align:middle;"><select class="form-select form-select-dark form-select-sm" id="fmt_' + gi + '_0">' + fmtOptions + '</select></td>' +
+            '<td style="vertical-align:middle;"><button class="btn btn-sm btn-accent" onclick="downloadSingleSong(' + gi + ')"><i class="bi bi-download"></i></button></td>' +
             '</tr>';
     }).join('');
 }
@@ -3554,7 +3577,7 @@ async function openAlbum(source, albumId) {
                     '<td><button class="btn btn-sm btn-accent" onclick="downloadAlbumTrack(' + i + ')"><i class="bi bi-download"></i></button></td>' +
                     '</tr>';
             });
-            let trackHtmlEnd = '</tbody></table><div class="p-2"><button class="btn btn-outline-accent btn-sm" onclick="downloadAllAlbumTracks()"><i class="bi bi-download"></i> 下载全部</button></div>';
+            let trackHtmlEnd = '<tr><td colspan="6" class="p-2"><button class="btn btn-outline-accent btn-sm" onclick="downloadAllAlbumTracks()"><i class="bi bi-download"></i> 下载全部</button></td></tr>';
             document.getElementById('albumTrackBody').innerHTML = trackHtml + trackHtmlEnd;
             window._albumTracks = tracks;
             window._albumSource = source;
@@ -3993,7 +4016,7 @@ async function renderArtistList(kw) {
         // 始终通过 API 获取封面（后端会 fallback 到 vinyl.svg）
         const coverUrl = '/api/music/artist_cover?artist=' + encodeURIComponent(a.name);
         return '<div class="col"><div class="album-card card-dark h-100 text-center p-3" style="cursor:default;">'
-            + '<img src="' + coverUrl + '" style="width:80px;height:80px;border-radius:50%;object-fit:cover;margin:0 auto 8px;" onerror="this.src=\'/static/vinyl.svg\'">'
+            + '<img src="' + coverUrl + '" style="width:160px;height:160px;border-radius:50%;object-fit:cover;margin:0 auto 8px;" onerror="this.src=\'/static/vinyl.svg\'">'
             + '<div style="font-size:14px;color:#fff;font-weight:500;">' + escHtml(a.name) + '</div>'
             + '<small class="text-muted">' + a.song_count + ' 首歌曲</small>'
             + '<div class="mt-2"><button class="btn btn-sm btn-outline-danger" data-name="' + escAttr(a.name) + '" onclick="deleteArtist(this.dataset.name)"><i class="bi bi-trash"></i> 删除</button></div>'

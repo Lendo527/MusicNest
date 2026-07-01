@@ -1295,8 +1295,12 @@ async def api_devices_auth(body: dict) -> dict:
                 })
                 await _init_miot_client(user_id, service_token)
                 # 记录 token 创建时间，供刷新循环估算有效期
-                from app.miot.token_refresh import record_token_created
+                from app.miot.token_refresh import record_token_created, start_refresh_loop
                 record_token_created()
+                start_refresh_loop(miauth)
+                # 启动对话监控和媒体状态轮询
+                if config.get("conversation_monitor_enabled", True):
+                    await _start_monitor()
                 return {"code": 0, "msg": "登录成功", "data": {"userId": user_id}}
         return {"code": 1, "msg": result.get("msg", "登录失败")}
 
@@ -1341,8 +1345,12 @@ async def api_devices_auth(body: dict) -> dict:
 
                 await _init_miot_client(user_id, service_token)
                 # 记录 token 创建时间，供刷新循环估算有效期
-                from app.miot.token_refresh import record_token_created
+                from app.miot.token_refresh import record_token_created, start_refresh_loop
                 record_token_created()
+                start_refresh_loop(miauth)
+                # 启动对话监控和媒体状态轮询
+                if config.get("conversation_monitor_enabled", True):
+                    await _start_monitor()
                 return {
                     "code": 0,
                     "msg": "登录成功",
