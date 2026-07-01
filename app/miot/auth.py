@@ -266,10 +266,10 @@ class MiAuth:
                 headers["Cookie"] = cookie_header
 
             logger.debug("[MiAuth] 轮询 QR 结果: lp_url=%s", lp_url[:80])
-            # 单次长轮询：服务端会阻塞约 30s，这里设 short timeout 让前端驱动重试
+            # 长轮询：服务端会阻塞约 30s，客户端 timeout 略大于服务端（35s）
             resp = await client.get(
                 lp_url, headers=headers,
-                timeout=httpx.Timeout(12.0, connect=10.0),
+                timeout=httpx.Timeout(35.0, connect=10.0),
             )
 
             status = resp.status_code

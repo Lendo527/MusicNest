@@ -44,6 +44,8 @@ class MinaHTTPClient:
         self._ssecurity = ssecurity
         self._user_agent = _format_user_agent(self._device_id)
         self._client = httpx.AsyncClient(timeout=15.0)
+        # 401 过期回调（由 token_refresh 模块注入）
+        self._on_token_expired = None
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -53,6 +55,10 @@ class MinaHTTPClient:
         self._service_token = service_token
         if ssecurity:
             self._ssecurity = ssecurity
+
+    def set_token_expired_callback(self, cb) -> None:
+        """注入 401 过期回调"""
+        self._on_token_expired = cb
 
     # ===== 设备列表 =====
 
@@ -346,7 +352,7 @@ class MinaHTTPClient:
         return result
 
     async def _do_get(self, url: str) -> Optional[dict]:
-        """执行 GET 请求"""
+        """执行 GET 请求（含 401 自动重试）"""
         headers = {
             "User-Agent": self._user_agent,
             "Cookie": _build_cookies(self._user_id, self._service_token),
@@ -354,13 +360,21 @@ class MinaHTTPClient:
         try:
             resp = await self._client.get(url, headers=headers)
             if resp.status_code == 401:
+                # 尝试刷新 token 后重试一次
+                if await self._try_refresh_token():
+                    headers["Cookie"] = _build_cookies(self._user_id, self._service_token)
+                    resp = await self._client.get(url, headers=headers)
+                    if resp.status_code == 401:
+                        logger.warning("[MIoT] 401 重试后仍失败")
+                        return None
+                    return resp.json()
                 return None
             return resp.json()
         except Exception:
             return None
 
     async def _do_post(self, url: str, form_data: dict) -> Optional[dict]:
-        """执行 POST 请求（form-urlencoded）"""
+        """执行 POST 请求（form-urlencoded，含 401 自动重试）"""
         headers = {
             "User-Agent": self._user_agent,
             "Content-Type": "application/x-www-form-urlencoded",
@@ -369,10 +383,33 @@ class MinaHTTPClient:
         try:
             resp = await self._client.post(url, headers=headers, data=form_data)
             if resp.status_code == 401:
+                # 尝试刷新 token 后重试一次
+                if await self._try_refresh_token():
+                    headers["Cookie"] = _build_cookies(self._user_id, self._service_token)
+                    resp = await self._client.post(url, headers=headers, data=form_data)
+                    if resp.status_code == 401:
+                        logger.warning("[MIoT] 401 重试后仍失败")
+                        return None
+                    return resp.json() if resp.text else None
                 return None
             return resp.json() if resp.text else None
         except Exception:
             return None
+
+    async def _try_refresh_token(self) -> bool:
+        """401 时尝试刷新 token"""
+        if self._on_token_expired is None:
+            return False
+        try:
+            ok = await self._on_token_expired()
+            if ok:
+                # 从 config 读取刷新后的 token
+                self._service_token = config.get("miot_token", "")
+                logger.info("[MIoT] token 已刷新，重试请求")
+            return ok
+        except Exception as e:
+            logger.error("[MIoT] token 刷新异常: %s", e)
+            return False
 
 
 def _generate_device_id() -> str:

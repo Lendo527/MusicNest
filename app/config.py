@@ -1,5 +1,6 @@
 """配置管理 - 持久化到 /data/config.yaml"""
 
+import logging
 import os
 import threading
 from pathlib import Path
@@ -49,7 +50,6 @@ DEFAULT_CONFIG = {
         "cookie": "",  # 网易云 Cookie
         "enabled": True,
     },
-    "tts_enabled": True,
 }
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/data/config.yaml")
@@ -75,8 +75,10 @@ class ConfigManager:
                     for key in DEFAULT_CONFIG:
                         if key in loaded:
                             self._data[key] = loaded[key]
-            except Exception:
-                pass
+            except Exception as e:
+                logging.getLogger("musicnest.config").warning(
+                    "[Config] 配置文件加载失败，使用默认配置: %s", e
+                )
         else:
             self._save()
 

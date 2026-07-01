@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import jinja2
@@ -109,10 +109,9 @@ monitor: ConversationMonitor | None = None
 scanner = MusicScanner(config.get("music_path", "/music"))
 voice_engine = VoiceEngine()
 
-app = FastAPI(title="MusicNest", version="0.0.23")
+app = FastAPI(title="MusicNest", version="0.0.27")
 
 # 静态文件（默认封面等）
-import os
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
@@ -181,7 +180,9 @@ class PlayState:
             if length == 1:
                 return 0
             import random as _random
-            return _random.randint(0, length - 1)
+            # 排除当前歌曲，避免"下一首"返回正在播放的曲
+            candidates = [i for i in range(length) if i != self.current_index]
+            return _random.choice(candidates)
         return None
 
     def _get_prev_index(self) -> Optional[int]:
@@ -446,6 +447,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
     # === 通用语音引擎 ===
     result = voice_engine.handle_message(query)
     if not result:
+        # 未匹配任何指令：用户与小爱聊天（如问天气）打断了音乐
+        # 触发 smart_resume：等待 TTS 结束后自动恢复播放
+        if play_state.is_playing and play_state.current_song() and miot_client:
+            asyncio.create_task(_smart_resume_playback(device_id))
+            logger.info(f"[SmartResume] 检测到播放被打断，启动智能恢复任务: query={query[:40]!r}")
         return
     logger.info(f"[VoiceCmd] 命中: type={result.command.type} keyword={result.keyword} arg={result.argument}")
 
@@ -719,6 +725,69 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             logger.warning(f"[VoiceTTS] TTS 播报失败: {e}")
 
 
+async def _smart_resume_playback(device_id: str, timeout: int = 30) -> None:
+    """语音打断后智能恢复播放
+
+    场景：用户问"今天天气"等非音乐问题，小爱 TTS 回答打断了音乐。
+    逻辑（参考 songloft-plugin-miot 的 smart_resume）:
+    1. 等待 3 秒让 TTS 开始
+    2. 轮询设备状态每 2 秒
+    3. 检测 status != 1（设备空闲）→ 重新推送当前歌曲 URL
+    4. 超时但设备仍在播放 → 说明已自动恢复，不重发 URL
+    """
+    if not play_state.is_playing or not play_state.current_song():
+        return
+    client = await _check_miot()
+    if not client:
+        return
+
+    # 等待 3 秒让 TTS 开始播报
+    await asyncio.sleep(3)
+    if not play_state.is_playing:
+        return
+
+    poll_interval = 2.0
+    start_time = time.monotonic()
+    device_became_idle = False
+
+    while time.monotonic() - start_time < timeout:
+        if not play_state.is_playing:
+            return
+        try:
+            raw = await client.get_player_status(device_id)
+            info = _parse_player_info(raw)
+        except Exception as e:
+            logger.debug(f"[SmartResume] 状态轮询失败: {e}")
+            await asyncio.sleep(poll_interval)
+            continue
+        # status != 1 表示设备空闲（TTS 结束）
+        if info["status"] != 1:
+            device_became_idle = True
+            break
+        await asyncio.sleep(poll_interval)
+
+    if not play_state.is_playing:
+        return
+
+    if not device_became_idle:
+        # 超时：设备一直在播放，说明已自动恢复，无需重发
+        logger.info("[SmartResume] 设备仍在播放，跳过恢复")
+        return
+
+    # 设备空闲（TTS 结束），重新推送当前歌曲 URL
+    if play_state.current_index is None:
+        return
+    song = play_state.current_song()
+    if not song:
+        return
+    logger.info(f"[SmartResume] 检测到设备空闲，恢复播放: {song.get('title', '')}")
+    ok = await _play_on_device(device_id, play_state.current_index)
+    if ok:
+        play_state._play_start_time = time.monotonic()
+        play_state.is_playing = True
+        logger.info("[SmartResume] 播放已恢复")
+
+
 def _parse_timer_minutes(query: str) -> Optional[int]:
     """从语音文本中解析睡眠定时分钟数，如 '30分钟后停止播放' -> 30"""
     m = re.search(r'(\d+)\s*分钟?后?(?:停止|关闭|停|关)', query)
@@ -795,6 +864,8 @@ async def lifespan(app: FastAPI):
             logger.info(f"从缓存恢复曲库: {s['total_songs']} 首歌曲")
 
     # 启动下载 Worker
+    from app.download.worker import set_scan_callback
+    set_scan_callback(scanner.scan_new)
     _download_task = asyncio.create_task(download_worker(poll_interval=5.0))
     logger.info("下载 Worker 已启动")
 
@@ -832,9 +903,17 @@ async def lifespan(app: FastAPI):
         # 恢复闹钟任务
         _restore_alarms()
 
+        # 启动 token 自动刷新定时任务（2h 检查 / 3h 阈值 / 60s 节流）
+        from app.miot.token_refresh import start_refresh_loop
+        start_refresh_loop(miauth)
+        logger.info("[TokenRefresh] token 自动刷新任务已启动")
+
     yield
 
     # 关闭
+    # 停止 token 自动刷新
+    from app.miot.token_refresh import stop_refresh_loop
+    stop_refresh_loop()
     # 停止下载 Worker
     stop_worker()
     _download_task.cancel()
@@ -873,6 +952,11 @@ async def _init_miot_client(user_id: str, service_token: str) -> None:
     ssecurity = config.get("miot_ssecurity", "")
     device_id = config.get("miot_device_id", "")
     miot_client = MinaHTTPClient(user_id, service_token, device_id, ssecurity)
+    # 注入 401 自动刷新回调
+    from app.miot.token_refresh import handle_token_expired
+    miot_client.set_token_expired_callback(
+        lambda: handle_token_expired(miauth)
+    )
 
 
 async def _start_monitor() -> None:
@@ -893,8 +977,8 @@ async def _start_monitor() -> None:
     # 注册语音指令回调
     monitor.register_callback("voice", _on_voice_message)
 
-    # 获取设备列表并启动
-    devices = await miot_client.get_device_list()
+    # 获取设备列表并启动（强制刷新，确保启动时拿到最新列表）
+    devices = await _get_device_list(use_cache=False)
     if devices:
         logger.info(f"发现 {len(devices)} 个设备，启动对话监控 (poll_interval={poll_interval}s)")
         await monitor.start(devices)
@@ -913,6 +997,30 @@ async def _check_miot() -> MinaHTTPClient:
             raise ValueError("小米账号未配置，请先授权登录")
     assert miot_client is not None
     return miot_client
+
+
+# ===== 设备列表缓存（TTL 60s，避免高频远程调用） =====
+_device_list_cache: list[dict] = []
+_device_list_cache_at: float = 0.0
+_DEVICE_LIST_CACHE_TTL = 60.0  # 秒
+
+
+async def _get_device_list(use_cache: bool = True) -> list[dict]:
+    """获取设备列表（带 60s TTL 缓存）
+
+    Args:
+        use_cache: True 时优先用缓存；False 强制刷新
+    """
+    global _device_list_cache, _device_list_cache_at
+    now = time.time()
+    if use_cache and _device_list_cache and (now - _device_list_cache_at) < _DEVICE_LIST_CACHE_TTL:
+        return _device_list_cache
+    client = await _check_miot()
+    devices = await client.get_device_list()
+    if devices:
+        _device_list_cache = devices
+        _device_list_cache_at = now
+    return devices or []
 
 
 def _restart_monitor_if_running() -> None:
@@ -1026,6 +1134,9 @@ async def api_devices_auth(body: dict) -> dict:
                     "miot_device_id": device_id,
                 })
                 await _init_miot_client(user_id, service_token)
+                # 记录 token 创建时间，供刷新循环估算有效期
+                from app.miot.token_refresh import record_token_created
+                record_token_created()
                 return {"code": 0, "msg": "登录成功", "data": {"userId": user_id}}
         return {"code": 1, "msg": result.get("msg", "登录失败")}
 
@@ -1063,11 +1174,15 @@ async def api_devices_auth(body: dict) -> dict:
                     "miot_user_id": user_id,
                     "miot_ssecurity": ssecurity,
                     "miot_device_id": device_id,
+                    "miot_pass_token": pass_token,  # 持久化 passToken 用于后续自动刷新
                 })
                 config.set("_auth_lp_url", "")
                 config.set("_auth_device_id", "")
 
                 await _init_miot_client(user_id, service_token)
+                # 记录 token 创建时间，供刷新循环估算有效期
+                from app.miot.token_refresh import record_token_created
+                record_token_created()
                 return {
                     "code": 0,
                     "msg": "登录成功",
@@ -1089,7 +1204,11 @@ async def api_devices_auth(body: dict) -> dict:
             "miot_token": "",
             "miot_user_id": "",
             "miot_ssecurity": "",
+            "miot_pass_token": "",
         })
+        # 停止 token 自动刷新
+        from app.miot.token_refresh import stop_refresh_loop
+        stop_refresh_loop()
         global miot_client, monitor
         if miot_client:
             await miot_client.close()
@@ -1197,24 +1316,33 @@ async def api_music_play(song_index: int, request: Request) -> Response:
 
 @app.get("/api/music/proxy/{url_hash}")
 async def api_music_proxy(url_hash: str) -> Response:
-    """代理在线音频流（带上正确 header 拉取 KUWO）"""
-    import httpx
-
+    """代理在线音频流（带上正确 header 拉取 KUWO），流式传输避免 OOM"""
     kuwo_url = _online_urls.get(url_hash)
     if not kuwo_url:
         return JSONResponse({"code": 1, "msg": "URL not found"}, status_code=404)
 
+    client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0))
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            req = client.build_request("GET", kuwo_url, headers=KUWO_HEADERS)
-            resp = await client.send(req, follow_redirects=True)
-            if resp.status_code != 200:
-                return JSONResponse({"code": 1, "msg": f"KUWO返回{resp.status_code}"}, status_code=502)
+        req = client.build_request("GET", kuwo_url, headers=KUWO_HEADERS)
+        resp = await client.send(req, follow_redirects=True)
+        if resp.status_code != 200:
+            await resp.aclose()
+            await client.aclose()
+            return JSONResponse({"code": 1, "msg": f"KUWO返回{resp.status_code}"}, status_code=502)
 
-            content = await resp.aread()
-            media_type = resp.headers.get("content-type", "audio/mpeg")
-            return Response(content=content, media_type=media_type)
+        media_type = resp.headers.get("content-type", "audio/mpeg")
+
+        async def _stream_and_close():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(_stream_and_close(), media_type=media_type)
     except Exception as e:
+        await client.aclose()
         return JSONResponse({"code": 1, "msg": str(e)}, status_code=502)
 
 
@@ -1366,6 +1494,19 @@ def _fix_play_state_after_delete(deleted_filepath: Optional[str] = None) -> None
 _AUDIO_EXTS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".wma", ".aac"}
 
 
+def _is_safe_path(path: str) -> bool:
+    """校验路径是否在音乐库目录下，防止误删系统文件"""
+    if not path:
+        return False
+    try:
+        music_root = Path(config.get("music_path", "/music")).resolve()
+        target = Path(path).resolve()
+        # 检查 target 是否在 music_root 下
+        return str(target).startswith(str(music_root))
+    except Exception:
+        return False
+
+
 def _has_audio_files(dirpath: str) -> bool:
     """检查目录下是否还有音频文件"""
     if not dirpath or not os.path.isdir(dirpath):
@@ -1423,6 +1564,10 @@ async def api_music_artist_delete(artist_name: str) -> dict:
     import shutil
     from urllib.parse import unquote
     name = unquote(artist_name)
+    # 校验路径安全性
+    artist_dir_path = os.path.join(config.get("music_path", "/music"), name)
+    if not _is_safe_path(artist_dir_path):
+        return {"code": 1, "msg": "路径不在音乐库范围内，已拒绝删除"}
     deleted = 0
     for s in scanner._songs[:]:
         if s.get("artist") == name:
@@ -1450,6 +1595,10 @@ async def api_music_album_delete(album_name: str, artist_name: str) -> dict:
     from urllib.parse import unquote
     aname = unquote(album_name)
     artname = unquote(artist_name)
+    # 校验路径安全性
+    album_dir_path = os.path.join(config.get("music_path", "/music"), artname, aname)
+    if not _is_safe_path(album_dir_path):
+        return {"code": 1, "msg": "路径不在音乐库范围内，已拒绝删除"}
     album_dir = ""
     deleted = 0
     for s in scanner._songs[:]:
@@ -1567,8 +1716,7 @@ async def api_device_control(body: dict) -> dict:
 async def _get_target_device() -> Optional[str]:
     """获取第一个在线且已勾选的设备"""
     try:
-        client = await _check_miot()
-        devices = await client.get_device_list()
+        devices = await _get_device_list()
         selections: dict = config.get("device_selections", {})
         for d in devices:
             did = d.get("deviceID", "")
@@ -1582,8 +1730,7 @@ async def _get_target_device() -> Optional[str]:
 async def _get_device_hardware(device_id: str) -> str:
     """根据 device_id 查询设备的 hardware 型号"""
     try:
-        client = await _check_miot()
-        devices = await client.get_device_list()
+        devices = await _get_device_list()
         for d in devices:
             if d.get("deviceID", "") == device_id:
                 return d.get("hardware", "")
@@ -1653,6 +1800,38 @@ async def _play_on_device(device_id: str, song_index: int) -> bool:
         return False
 
 
+def _parse_player_info(raw: dict) -> dict:
+    """解析 UBus player_get_play_status 响应。
+
+    响应格式: {"code":0, "data":{"info":'{"status":1,"play_song_detail":{"position":12000,"duration":240000,"name":"歌名"}}'}}
+
+    Returns:
+        {"status": int, "position": int(秒), "duration": int(秒), "name": str}
+        status: 1=播放中, 0=空闲/暂停; 解析失败返回 {"status": -1, ...}
+    """
+    result = {"status": -1, "position": 0, "duration": 0, "name": ""}
+    if not isinstance(raw, dict):
+        return result
+    data = raw.get("data")
+    info_str = data.get("info") if isinstance(data, dict) else None
+    if not isinstance(info_str, str):
+        return result
+    try:
+        parsed = json.loads(info_str)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return result
+    if not isinstance(parsed, dict):
+        return result
+    if "status" in parsed and isinstance(parsed["status"], (int, float)):
+        result["status"] = int(parsed["status"])
+    detail = parsed.get("play_song_detail")
+    if isinstance(detail, dict):
+        result["position"] = int(detail.get("position", 0)) // 1000  # ms → s
+        result["duration"] = int(detail.get("duration", 0)) // 1000
+        result["name"] = str(detail.get("name", "") or detail.get("title", ""))
+    return result
+
+
 @app.get("/api/player/state")
 async def api_player_state() -> dict:
     """获取播放器状态，自动感知音箱是否正在独立播放"""
@@ -1674,27 +1853,14 @@ async def api_player_state() -> dict:
         if not raw:
             return {"code": 0, "data": state}
         
-        # 解析 UBus 返回的播放状态
-        # 格式: {"code":0, "data":{"info":'{"status":1, "play_song_detail":{"position":12000,"duration":240000,"name":"歌曲名"}}'}}
-        info_str = None
-        data = raw.get("data")
-        if isinstance(data, dict):
-            info_str = data.get("info")
-        
-        if not isinstance(info_str, str):
+        info = _parse_player_info(raw)
+        if info["status"] != 1:  # 1 = 播放中
             return {"code": 0, "data": state}
         
-        parsed = json.loads(info_str)
-        status_code = parsed.get("status", 0)
-        if status_code != 1:  # 1 = 播放中
-            return {"code": 0, "data": state}
-        
-        detail = parsed.get("play_song_detail", {})
-        position = int(detail.get("position", 0)) // 1000  # ms → s
-        duration = int(detail.get("duration", 0)) // 1000
+        duration = info["duration"]
+        song_name = info["name"]
         
         # 尝试匹配正在播放的歌曲
-        song_name = detail.get("name", "") or detail.get("title", "")
         matched_song = None
         matched_index = None
         if song_name and scanner._songs:
@@ -1895,23 +2061,9 @@ async def api_player_progress() -> dict:
         if not raw:
             return {"code": 0, "data": {"position": 0, "duration": play_state.duration}}
 
-        # UBus response nests position/duration inside data.info as JSON string
-        # e.g. {"code":0, "data":{"info":'{"status":1, "play_song_detail":{"position":12000,"duration":240000}}'}}
-        position = 0
-        duration = 0
-        info_str = None
-        data = raw.get("data")
-        if isinstance(data, dict):
-            info_str = data.get("info")
-        if isinstance(info_str, str):
-            try:
-                parsed = json.loads(info_str)
-                detail = parsed.get("play_song_detail", {})
-                if isinstance(detail, dict):
-                    position = int(detail.get("position", 0)) // 1000  # ms → s
-                    duration = int(detail.get("duration", 0)) // 1000
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+        info = _parse_player_info(raw)
+        position = info["position"]
+        duration = info["duration"]
 
         if duration > 0:
             play_state.duration = duration

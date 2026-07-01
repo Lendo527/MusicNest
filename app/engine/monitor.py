@@ -149,9 +149,9 @@ class ConversationMonitor:
         if not messages:
             return
 
-        now_ms = int(time.time() * 1000)
         last_ts = self._last_timestamps.get(device_id, 0)
         new_messages = []
+        max_ts = last_ts
 
         for msg in messages:
             ts = msg.get("timestamp_ms", 0)
@@ -160,8 +160,7 @@ class ConversationMonitor:
             if ts <= last_ts:
                 continue
 
-            # 新记录：更新最后时间戳，存入仪表盘缓冲区
-            self._last_timestamps[device_id] = ts
+            # 新记录：存入仪表盘缓冲区
             self._message_buffer.append({
                 "device_id": device_id,
                 "device_name": info.get("name", ""),
@@ -170,11 +169,21 @@ class ConversationMonitor:
                 "answer": msg.get("answer", ""),
             })
 
+            # 取最大时间戳防止乱序消息遗漏
+            if ts > max_ts:
+                max_ts = ts
+
+            # 每条消息独立判断时间窗口（避免累积耗时导致偏差）
+            now_ms = int(time.time() * 1000)
             # 跳过过期指令（早于当前时间2秒以上），不触发回调
             if now_ms - ts > 2000:
                 continue
 
             new_messages.append(msg)
+
+        # 更新最后时间戳为最大值
+        if max_ts > last_ts:
+            self._last_timestamps[device_id] = max_ts
 
         if not new_messages:
             return
@@ -193,5 +202,7 @@ class ConversationMonitor:
         for name, cb in self._callbacks:
             try:
                 await cb(device_id, latest_msg)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(
+                    "[Monitor] 回调 %s 执行异常: %s", name, e, exc_info=True
+                )

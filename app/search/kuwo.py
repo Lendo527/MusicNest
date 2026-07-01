@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.search.base import SearchResult, MusicFormat
+from app.search.base import SearchResult, MusicFormat, SearchProvider
 
 logger = logging.getLogger("musicnest.kuwo")
 
@@ -669,3 +669,25 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
         logger.error(f"[Kuwo] 获取专辑详情失败: {e}")
 
     return result
+
+
+class KuwoProvider(SearchProvider):
+    """酷我音乐 SearchProvider 实现"""
+
+    @property
+    def name(self) -> str:
+        return "kuwo"
+
+    async def search(self, keyword: str, limit: int = 10,
+                     search_type: str = "music",
+                     skip_formats: bool = False,
+                     cookie: str = "") -> list[SearchResult]:
+        # kuwo 不需要 cookie，忽略
+        return await search(keyword, limit=limit, search_type=search_type,
+                           skip_formats=skip_formats)
+
+    async def get_artist_detail(self, artist_id: str) -> dict:
+        return await get_artist_detail(artist_id)
+
+    async def get_album_detail(self, album_id: str) -> dict:
+        return await get_album_detail(album_id)

@@ -1,5 +1,6 @@
 """SQLite 数据库操作 - 下载队列 + 歌单同步记录"""
 
+import os
 import sqlite3
 import threading
 import time
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Optional, List
 from dataclasses import dataclass, field
 
-DB_PATH = Path(__file__).parent.parent / "musicnest.db"
+DB_PATH = Path(os.environ.get("DB_PATH", "/data/musicnest.db"))
 
 _lock = threading.Lock()
 
@@ -63,6 +64,17 @@ def init_db():
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_sh_source_pl ON sync_history(source, playlist_id)
+            """)
+            # 歌单增量同步锚点表：存储各歌单的 updateTime / trackUpdateTime
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS playlist_sync_anchor (
+                    source TEXT NOT NULL,
+                    playlist_id TEXT NOT NULL,
+                    update_time INTEGER DEFAULT 0,
+                    track_update_time INTEGER DEFAULT 0,
+                    synced_at REAL NOT NULL,
+                    PRIMARY KEY (source, playlist_id)
+                )
             """)
 
             conn.commit()
@@ -333,6 +345,49 @@ def clear_sync_history(source: str = "", playlist_id: str = ""):
                 conn.execute("DELETE FROM sync_history WHERE source=?", (source,))
             else:
                 conn.execute("DELETE FROM sync_history")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_playlist_sync_anchor(source: str, playlist_id: str) -> tuple[int, int]:
+    """获取歌单同步锚点
+
+    Returns:
+        (update_time, track_update_time)，均为毫秒时间戳；无记录返回 (0, 0)
+    """
+    with _lock:
+        conn = _get_conn()
+        try:
+            row = conn.execute(
+                "SELECT update_time, track_update_time FROM playlist_sync_anchor "
+                "WHERE source=? AND playlist_id=?",
+                (source, playlist_id),
+            ).fetchone()
+            if row:
+                return int(row["update_time"]), int(row["track_update_time"])
+            return 0, 0
+        finally:
+            conn.close()
+
+
+def set_playlist_sync_anchor(source: str, playlist_id: str,
+                              update_time: int, track_update_time: int) -> None:
+    """更新歌单同步锚点"""
+    now = time.time()
+    with _lock:
+        conn = _get_conn()
+        try:
+            conn.execute(
+                """INSERT INTO playlist_sync_anchor
+                   (source, playlist_id, update_time, track_update_time, synced_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(source, playlist_id) DO UPDATE SET
+                   update_time=excluded.update_time,
+                   track_update_time=excluded.track_update_time,
+                   synced_at=excluded.synced_at""",
+                (source, playlist_id, int(update_time), int(track_update_time), now),
+            )
             conn.commit()
         finally:
             conn.close()

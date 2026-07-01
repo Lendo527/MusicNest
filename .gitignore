@@ -1,8 +1,5 @@
-# Local build scripts
+# Local build script
 build_oci.py
-build_oci_v2.py
-build_oci_v3.py
-build_oci_v4.py
 
 # Python
 __pycache__/

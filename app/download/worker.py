@@ -25,6 +25,15 @@ logger = logging.getLogger("musicnest.download")
 
 RUNNING = False
 
+# 扫描器增量更新回调（由 main.py 注入，避免循环导入）
+_scan_new_callback = None
+
+
+def set_scan_callback(cb) -> None:
+    """注入扫描器增量更新回调"""
+    global _scan_new_callback
+    _scan_new_callback = cb
+
 
 async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float = 120.0) -> bool:
     """下载文件到目标路径，含进度日志"""
@@ -72,7 +81,7 @@ async def _download_cover(cover_url: str, artist_dir: Path, album_dir: Path) -> 
 
 
 async def _fetch_lyrics(source: str, music_id: str, title: str, artist: str) -> Optional[str]:
-    """获取歌词（简化实现，后续可扩展）"""
+    """获取歌词（酷我原文 / 网易云原文+翻译合并双语）"""
     # 酷我歌词 API（简化）
     if source == "kuwo":
         try:
@@ -91,7 +100,18 @@ async def _fetch_lyrics(source: str, music_id: str, title: str, artist: str) -> 
                                 lines.append(f"[{t}]{txt}")
                         return "\n".join(lines)
         except Exception as e:
-            logger.warning(f"[Lyrics] 获取歌词失败: {e}")
+            logger.warning(f"[Lyrics] 获取酷我歌词失败: {e}")
+    elif source == "netease":
+        try:
+            from app.search.netease import get_lyrics as netease_lyrics
+            from app.config import config
+            cookie = config.get("netease_cookie", "") or config.get("netease", {}).get("cookie", "")
+            lrc = await netease_lyrics(music_id, cookie=cookie)
+            if lrc:
+                logger.info(f"[Lyrics] 网易云歌词已获取: {title} ({len(lrc)} 字符)")
+            return lrc or None
+        except Exception as e:
+            logger.warning(f"[Lyrics] 获取网易云歌词失败: {e}")
     return None
 
 
@@ -227,7 +247,8 @@ async def _process_task(task) -> bool:
             return False
 
         # ==== 第二步：构建目录 ====
-        music_path = "/music"
+        from app.config import config
+        music_path = config.get("music_path", "/music")
         artist_dir = Path(music_path) / resolved_artist
         album_dir = artist_dir / resolved_album
         album_dir.mkdir(parents=True, exist_ok=True)
@@ -271,13 +292,12 @@ async def _process_task(task) -> bool:
 
         update_task_status(task_id, "success", file_path=str(track_path))
         logger.info(f"[Download] 完成: {task_id} -> {track_path}")
-        # 通知扫描器增量更新
-        try:
-            from app.main import scanner as _scanner
-            if hasattr(_scanner, "scan_new") and _scanner._songs is not None:
-                await _scanner.scan_new([str(track_path)])
-        except Exception:
-            pass
+        # 通知扫描器增量更新（通过回调，避免循环导入）
+        if _scan_new_callback:
+            try:
+                await _scan_new_callback([str(track_path)])
+            except Exception as e:
+                logger.debug(f"[Download] 扫描器增量更新失败: {e}")
         return True
 
     except Exception as e:
@@ -322,13 +342,22 @@ def stop_worker():
 # ===== 歌单同步 =====
 
 async def playlist_sync_worker(sync_interval: int = 1800):
-    """歌单同步后台定时任务"""
+    """歌单同步后台定时任务（增量同步）
+
+    优化：使用 playlist_sync_anchor 锚点避免重复拉取未变化的歌单曲目列表。
+    - 先获取歌单详情的 updateTime / trackUpdateTime
+    - 若两个锚点与本地一致，则整个跳过（无需拉取曲目列表）
+    - 若变化，才拉取曲目列表并 diff 出新增曲目
+    """
     global RUNNING
     logger.info(f"[PlaylistSync] 歌单同步已启动, 间隔={sync_interval}s")
 
     from app.config import config
-    from app.download.tracker import get_synced_ids, record_sync
-    from app.search.netease import get_playlist_tracks
+    from app.download.tracker import (
+        get_synced_ids, record_sync,
+        get_playlist_sync_anchor, set_playlist_sync_anchor,
+    )
+    from app.search.netease import get_playlist_tracks, get_playlist_detail
     from app.search.kuwo import search as kuwo_search
 
     while RUNNING:
@@ -349,15 +378,26 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                 if not pl_id:
                     continue
 
-                logger.info(f"[PlaylistSync] 同步歌单: {pl_name} ({source}/{pl_id})")
-
-                # 获取远端曲目
+                # === 增量同步：先检查歌单锚点 ===
                 if source == "netease":
-                    cookie = config.get("netease", {}).get("cookie", "")
-                    if cookie:
-                        logger.info("[PlaylistSync] 网易云 Cookie: 已配置 (%d 字符)", len(cookie))
-                    else:
-                        logger.info("[PlaylistSync] 网易云 Cookie: 未配置，私有歌单可能同步失败")
+                    cookie = config.get("netease_cookie", "") or config.get("netease", {}).get("cookie", "")
+                    # 获取歌单元数据（轻量请求）
+                    detail = await get_playlist_detail(pl_id, cookie=cookie)
+                    remote_update = detail.get("update_time", 0)
+                    remote_track_update = detail.get("track_update_time", 0)
+
+                    # 对比本地锚点
+                    local_update, local_track_update = get_playlist_sync_anchor(source, pl_id)
+                    if remote_update and remote_update == local_update \
+                            and remote_track_update == local_track_update:
+                        logger.debug(f"[PlaylistSync] 歌单 [{pl_name}] 锚点未变化，跳过")
+                        continue
+
+                    logger.info(f"[PlaylistSync] 歌单 [{pl_name}] 有更新 "
+                                f"(updateTime: {local_update}->{remote_update}, "
+                                f"trackUpdateTime: {local_track_update}->{remote_track_update})")
+
+                    # 锚点变化，拉取曲目列表
                     tracks = await get_playlist_tracks(pl_id, cookie=cookie)
                 else:
                     # 酷我歌单暂不支持（按歌曲名搜索太模糊）
@@ -389,10 +429,14 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                     record_sync(source, pl_id, track.id)
                     new_count += 1
 
+                # 无论是否有新曲目，都更新锚点（避免下次重复拉取）
+                if remote_update or remote_track_update:
+                    set_playlist_sync_anchor(source, pl_id, remote_update, remote_track_update)
+
                 if new_count > 0:
                     logger.info(f"[PlaylistSync] 歌单 [{pl_name}] 新增 {new_count} 首待下载")
                 else:
-                    logger.info(f"[PlaylistSync] 歌单 [{pl_name}] 无新歌曲")
+                    logger.info(f"[PlaylistSync] 歌单 [{pl_name}] 无新歌曲（已更新锚点）")
 
         except Exception as e:
             logger.error(f"[PlaylistSync] 同步异常: {e}", exc_info=True)

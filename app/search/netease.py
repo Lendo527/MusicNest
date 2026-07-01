@@ -6,7 +6,7 @@ from typing import Optional, List
 
 import httpx
 
-from app.search.base import SearchResult, MusicFormat
+from app.search.base import SearchResult, MusicFormat, SearchProvider
 
 logger = logging.getLogger("musicnest.netease")
 
@@ -350,6 +350,37 @@ async def get_download_url(
     return None
 
 
+async def get_playlist_detail(
+    playlist_id: str,
+    cookie: str = "",
+    timeout: float = 10.0,
+) -> dict:
+    """获取歌单元数据（用于增量同步锚点）
+
+    Returns:
+        {"id": int, "name": str, "update_time": int, "track_update_time": int,
+         "track_count": int, "play_count": int}
+    """
+    result = await _netease_request(
+        "/playlist/detail",
+        params={"id": playlist_id},
+        cookie=cookie,
+        timeout=timeout,
+    )
+    if result.get("code") != 200:
+        return {"id": 0, "name": "", "update_time": 0, "track_update_time": 0,
+                "track_count": 0, "play_count": 0}
+    pl = result.get("playlist", {}) or {}
+    return {
+        "id": pl.get("id", 0),
+        "name": pl.get("name", ""),
+        "update_time": pl.get("updateTime", 0),
+        "track_update_time": pl.get("trackUpdateTime", 0),
+        "track_count": pl.get("trackCount", 0),
+        "play_count": pl.get("playCount", 0),
+    }
+
+
 async def get_playlist_tracks(
     playlist_id: str,
     cookie: str = "",
@@ -424,6 +455,79 @@ async def get_song_detail(
         return None
 
     return _parse_song(songs[0], source="netease")
+
+
+async def get_lyrics(song_id: str, cookie: str = "", timeout: float = 10.0) -> str:
+    """获取网易云歌词（原文 + 翻译合并为双语 LRC）
+
+    合并策略：按时间戳对齐，翻译追加到原文同一行后。
+    若无翻译，返回纯原文歌词。
+
+    Returns:
+        LRC 格式歌词字符串，失败返回空字符串
+    """
+    import re
+    try:
+        result = await _netease_request(
+            "/lyric",
+            params={"id": song_id},
+            cookie=cookie,
+            timeout=timeout,
+        )
+        if result.get("code") != 200:
+            return ""
+
+        lrc_obj = result.get("lrc", {}) or {}
+        orig_lrc = lrc_obj.get("lyric", "") or ""
+        if not orig_lrc:
+            return ""
+
+        tlyric_obj = result.get("tlyric", {}) or {}
+        trans_lrc = tlyric_obj.get("lyric", "") or ""
+
+        if not trans_lrc:
+            return orig_lrc
+
+        # 解析翻译：[mm:ss.xx]text → {timestamp: text}
+        # 注意：网易云翻译时间戳可能比原文稍有偏差，按整秒对齐
+        def _parse(lrc: str) -> dict:
+            parsed = {}
+            for line in lrc.split("\n"):
+                # 匹配 [mm:ss.xx] 或 [mm:ss]
+                m = re.match(r"\[(\d+):(\d+)(?:\.\d+)?\](.*)", line.strip())
+                if m:
+                    minute, sec, txt = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+                    ts = minute * 60 + sec  # 整秒对齐
+                    parsed[ts] = txt
+            return parsed
+
+        orig_map = _parse(orig_lrc)
+        trans_map = _parse(trans_lrc)
+        if not trans_map:
+            return orig_lrc
+
+        # 合并：原文每行后追加翻译（若同一整秒有翻译）
+        # 保留原文行的原始时间戳格式 [mm:ss.xx]
+        merged_lines = []
+        for line in orig_lrc.split("\n"):
+            m = re.match(r"(\[\d+:\d+(?:\.\d+)?\])(.*)", line.strip())
+            if m:
+                ts_prefix = m.group(1)  # 如 [01:23.45]
+                rest = m.group(2).strip()
+                # 从时间戳提取整秒用于查翻译
+                ts_match = re.match(r"\[(\d+):(\d+)", ts_prefix)
+                if ts_match:
+                    ts = int(ts_match.group(1)) * 60 + int(ts_match.group(2))
+                    trans_txt = trans_map.get(ts, "")
+                    if trans_txt and trans_txt != rest:
+                        merged_lines.append(f"{ts_prefix}{rest} ({trans_txt})")
+                        continue
+            merged_lines.append(line)
+
+        return "\n".join(merged_lines)
+    except Exception as e:
+        logger.warning(f"[Netease] 获取歌词失败: {e}")
+        return ""
 
 
 async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
@@ -721,3 +825,37 @@ async def get_album_detail(
         logger.error(f"[Netease] 获取专辑详情失败: {e}")
 
     return result
+
+
+class NeteaseProvider(SearchProvider):
+    """网易云音乐 SearchProvider 实现"""
+
+    @property
+    def name(self) -> str:
+        return "netease"
+
+    async def search(self, keyword: str, limit: int = 10,
+                     search_type: str = "music",
+                     skip_formats: bool = False,
+                     cookie: str = "") -> list[SearchResult]:
+        return await search(keyword, limit=limit, search_type=search_type,
+                           cookie=cookie, skip_formats=skip_formats)
+
+    async def get_artist_detail(self, artist_id: str) -> dict:
+        cookie = ""
+        # 从 config 取 cookie（避免 main.py 传入）
+        try:
+            from app.config import config
+            cookie = config.get("netease_cookie", "") or config.get("netease", {}).get("cookie", "")
+        except Exception:
+            pass
+        return await get_artist_detail(artist_id, cookie=cookie)
+
+    async def get_album_detail(self, album_id: str) -> dict:
+        cookie = ""
+        try:
+            from app.config import config
+            cookie = config.get("netease_cookie", "") or config.get("netease", {}).get("cookie", "")
+        except Exception:
+            pass
+        return await get_album_detail(album_id, cookie=cookie)
