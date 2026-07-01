@@ -7,6 +7,76 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.36 - 全代码库深度审阅修复（CRITICAL 12 + HIGH 19 + MEDIUM 30+）：
+           main: 流式转码finally加proc.kill()防僵尸进程；
+           main: 删除歌曲改按filepath定位(消除误删风险)；
+           main: scanner._songs全部改用iter_songs()/remove_artist/remove_album带锁接口；
+           main: API下一曲SINGLE模式强制切下一首(与语音指令一致)；
+           main: 封面提取改asyncio子进程不阻塞事件循环；
+           main: rmtree前对真实路径调_is_safe_path校验(安全漏洞)；
+           main: _check_miot用asyncio.Lock防并发初始化泄漏；
+           main: 全局异常不向客户端泄漏str(exc)；
+           main: lifespan存储后台任务引用+关闭时取消；
+           main: fire-and-forget任务统一_create_background_task加异常回调；
+           main: _alarm_loop外层try/except防静默死亡；
+           main: _parse_cn_number支持百位解析；
+           main: .cancel()改用_safe_cancel(定义+7处替换)；
+           scanner: 读取方法全部加_thread_lock保护+返回快照；
+           scanner: scan_new循环体加try/except+并发Semaphore(10)；
+           scanner: 缓存schema校验+__init__中_load_cache；
+           scanner: _save_cache原子写入+持锁快照；
+           scanner: rglob跳过symlink防越界；
+           scanner: 新增iter_songs/remove_by_filepath/remove_artist/remove_album；
+           scanner: _thread_lock改RLock防嵌套死锁；
+           config: _save原子写入(tmp+os.replace)+锁内完成；
+           config: __init__中_load/_save包try/except防启动崩溃；
+           config: _deep_merge递归合并嵌套配置；
+           config: get/get_all返回深拷贝防外部污染；
+           kuwo: _python_to_json改用ast.literal_eval(修复含撇号歌名崩溃)；
+           kuwo: DURATION解析加try/except+gather加return_exceptions；
+           kuwo: 歌手搜索字段大小写fallback；
+           kuwo: 封面URL精确替换re.sub；
+           kuwo: 新增close_client()供应用关闭调用；
+           netease: 移除搜索关键词过严校验(导致0结果)；
+           netease: /song/url回退保持type=flac参数；
+           netease: _build_quality_formats/_parse_song类型校验；
+           netease: _netease_request单client复用遍历网关；
+           worker: 下载失败清理partial文件+大小校验(>1KB)；
+           worker: netease下载传cookie(FLAC/Hi-Res必需)；
+           worker: 启动时重置卡死loading任务；
+           worker: kuwo优先query_song_by_id精确查询；
+           worker: 歌单同步歌手匹配改集合交集(避免子串误判)；
+           worker: 循环内异常容错(单首失败不中断整批)；
+           tracker: add_task改UPSERT重置error/loading状态；
+           tracker: 新增reset_stale_loading_tasks函数；
+           tracker: _get_conn改线程局部连接复用；
+           monitor: _poll_all改asyncio.gather并发轮询(修复0.2s间隔失效)；
+           monitor: 新增get_last_unhandled_query方法；
+           media_watcher: start()首轮状态预热(防重启误拦)；
+           media_watcher: stop_all_media改await(消除竞态)；
+           media_watcher: 拦截后mark_query_handled(防双轨重复触发)；
+           media_watcher: _watch_all_devices改asyncio.gather并发；
+           client: _last_own_play_at改per-device dict(修复跨设备误判)；
+           client: _try_refresh_token始终从config同步新token；
+           client: stop_all_media超时缩短3s+失败计数；
+           client: 注册token_refresh回调自动更新token；
+           token_refresh: 新增register_client_callback机制；
+           token_refresh: _last_relogin_at刷新成功后置位(失败5s退避)；
+           player: pause记录暂停时刻+resume补偿_play_start_time(修复提前切歌)；
+           player: smart_resume区分status=-1(继续轮询)和status=0(重播)；
+           player: _auto_next_after异常转STOPPED(防卡死)；
+           auth: _build_cookie_header域名匹配改正确子域判断；
+           auth: poll_qr_result 5xx返回failed(防无限轮询)；
+           index: playlistPlaySong用缓存playlist(修复播1首专辑显示全库)；
+           index: renamePlaylist/playPlaylistSongs改data-*属性(修复XSS)；
+           index: openArtist/openAlbum改data-*属性(修复XSS)；
+           index: t.format_type/task_id/error_msg防空(防整表崩溃)；
+           index: 统计文本统一为"共XX首/个/张"格式；
+           index: currentPlayingIdx停止播放后重置(防残留高亮)；
+           index: Modal改getOrCreateInstance(防实例堆积)；
+           index: _prevDownloadStatus自动修剪(防内存增长)；
+           index: deleteSong改按filepath(配合后端)；
+           index: escHtml(m.time)防注入
   0.0.35 - 下载模块 11 个 bug 修复：
            worker: 下载失败清理 partial 文件 + 文件大小校验(>1KB)；
            worker: netease 下载链接传 cookie（FLAC/Hi-Res 必需）；
@@ -84,4 +154,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.35"
+__version__ = "0.0.36"

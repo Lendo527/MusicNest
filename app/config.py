@@ -1,5 +1,6 @@
 """配置管理 - 持久化到 /data/config.yaml"""
 
+import copy
 import logging
 import os
 import threading
@@ -63,7 +64,29 @@ class ConfigManager:
         self._config_path = config_path
         self._lock = threading.Lock()
         self._data: dict[str, Any] = dict(DEFAULT_CONFIG)
-        self._load()
+        try:
+            self._load()
+        except Exception as e:
+            logging.getLogger("musicnest.config").warning(
+                "[Config] 配置加载失败，使用默认配置: %s", e
+            )
+        if not Path(self._config_path).exists():
+            try:
+                self._save()
+            except Exception as e:
+                logging.getLogger("musicnest.config").warning(
+                    "[Config] 默认配置保存失败，使用内存配置: %s", e
+                )
+
+    def _deep_merge(self, default: dict, loaded: dict) -> dict:
+        """递归合并：loaded 覆盖 default，对 dict 子键递归合并"""
+        result = copy.deepcopy(default)
+        for key, val in loaded.items():
+            if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+                result[key] = self._deep_merge(result[key], val)
+            else:
+                result[key] = val
+        return result
 
     def _load(self) -> None:
         """从文件加载配置，不存在则创建默认配置"""
@@ -73,9 +96,7 @@ class ConfigManager:
                 with open(path, "r", encoding="utf-8") as f:
                     loaded = yaml.safe_load(f) or {}
                 with self._lock:
-                    for key in DEFAULT_CONFIG:
-                        if key in loaded:
-                            self._data[key] = loaded[key]
+                    self._data = self._deep_merge(dict(DEFAULT_CONFIG), loaded)
             except Exception as e:
                 logging.getLogger("musicnest.config").warning(
                     "[Config] 配置文件加载失败，使用默认配置: %s", e
@@ -84,17 +105,32 @@ class ConfigManager:
             self._save()
 
     def _save(self) -> None:
-        """保存配置到文件"""
+        """保存配置到文件（原子写入）"""
         path = Path(self._config_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            data = dict(self._data)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False)
+            data = copy.deepcopy(self._data)
+        tmp_path = path.with_suffix(".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False)
+            os.replace(str(tmp_path), str(path))  # 原子替换
+        except Exception as e:
+            logging.getLogger("musicnest.config").error(
+                "[Config] 配置保存失败: %s", e
+            )
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
-            return self._data.get(key, default)
+            val = self._data.get(key, default)
+            if isinstance(val, (list, dict)):
+                return copy.deepcopy(val)
+            return val
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
@@ -108,7 +144,7 @@ class ConfigManager:
 
     def get_all(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._data)
+            return copy.deepcopy(self._data)
 
     @property
     def miot_token(self) -> str:

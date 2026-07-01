@@ -95,6 +95,9 @@ class MediaWatcher:
         # 连续失败计数（用于自动暂停）
         self._consecutive_failures: dict[str, int] = {}
 
+        # 首轮预热标志（首次读取只记录状态，不触发拦截）
+        self._first_poll = True
+
     @property
     def is_running(self) -> bool:
         return self._enabled and self._task is not None
@@ -115,6 +118,8 @@ class MediaWatcher:
         """
         if self._enabled:
             return
+
+        self._first_poll = True  # 首轮预热
 
         from app.config import config as app_config
         selections: dict = app_config.get("device_selections", {})
@@ -173,11 +178,18 @@ class MediaWatcher:
 
     async def _watch_all_devices(self) -> None:
         """轮询所有勾选设备的状态"""
-        # 仅监控勾选的设备
-        for device_id, selected in list(self._device_selected.items()):
-            if not selected:
-                continue
-            await self._watch_device(device_id)
+        selected_ids = [
+            did for did, selected in self._device_selected.items() if selected
+        ]
+        if not selected_ids:
+            return
+        await asyncio.gather(
+            *[self._watch_device(did) for did in selected_ids],
+            return_exceptions=True
+        )
+        # 首轮预热完成
+        if self._first_poll:
+            self._first_poll = False
 
     async def _watch_device(self, device_id: str) -> None:
         """监控单个设备的状态变化"""
@@ -208,6 +220,10 @@ class MediaWatcher:
         prev_status = self._last_status.get(device_id, 0)
         self._last_status[device_id] = current_status
 
+        # 首轮预热：只记录状态，不触发事件（避免对正在播放的设备触发误拦截）
+        if self._first_poll:
+            return
+
         # 检测 status: 0→1 跳变
         if prev_status != 1 and current_status == 1:
             await self._on_playback_started(device_id)
@@ -225,7 +241,7 @@ class MediaWatcher:
             return
 
         # 判断是否 musicnest 自己触发
-        if self._client.is_own_play_recent(OWN_PLAY_WINDOW_SEC):
+        if self._client.is_own_play_recent(device_id, OWN_PLAY_WINDOW_SEC):
             # 自己触发的播放，不干预
             self._device_states[device_id] = DevicePlayState.OWN_PLAYING
             logger.debug(
@@ -241,8 +257,8 @@ class MediaWatcher:
             device_id[:12]
         )
 
-        # 1. 反查最近对话记录（先查，不立即 stop）
-        recent_query = self._monitor.get_last_query(
+        # 1. 反查最近未处理的对话记录（先查，不立即 stop）
+        recent_query = self._monitor.get_last_unhandled_query(
             device_id, within_sec=RECENT_QUERY_WINDOW_SEC
         )
 
@@ -264,12 +280,12 @@ class MediaWatcher:
             self._last_intercept_at[device_id] = now
             return
 
-        # 3. 确认需要拦截：立即 stop（此时才发出 stop 命令）
+        # 3. 确认需要拦截：先 stop 所有媒体通道，确保完成后再触发回调
         logger.info(
             "[MediaWatcher] 设备 %s 确认拦截: query=%r",
             device_id[:12], recent_query[:80]
         )
-        asyncio.create_task(self._client.stop_all_media(device_id))
+        await self._client.stop_all_media(device_id)
 
         # 4. 触发拦截回调
         self._last_intercept_at[device_id] = now
@@ -280,6 +296,10 @@ class MediaWatcher:
                 logger.error(
                     "[MediaWatcher] 拦截回调 %s 执行异常: %s", name, e, exc_info=True
                 )
+
+        # 拦截后标记 query 为已处理，避免轨道 1 重复触发
+        if self._monitor:
+            self._monitor.mark_query_handled(device_id, recent_query)
 
     @staticmethod
     def _parse_status(raw) -> Optional[int]:

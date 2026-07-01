@@ -102,49 +102,71 @@ class MusicScanner:
         self._auto_scan_task: Optional["asyncio.Task"] = None  # type: ignore
         self._auto_scan_interval: int = 0  # 0 = 禁用
         # 使用 asyncio.Lock 避免在 async 函数中阻塞事件循环
-        # 延迟初始化：asyncio.Lock() 需在事件循环内创建
-        self._lock: Optional[asyncio.Lock] = None
-        self._thread_lock = threading.Lock()  # 仅用于 _songs 列表的同步访问保护
+        self._lock = asyncio.Lock()  # 直接创建，避免惰性初始化的线程安全问题
+        self._thread_lock = threading.RLock()  # 可重入锁，允许嵌套调用 _save_cache
+        self._load_cache()  # 启动时立即加载缓存
 
     def _get_async_lock(self) -> asyncio.Lock:
-        """获取 asyncio.Lock（惰性初始化，确保在事件循环内创建）"""
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+        """获取 asyncio.Lock"""
         return self._lock
 
     def _load_cache(self) -> bool:
         """从缓存文件加载歌曲列表。成功返回 True"""
+        cache_path = Path(self.CACHE_FILE)
+        if not cache_path.exists():
+            return False
+        import json
         try:
-            cache_path = Path(self.CACHE_FILE)
-            if not cache_path.exists():
-                return False
-            import json
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, list):
-                return False
-            self._songs = data
-            self._scan_time = time.time()
-            logger.info(f"[Scanner] 从缓存加载: {len(data)} 首歌曲")
-            return True
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"[Scanner] 缓存文件损坏: {e}，将重新扫描")
+            self._songs = []
+            return False
         except Exception as e:
             logger.warning(f"[Scanner] 缓存加载失败: {e}")
+            self._songs = []
             return False
 
+        if not isinstance(data, list):
+            logger.warning("[Scanner] 缓存格式异常，将重新扫描")
+            self._songs = []
+            return False
+
+        # 逐项校验必需字段
+        required_keys = {"title", "artist", "filepath"}
+        valid_songs = []
+        for s in data:
+            if isinstance(s, dict) and required_keys.issubset(s.keys()):
+                valid_songs.append(s)
+            else:
+                logger.debug(f"[Scanner] 丢弃无效缓存项: {s}")
+        self._songs = valid_songs
+        self._scan_time = time.time()
+        logger.info(f"[Scanner] 从缓存加载: {len(valid_songs)} 首歌曲")
+        return True
+
     def _save_cache(self) -> None:
-        """将歌曲列表保存到缓存文件（原子写入）"""
+        """保存缓存到文件（原子写入）"""
+        with self._thread_lock:
+            snapshot = list(self._songs)
+        import json
+        import os
+        cache_path = Path(self.CACHE_FILE)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(".tmp")
         try:
-            import json
-            import tempfile
-            cache_path = Path(self.CACHE_FILE)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache_path.with_suffix('.tmp')
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._songs, f, ensure_ascii=False, indent=1)
-            tmp.replace(cache_path)  # 原子替换
-            logger.info(f"[Scanner] 缓存已保存: {len(self._songs)} 首歌曲")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=1)
+            os.replace(str(tmp_path), str(cache_path))  # 原子替换
+            logger.info(f"[Scanner] 缓存已保存: {len(snapshot)} 首歌曲")
         except Exception as e:
-            logger.warning(f"[Scanner] 缓存保存失败: {e}")
+            logger.error(f"[Scanner] 缓存保存失败: {e}")
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     async def scan(self) -> list[dict]:
         """扫描音乐目录，返回歌曲列表"""
@@ -160,6 +182,8 @@ class MusicScanner:
             # 第一步：收集所有音乐文件
             audio_files: list[Path] = []
             for filepath in root.rglob("*"):
+                if filepath.is_symlink():
+                    continue  # 跳过符号链接，防止越界
                 if not filepath.is_file():
                     continue
                 ext = filepath.suffix.lower()
@@ -250,15 +274,20 @@ class MusicScanner:
                         split_aa = parts[0].split(" - ", 1)
                         album_path = str(root / parts[0])
 
+                    try:
+                        file_size = filepath.stat().st_size if filepath.exists() else 0
+                    except (FileNotFoundError, PermissionError):
+                        file_size = 0
+
                     return {
                         "title": title,
                         "artist": artist,
                         "album": album,
                         "duration": duration,
-                        "format": filepath.suffix.lstrip('.').upper(),
+                        "format": filepath.suffix.removeprefix(".").upper(),
                         "filepath": str(filepath),
                         "lyrics_path": lyrics_path,
-                        "size": filepath.stat().st_size if filepath.exists() else 0,
+                        "size": file_size,
                         "artist_path": artist_path,
                         "album_path": album_path,
                     }
@@ -280,57 +309,83 @@ class MusicScanner:
         async with self._get_async_lock():
             root = Path(self._music_path)
             new_songs = []
-            existing_paths = {s["filepath"] for s in self._songs}
+            with self._thread_lock:
+                existing_paths = {s["filepath"] for s in self._songs}
+            # 过滤有效文件（跳过符号链接）
+            valid_files = []
             for fp in filepaths:
                 p = Path(fp)
+                if p.is_symlink():
+                    continue  # 跳过符号链接，防止越界
                 if not p.exists() or not p.is_file():
                     continue
                 if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
                     continue
                 if str(p) in existing_paths:
                     continue
-                relative = p.relative_to(root)
-                parts = relative.parts
-                filename = p.stem
-                title = _clean_title(filename)
-                meta_tags = await _probe_file_async(p)
-                if meta_tags.get("title"):
-                    title = meta_tags["title"]
-                artist = meta_tags.get("artist", "")
-                album = meta_tags.get("album", "")
-                duration = meta_tags.get("duration", 0)
-                if len(parts) >= 3:
-                    if not artist: artist = parts[0]
-                    if not album: album = parts[1]
-                elif len(parts) == 2:
-                    if " - " in parts[0]:
-                        aa = parts[0].split(" - ", 1)
-                        if not artist: artist = aa[0].strip()
-                        if not album: album = aa[1].strip()
-                    else:
+                valid_files.append(p)
+
+            # 并发 ffprobe（参照 scan 的并发结构）
+            sem = asyncio.Semaphore(10)
+
+            async def _probe_one(p: Path) -> dict:
+                async with sem:
+                    relative = p.relative_to(root)
+                    parts = relative.parts
+                    filename = p.stem
+                    title = _clean_title(filename)
+                    meta_tags = await _probe_file_async(p)
+                    if meta_tags.get("title"):
+                        title = meta_tags["title"]
+                    artist = meta_tags.get("artist", "")
+                    album = meta_tags.get("album", "")
+                    duration = meta_tags.get("duration", 0)
+                    if len(parts) >= 3:
                         if not artist: artist = parts[0]
-                lyrics_path = _find_lyrics(p)
-                artist_path = str(root / parts[0]) if len(parts) >= 2 else ""
-                album_path = str(root / parts[0] / parts[1]) if len(parts) >= 3 else ""
-                new_songs.append({
-                    "title": title, "artist": artist, "album": album,
-                    "duration": duration, "format": p.suffix.lstrip(".").upper(),
-                    "filepath": str(p), "lyrics_path": lyrics_path,
-                    "size": p.stat().st_size,
-                    "artist_path": artist_path, "album_path": album_path,
-                })
+                        if not album: album = parts[1]
+                    elif len(parts) == 2:
+                        if " - " in parts[0]:
+                            aa = parts[0].split(" - ", 1)
+                            if not artist: artist = aa[0].strip()
+                            if not album: album = aa[1].strip()
+                        else:
+                            if not artist: artist = parts[0]
+                    lyrics_path = _find_lyrics(p)
+                    artist_path = str(root / parts[0]) if len(parts) >= 2 else ""
+                    album_path = str(root / parts[0] / parts[1]) if len(parts) >= 3 else ""
+                    try:
+                        size = p.stat().st_size if p.exists() else 0
+                    except (FileNotFoundError, PermissionError):
+                        size = 0
+                    return {
+                        "title": title, "artist": artist, "album": album,
+                        "duration": duration, "format": p.suffix.removeprefix(".").upper(),
+                        "filepath": str(p), "lyrics_path": lyrics_path,
+                        "size": size,
+                        "artist_path": artist_path, "album_path": album_path,
+                    }
+
+            tasks = [_probe_one(p) for p in valid_files]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, dict):
+                    new_songs.append(r)
+                elif isinstance(r, Exception):
+                    logger.warning(f"[Scanner] scan_new 处理文件失败: {r}")
             if new_songs:
-                self._songs.extend(new_songs)
-                self._songs.sort(key=lambda s: (s["artist"].lower(), s["album"].lower(), s["title"].lower()))
+                with self._thread_lock:
+                    self._songs.extend(new_songs)
+                    self._songs.sort(key=lambda s: (s["artist"].lower(), s["album"].lower(), s["title"].lower()))
                 self._save_cache()
             return len(new_songs)
 
     def get_index_by_filepath(self, filepath: str) -> Optional[int]:
         """通过 filepath 查找歌曲索引"""
-        for i, s in enumerate(self._songs):
-            if s.get("filepath") == filepath:
-                return i
-        return None
+        with self._thread_lock:
+            for i, s in enumerate(self._songs):
+                if s.get("filepath") == filepath:
+                    return i
+            return None
 
     def remove_song(self, index: int) -> Optional[dict]:
         """移除指定索引的歌曲并保存缓存"""
@@ -342,21 +397,68 @@ class MusicScanner:
                 return removed
             return None
 
+    def iter_songs(self) -> list:
+        """返回 songs 的快照副本，供外部安全迭代"""
+        with self._thread_lock:
+            return list(self._songs)
+
+    def remove_by_filepath(self, filepath: str) -> bool:
+        """按文件路径删除歌曲（替代按位置 index 删除）"""
+        with self._thread_lock:
+            for i, s in enumerate(self._songs):
+                if s.get("filepath") == filepath:
+                    self._songs.pop(i)
+                    self._save_cache()
+                    return True
+            return False
+
+    def remove_artist(self, artist_name: str) -> int:
+        """删除指定歌手的所有歌曲，返回删除数量"""
+        with self._thread_lock:
+            before = len(self._songs)
+            self._songs = [s for s in self._songs if (s.get("artist") or "").strip() != artist_name.strip()]
+            removed = before - len(self._songs)
+            if removed > 0:
+                self._save_cache()
+            return removed
+
+    def remove_album(self, album_name: str, artist_name: str = "") -> int:
+        """删除指定专辑（可指定歌手）的所有歌曲，返回删除数量"""
+        with self._thread_lock:
+            before = len(self._songs)
+            if artist_name:
+                self._songs = [
+                    s for s in self._songs
+                    if not (
+                        (s.get("album") or "").strip() == album_name.strip()
+                        and (s.get("artist") or "").strip() == artist_name.strip()
+                    )
+                ]
+            else:
+                self._songs = [s for s in self._songs if (s.get("album") or "").strip() != album_name.strip()]
+            removed = before - len(self._songs)
+            if removed > 0:
+                self._save_cache()
+            return removed
+
     def get_stats(self) -> dict:
         """获取音乐库统计"""
+        with self._thread_lock:
+            songs_snapshot = list(self._songs)
         artists = set()
         albums = set()
         total_size = 0
-        for s in self._songs:
-            if s["artist"]:
-                artists.add(s["artist"])
+        for s in songs_snapshot:
+            artist = (s.get("artist") or "").strip()
+            if artist:
+                artists.add(artist)
             # 空 album 也计入，使用 '未知专辑' 保持与前端一致
             album_name = s.get("album") or "未知专辑"
             albums.add((album_name, s.get("artist", "")))
             total_size += s.get("size", 0)
 
         return {
-            "total_songs": len(self._songs),
+            "total_songs": len(songs_snapshot),
             "total_artists": len(artists),
             "total_albums": len(albums),
             "total_size": total_size,
@@ -367,19 +469,22 @@ class MusicScanner:
 
     def get_songs(self, limit: int = 500, offset: int = 0) -> list[dict]:
         """获取歌曲列表（分页）"""
-        return self._songs[offset:offset + limit]
+        with self._thread_lock:
+            return list(self._songs[offset:offset + limit])
 
     def search(self, keyword: str) -> list[dict]:
         """搜索本地歌曲"""
         if not keyword:
             return []
         kw = keyword.lower()
+        with self._thread_lock:
+            songs_snapshot = list(self._songs)
         results = []
-        for song in self._songs:
+        for song in songs_snapshot:
             if (
-                kw in song["title"].lower()
-                or kw in song["artist"].lower()
-                or kw in song["album"].lower()
+                kw in (song.get("title") or "").lower()
+                or kw in (song.get("artist") or "").lower()
+                or kw in (song.get("album") or "").lower()
             ):
                 results.append(song)
         return results

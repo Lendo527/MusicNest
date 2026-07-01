@@ -276,6 +276,8 @@ class MiAuth:
             logger.debug("[MiAuth] QR 轮询响应: status=%d", status)
             if status == 403:
                 return {"state": "expired", "message": "二维码已过期 (403)"}
+            if status >= 500:
+                return {"state": "failed", "message": f"服务端错误: {status}"}
             if status >= 400:
                 return {"state": "waiting", "message": f"HTTP {status}"}
 
@@ -544,7 +546,7 @@ class MiAuth:
             if cookie_domain:
                 # 确保 cookie 适用于当前 URL 的域名
                 d = cookie_domain.lstrip(".")
-                if d and url_host and not url_host.endswith(d):
+                if d and url_host and url_host != d and not url_host.endswith("." + d):
                     continue
             cookies.append(f"{cookie.name}={cookie.value}")
 

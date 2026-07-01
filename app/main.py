@@ -155,7 +155,7 @@ async def _global_exception_handler(request: Request, exc: Exception):
     logger.error(f"[Unhandled] {request.method} {request.url.path} 异常: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"code": 1, "msg": f"服务器内部错误: {exc}"},
+        content={"code": 1, "msg": "服务器内部错误"},  # 不返回 exc 详情
     )
 
 
@@ -316,53 +316,85 @@ async def _sleep_timer(minutes: int):
 
 _alarm_tasks: dict[str, asyncio.Task] = {}
 
+def _create_background_task(coro, name: str = ""):
+    """创建后台任务并自动记录异常"""
+    task = asyncio.create_task(coro)
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            return
+        if t.exception():
+            logger.error(f"[Background] 任务 {name} 异常: {t.exception()}", exc_info=t.exception())
+    task.add_done_callback(_on_done)
+    return task
+
+async def _safe_cancel(task):
+    """安全取消任务：cancel 后 await，避免 task 未被 await 产生的 warning"""
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
 
 async def _alarm_loop(alarm_id: str, hour: int, minute: int, days: list[int], song_index: Optional[int] = None):
     """闹钟循环，每天指定时间触发"""
     logger.info(f"[Alarm] 闹钟已启动: id={alarm_id} time={hour:02d}:{minute:02d} days={days} song_index={song_index}")
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        if wait_seconds < 1:
-            wait_seconds = 60  # 避免瞬时重复触发
-        await asyncio.sleep(wait_seconds)
+    try:
+        while True:
+            now = datetime.now()
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            if wait_seconds < 1:
+                wait_seconds = 60  # 避免瞬时重复触发
+            await asyncio.sleep(wait_seconds)
 
-        # 检查星期匹配（0=Mon ... 6=Sun）
-        if days and target.weekday() not in days:
-            continue
+            # 检查星期匹配（0=Mon ... 6=Sun）
+            if days and target.weekday() not in days:
+                continue
 
-        try:
-            client = await _check_miot()
-            if not client or not play_state.device_id:
-                # 尝试获取设备
-                play_state.device_id = await _get_target_device()
-                if not play_state.device_id:
-                    logger.warning(f"[Alarm] 闹钟 id={alarm_id} 无可用播放设备，跳过")
-                    continue
+            try:
+                client = await _check_miot()
+                if not client or not play_state.device_id:
+                    # 尝试获取设备
+                    play_state.device_id = await _get_target_device()
+                    if not play_state.device_id:
+                        logger.warning(f"[Alarm] 闹钟 id={alarm_id} 无可用播放设备，跳过")
+                        continue
 
-            # 先停掉音箱所有媒体通道，确保闹钟能完全接管播放
-            await client.stop_all_media(play_state.device_id)
+                # 先停掉音箱所有媒体通道，确保闹钟能完全接管播放
+                await client.stop_all_media(play_state.device_id)
 
-            if song_index is not None:
-                await _play_on_device(play_state.device_id, song_index)
-                play_state.is_playing = True
-                logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放歌曲 index={song_index}")
-            else:
-                # 播放第一首可用歌曲
-                songs = scanner.get_songs(limit=1)
-                if songs:
-                    play_state.playlist = scanner.get_songs(limit=500)
-                    play_state.current_index = 0
-                    await _play_on_device(play_state.device_id, 0)
+                if song_index is not None:
+                    await _play_on_device(play_state.device_id, song_index)
                     play_state.is_playing = True
-                    logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放默认歌单")
+                    logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放歌曲 index={song_index}")
                 else:
-                    logger.warning(f"[Alarm] 闹钟 id={alarm_id} 曲库为空，无法播放")
-        except Exception as e:
-            logger.error(f"[Alarm] 闹钟触发失败: {e}")
+                    # 播放第一首可用歌曲
+                    songs = scanner.get_songs(limit=1)
+                    if songs:
+                        play_state.playlist = scanner.get_songs(limit=500)
+                        play_state.current_index = 0
+                        await _play_on_device(play_state.device_id, 0)
+                        play_state.is_playing = True
+                        logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放默认歌单")
+                    else:
+                        logger.warning(f"[Alarm] 闹钟 id={alarm_id} 曲库为空，无法播放")
+            except Exception as e:
+                logger.error(f"[Alarm] 闹钟触发失败: {e}")
+    except asyncio.CancelledError:
+        logger.info(f"[Alarm] 闹钟 {alarm_id} 已取消")
+        raise
+    except Exception as e:
+        logger.error(f"[Alarm] 闹钟 {alarm_id} 致命错误: {e}", exc_info=True)
+    finally:
+        _alarm_tasks.pop(alarm_id, None)
+
+
 
 
 def _restore_alarms():
@@ -461,6 +493,22 @@ def _parse_cn_number(text: str) -> Optional[int]:
     # 中文数字解析
     if text == '一百':
         return 100
+    if text == '两百':
+        return 200
+    if text == '三百':
+        return 300
+    if text == '四百':
+        return 400
+    if text == '五百':
+        return 500
+    if text == '六百':
+        return 600
+    if text == '七百':
+        return 700
+    if text == '八百':
+        return 800
+    if text == '九百':
+        return 900
     if text == '半':
         return 50
     result = 0
@@ -506,14 +554,14 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         # "X分钟后停止播放" / "X分钟停止" / "定时X分钟"
         global _sleep_timer_task
         if _sleep_timer_task:
-            _sleep_timer_task.cancel()
+            await _safe_cancel(_sleep_timer_task)
         _sleep_timer_task = asyncio.create_task(_sleep_timer(timer_minutes))
         logger.info(f"[VoiceCmd] 睡眠定时: {timer_minutes} 分钟")
         return
 
     if re.search(r'取消(?:睡眠)?定时|关掉定时|停掉定时', query):
         if _sleep_timer_task:
-            _sleep_timer_task.cancel()
+            await _safe_cancel(_sleep_timer_task)
             _sleep_timer_task = None
         global _sleep_timer_remaining
         _sleep_timer_remaining = 0
@@ -557,7 +605,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         # 未匹配任何指令：用户与小爱聊天（如问天气）打断了音乐
         # 触发 smart_resume：等待 TTS 结束后自动恢复播放
         if play_state.is_playing and play_state.current_song() and miot_client:
-            asyncio.create_task(_smart_resume_playback(device_id))
+            _create_background_task(_smart_resume_playback(device_id), "smart_resume")
             logger.info(f"[SmartResume] 检测到播放被打断，启动智能恢复任务: query={query[:40]!r}")
         return
     logger.info(f"[VoiceCmd] 命中: type={result.command.type} keyword={result.keyword} arg={result.argument}")
@@ -569,7 +617,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             # 立即 stop_all_media（fire-and-forget，不等返回）
             # 这是"抢先劫持"的核心：尽快打断小爱原生播放
             if miot_client and device_id:
-                asyncio.create_task(miot_client.stop_all_media(device_id))
+                _create_background_task(miot_client.stop_all_media(device_id), "stop_all_media")
 
             song_name = result.argument or query
             local_results = scanner.search(song_name)
@@ -591,7 +639,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 play_state.device_id = device_id
 
                 # 元数据查询改 fire-and-forget（不阻塞播放）
-                asyncio.create_task(_enrich_playlist_metadata(song_name, real_index, all_songs))
+                _create_background_task(_enrich_playlist_metadata(song_name, real_index, all_songs), "enrich_metadata")
 
                 ok = await _play_on_device(device_id, real_index)
                 if ok:
@@ -1020,7 +1068,7 @@ async def lifespan(app: FastAPI):
                     logger.info(f"首次扫描完成: {s['total_songs']} 首歌曲, {s['total_albums']} 张专辑")
                 except Exception as e:
                     logger.warning(f"首次扫描失败: {e}")
-            asyncio.create_task(_background_scan())
+            _bg_scan_task = asyncio.create_task(_background_scan())
         else:
             s = scanner.get_stats()
             logger.info(f"从缓存恢复曲库: {s['total_songs']} 首歌曲")
@@ -1088,13 +1136,24 @@ async def lifespan(app: FastAPI):
         await _sync_task
     except asyncio.CancelledError:
         pass
+    # 取消首次扫描后台任务
+    try:
+        _bg_scan_task
+    except NameError:
+        pass
+    else:
+        _bg_scan_task.cancel()
+        try:
+            await _bg_scan_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # 取消定时器
     global _sleep_timer_task
     if _sleep_timer_task:
-        _sleep_timer_task.cancel()
-    for aid, task in _alarm_tasks.items():
-        task.cancel()
+        await _safe_cancel(_sleep_timer_task)
+    for aid, task in list(_alarm_tasks.items()):
+        await _safe_cancel(task)
     _alarm_tasks.clear()
     if monitor:
         await monitor.stop()
@@ -1158,9 +1217,17 @@ async def _start_monitor() -> None:
         logger.warning("未发现设备，跳过对话监控")
 
 
+_miot_init_lock = asyncio.Lock()
+
 async def _check_miot() -> MinaHTTPClient:
     """检查并返回 miot_client"""
-    if miot_client is None:
+    global miot_client
+    if miot_client is not None:
+        return miot_client
+    async with _miot_init_lock:
+        # 双重检查
+        if miot_client is not None:
+            return miot_client
         token = config.miot_token
         user_id = config.get("miot_user_id", "")
         if token and user_id:
@@ -1489,6 +1556,11 @@ async def api_music_play(song_index: int, request: Request) -> Response:
                         break
                     yield chunk
             finally:
+                # 必须先 kill 子进程再 wait，否则 ffmpeg 阻塞在管道写入导致死锁
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
                 await proc.wait()
 
         logger.info(f"[Transcode] 流式转码: {filepath}")
@@ -1526,6 +1598,11 @@ async def api_music_proxy(url_hash: str) -> Response:
         return StreamingResponse(_stream_and_close(), media_type=media_type)
     except Exception as e:
         logger.error(f"[API] /api/music/proxy 代理音频流失败: {e}", exc_info=True)
+        if "resp" in locals() and resp is not None:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
         await client.aclose()
         return JSONResponse({"code": 1, "msg": str(e)}, status_code=502)
 
@@ -1547,12 +1624,14 @@ async def api_music_cover(song_index: int) -> Response:
 
     if not cache_path.exists():
         try:
-            result = subprocess.run(
-                ["ffmpeg", "-i", filepath, "-an", "-vcodec", "mjpeg",
-                 "-vframes", "1", "-y", str(cache_path)],
-                capture_output=True, timeout=10
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-i", filepath, "-an", "-vcodec", "mjpeg",
+                 "-vframes", "1", "-y", str(cache_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            if result.returncode != 0 or not cache_path.exists():
+            await asyncio.wait_for(proc.wait(), timeout=10)
+            if proc.returncode != 0 or not cache_path.exists():
                 # 无封面 → 返回默认黑胶唱片图
                 default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")
                 if os.path.isfile(default_svg):
@@ -1630,7 +1709,7 @@ async def api_music_artists() -> dict:
     """获取歌手列表（名、歌曲数、封面路径）"""
     from collections import Counter
     artists: dict[str, dict] = {}
-    for s in scanner._songs:
+    for s in scanner.iter_songs():
         name = s.get("artist", "未知歌手") or "未知歌手"
         if name not in artists:
             artists[name] = {"name": name, "song_count": 0, "cover": None}
@@ -1652,7 +1731,7 @@ async def api_music_albums() -> dict:
     """获取专辑列表（名、歌手、歌曲数、封面路径）"""
     from collections import Counter
     albums: dict[str, dict] = {}
-    for s in scanner._songs:
+    for s in scanner.iter_songs():
         album_name = s.get("album", "未知专辑") or "未知专辑"
         artist = s.get("artist", "") or ""
         key = (album_name, artist)
@@ -1686,7 +1765,7 @@ def _fix_play_state_after_delete(deleted_filepath: Optional[str] = None) -> None
         current = play_state.current_song()
         if current:
             filepath = current.get("filepath", "")
-            if filepath and filepath not in {s.get("filepath", "") for s in scanner._songs}:
+            if filepath and filepath not in {s.get("filepath", "") for s in scanner.iter_songs()}:
                 play_state.stop_playing()
                 logger.info("[PlayState] 当前播放歌曲已被批量删除，已停止播放")
 
@@ -1722,41 +1801,68 @@ def _has_audio_files(dirpath: str) -> bool:
     return False
 
 
+@app.delete("/api/music/song")
+async def api_music_song_delete(request: Request) -> dict:
+    """删除单首歌曲（按 filepath 定位，删文件+歌词），如果歌手目录无音频则删歌手目录"""
+    body = await request.json()
+    filepath = body.get("filepath", "")
+    # 兼容旧接口：如果没传 filepath 但传了 index，按 index 查找 filepath
+    if not filepath and "index" in body:
+        songs = scanner.get_songs(limit=5000)
+        idx_legacy = body["index"]
+        if 0 <= idx_legacy < len(songs):
+            filepath = songs[idx_legacy].get("filepath", "")
+    if not filepath:
+        return JSONResponse({"code": 1, "msg": "缺少 filepath"}, status_code=400)
+    idx = scanner.get_index_by_filepath(filepath)
+    if idx is None:
+        return JSONResponse({"code": 1, "msg": "歌曲不存在"}, status_code=404)
+    song = scanner.get_songs(limit=5000)[idx]
+    artist_path = song.get("artist_path", "")
+    lyrics_path = song.get("lyrics_path", "")
+    try:
+        # 删音频
+        deleted_audio = False
+        if filepath and os.path.isfile(filepath):
+            os.remove(filepath)
+            deleted_audio = True
+        # 删歌词（仅删除该歌曲对应的 .lrc，保留专辑封面图片）
+        if lyrics_path and os.path.isfile(lyrics_path):
+            os.remove(lyrics_path)
+        # 专辑目录若完全为空才删除空目录
+        song_dir = os.path.dirname(filepath) if filepath else ""
+        if song_dir and song_dir != artist_path and os.path.isdir(song_dir) and not os.listdir(song_dir):
+            os.rmdir(song_dir)
+        # 检查歌手目录是否还有音频（先校验路径安全性）
+        if artist_path and not _is_safe_path(artist_path):
+            logger.error(f"[API] 拒绝删除不安全歌手路径: {artist_path}")
+        elif artist_path and not _has_audio_files(artist_path):
+            import shutil
+            shutil.rmtree(artist_path, ignore_errors=True)
+        if deleted_audio:
+            scanner.remove_song(idx)
+            _fix_play_state_after_delete(filepath)
+        logger.info(f"[API] 删除歌曲成功: {filepath}")
+        return {"code": 0, "msg": "删除成功"}
+    except Exception as e:
+        logger.error(f"[API] 删除歌曲失败: {e}", exc_info=True)
+        return JSONResponse({"code": 1, "msg": f"删除失败: {e}"}, status_code=500)
+
+
 @app.post("/api/music/song/{index}/delete")
-async def api_music_song_delete(index: int) -> dict:
-    """删除单首歌曲（删文件+歌词），如果歌手目录无音频则删歌手目录"""
+async def api_music_song_delete_by_index(index: int) -> dict:
+    """[旧接口] 按 index 删除，内部转调 filepath 删除逻辑"""
     songs = scanner.get_songs(limit=5000)
     if index < 0 or index >= len(songs):
         return {"code": 1, "msg": "歌曲索引越界"}
-    song = songs[index]
-    filepath = song.get("filepath", "")
-    artist_path = song.get("artist_path", "")
-    lyrics_path = song.get("lyrics_path", "")
+    filepath = songs[index].get("filepath", "")
+    if not filepath:
+        return {"code": 1, "msg": "歌曲不存在"}
 
-    # 删音频
-    deleted_audio = False
-    if filepath and os.path.isfile(filepath):
-        os.remove(filepath)
-        deleted_audio = True
-    # 删歌词（仅删除该歌曲对应的 .lrc，保留专辑封面图片）
-    if lyrics_path and os.path.isfile(lyrics_path):
-        os.remove(lyrics_path)
-    # 注意：不删除专辑目录下的封面图片（cover.jpg 等），其他歌曲仍需使用
-    # 专辑目录若完全为空（无音频也无图片）才删除空目录
-    song_dir = os.path.dirname(filepath) if filepath else ""
-    if song_dir and song_dir != artist_path and os.path.isdir(song_dir) and not os.listdir(song_dir):
-        os.rmdir(song_dir)
-
-    # 检查歌手目录是否还有音频
-    if artist_path and not _has_audio_files(artist_path):
-        import shutil
-        shutil.rmtree(artist_path, ignore_errors=True)
-
-    if deleted_audio:
-        scanner.remove_song(index)
-        _fix_play_state_after_delete(filepath)
-    return {"code": 0, "msg": "已删除"}
-
+    class _FakeReq:
+        async def json(self):
+            return {"filepath": filepath}
+    return await api_music_song_delete(_FakeReq())
 
 @app.post("/api/music/artist/{artist_name}/delete")
 async def api_music_artist_delete(artist_name: str) -> dict:
@@ -1769,21 +1875,23 @@ async def api_music_artist_delete(artist_name: str) -> dict:
     if not _is_safe_path(artist_dir_path):
         return {"code": 1, "msg": "路径不在音乐库范围内，已拒绝删除"}
     deleted = 0
-    for s in scanner._songs[:]:
+    for s in scanner.iter_songs():
         if s.get("artist") == name:
             fp = s.get("filepath", "")
             if fp and os.path.isfile(fp):
                 os.remove(fp)
                 deleted += 1
     # 删歌手根目录
-    for s in scanner._songs:
+    for s in scanner.iter_songs():
         ap = s.get("artist_path", "")
         if ap and s.get("artist") == name and os.path.isdir(ap):
-            shutil.rmtree(ap, ignore_errors=True)
+            if _is_safe_path(ap):
+                shutil.rmtree(ap, ignore_errors=True)
+            else:
+                logger.error(f"[API] unsafe artist path: {ap}")
             break
     if deleted > 0:
-        scanner._songs = [s for s in scanner._songs if s.get("artist") != name]
-        scanner._save_cache()
+        scanner.remove_artist(name)
         _fix_play_state_after_delete()  # 检查当前播放是否被删
     return {"code": 0, "msg": f"已删除 {deleted} 首歌曲"}
 
@@ -1801,7 +1909,7 @@ async def api_music_album_delete(album_name: str, artist_name: str) -> dict:
         return {"code": 1, "msg": "路径不在音乐库范围内，已拒绝删除"}
     album_dir = ""
     deleted = 0
-    for s in scanner._songs[:]:
+    for s in scanner.iter_songs():
         if s.get("album") == aname and s.get("artist") == artname:
             fp = s.get("filepath", "")
             ap = s.get("album_path", "")
@@ -1811,18 +1919,23 @@ async def api_music_album_delete(album_name: str, artist_name: str) -> dict:
                 os.remove(fp)
                 deleted += 1
     if album_dir and os.path.isdir(album_dir):
-        shutil.rmtree(album_dir, ignore_errors=True)
+        if _is_safe_path(album_dir):
+            shutil.rmtree(album_dir, ignore_errors=True)
+        else:
+            logger.error(f"[API] unsafe album path: {album_dir}")
     # 检查歌手目录是否还有音频
     artist_path = ""
-    for s in scanner._songs:
+    for s in scanner.iter_songs():
         if s.get("artist") == artname:
             artist_path = s.get("artist_path", "")
             break
     if artist_path and not _has_audio_files(artist_path):
-        shutil.rmtree(artist_path, ignore_errors=True)
+        if _is_safe_path(artist_path):
+            shutil.rmtree(artist_path, ignore_errors=True)
+        else:
+            logger.error(f"[API] unsafe artist path: {artist_path}")
     if deleted > 0:
-        scanner._songs = [s for s in scanner._songs if not (s.get("album") == aname and s.get("artist") == artname)]
-        scanner._save_cache()
+        scanner.remove_album(aname, artname)
         _fix_play_state_after_delete()  # 检查当前播放是否被删
     return {"code": 0, "msg": f"已删除 {deleted} 首歌曲"}
 
@@ -2062,12 +2175,12 @@ async def api_player_state() -> dict:
         # 尝试匹配正在播放的歌曲
         matched_song = None
         matched_index = None
-        if song_name and scanner._songs:
+        if song_name and scanner.iter_songs():
             results = scanner.search(song_name)
             if results:
                 matched_song = results[0]
                 # 找到匹配歌曲在 _songs 中的索引
-                for i, s in enumerate(scanner._songs):
+                for i, s in enumerate(scanner.iter_songs()):
                     if s.get("title") == matched_song.get("title") and s.get("artist") == matched_song.get("artist"):
                         matched_index = i
                         break
@@ -2168,6 +2281,11 @@ async def api_player_toggle_play(body: dict) -> dict:
 async def api_player_next() -> dict:
     """下一曲"""
     next_idx = play_state._get_next_index()
+    # SINGLE 模式下 _get_next_index 返回 None，但用户主动按下一曲时应强制切到下一首
+    if next_idx is None and play_state.mode == PlayMode.SINGLE and play_state.playlist:
+        nxt = (play_state.current_index or 0) + 1
+        if nxt < len(play_state.playlist):
+            next_idx = nxt
     if next_idx is None:
         play_state.stop_playing()
         logger.info("[Player] 没有下一曲，播放结束")
@@ -2336,7 +2454,7 @@ async def api_timer_sleep(body: dict) -> dict:
         return {"code": 1, "msg": "分钟数需在 1-1440 之间"}
     global _sleep_timer_task
     if _sleep_timer_task:
-        _sleep_timer_task.cancel()
+        await _safe_cancel(_sleep_timer_task)
     _sleep_timer_task = asyncio.create_task(_sleep_timer(minutes))
     logger.info(f"[Timer] 睡眠定时设置: {minutes} 分钟")
     return {"code": 0, "data": {"minutes": minutes}}
@@ -2354,7 +2472,7 @@ async def api_timer_sleep_cancel() -> dict:
     """取消睡眠定时"""
     global _sleep_timer_task, _sleep_timer_remaining
     if _sleep_timer_task:
-        _sleep_timer_task.cancel()
+        await _safe_cancel(_sleep_timer_task)
         _sleep_timer_task = None
     _sleep_timer_remaining = 0
     return {"code": 0, "msg": "已取消"}
@@ -2401,8 +2519,8 @@ async def api_alarm_delete(body: dict) -> dict:
     """删除闹钟"""
     alarm_id = body.get("id", "")
     if alarm_id in _alarm_tasks:
-        _alarm_tasks[alarm_id].cancel()
-        del _alarm_tasks[alarm_id]
+        await _safe_cancel(_alarm_tasks[alarm_id])
+        _alarm_tasks.pop(alarm_id, None)
     alarms = [a for a in config.get("alarms", []) if a.get("id") != alarm_id]
     config.set("alarms", alarms)
     return {"code": 0}

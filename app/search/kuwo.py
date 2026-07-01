@@ -27,6 +27,15 @@ async def _get_client(timeout: float = 10.0) -> httpx.AsyncClient:
         )
     return _shared_client
 
+
+async def close_client():
+    """应用关闭时调用，关闭共享 httpx 客户端"""
+    global _shared_client
+    if _shared_client and not _shared_client.is_closed:
+        await _shared_client.aclose()
+        _shared_client = None
+
+
 KUWO_SEARCH_URL = "http://search.kuwo.cn/r.s"
 KUWO_MOBI_URL = "https://mobi.kuwo.cn/mobi.s"
 
@@ -47,42 +56,19 @@ FORMAT_DEFS = [
 
 
 def _python_to_json(raw_text: str) -> str:
-    """将酷我返回的 Python 风格字典转为 JSON - 状态机安全版"""
+    """将酷我返回的 Python 字面量转为 JSON"""
+    import ast
     s = raw_text.strip()
-
     # 移除 BOM
     if s and ord(s[0]) == 0xFEFF:
         s = s[1:]
-
-    result = []
-    in_string = False
-    escape_next = False
-    for ch in s:
-        if escape_next:
-            result.append(ch)
-            escape_next = False
-            continue
-        if ch == '\\':
-            result.append(ch)
-            escape_next = True
-            continue
-        if ch == "'" and not in_string:
-            result.append('"')  # open string
-            in_string = True
-            continue
-        if ch == "'" and in_string:
-            result.append('"')  # close string
-            in_string = False
-            continue
-        if ch == '"' and in_string:
-            result.append('\\"')  # escape double quote inside string
-            continue
-        # 布尔/None 字面量转换
-        result.append(ch)
-
-    text = ''.join(result)
-    text = text.replace(": True", ": true").replace(": False", ": false").replace(": None", ": null")
-    return text
+    try:
+        # 用 ast.literal_eval 安全解析 Python 字面量（含 True/False/None/单引号）
+        parsed = ast.literal_eval(s)
+        return json.dumps(parsed, ensure_ascii=False)
+    except (ValueError, SyntaxError) as e:
+        logger.debug("[Kuwo] ast.literal_eval 失败: %s，返回原文", e)
+        return s
 
 
 def _parse_nminfo(nminfo: str) -> list:
@@ -216,12 +202,12 @@ async def search(
         # ===== 歌手搜索 =====
         if search_type == "artist":
             for item in abslist:
-                artist_id_raw = item.get("ARTISTID", "")
+                artist_id_raw = item.get("ARTISTID") or item.get("artistid") or ""
                 artist_id = str(artist_id_raw).strip() if artist_id_raw else ""
                 if not artist_id:
                     continue
-                artist_name = (item.get("ARTIST") or "").strip()
-                pic = item.get("PICPATH") or item.get("pictitle") or ""
+                artist_name = (item.get("ARTIST") or item.get("artist") or "").strip()
+                pic = item.get("PICPATH") or item.get("picpath") or item.get("pictitle") or ""
                 # 补全图片 URL
                 if pic and not pic.startswith("http"):
                     pic = f"https://star.kuwo.cn/star/starheads/{pic.lstrip('/')}"
@@ -286,7 +272,10 @@ async def search(
             song_name = (song.get("NAME") or "").strip()
             artist_name = (song.get("ARTIST") or "").strip()
             album_name = (song.get("ALBUM") or "").strip()
-            duration = int(song.get("DURATION", 180))
+            try:
+                duration = int(song.get("DURATION", 180))
+            except (TypeError, ValueError):
+                duration = 180
 
             # 提取 artist_id 和 album_id
             raw_artist_id = song.get("ARTISTID", "") or song.get("artistid", "") or ""
@@ -308,11 +297,11 @@ async def search(
             cover_url = None
             album_pic = song.get("web_albumpic_short", "")
             if album_pic:
-                cover_url = f"https://img3.kuwo.cn/star/albumcover/{album_pic}".replace("/120", "/500")
+                cover_url = re.sub(r'/120(?=/|$)', '/500', f"https://img3.kuwo.cn/star/albumcover/{album_pic}")
             if not cover_url:
                 artist_pic = song.get("web_artistpic_short", "")
                 if artist_pic:
-                    cover_url = f"https://star.kuwo.cn/star/starheads/{artist_pic}".replace("/120", "/500")
+                    cover_url = re.sub(r'/120(?=/|$)', '/500', f"https://star.kuwo.cn/star/starheads/{artist_pic}")
 
             # 音质获取：优先用 nMinfo 字段（sqmusic 方式），无则调 API
             nminfo = song.get("nMinfo", "") or song.get("NMINFO", "") or ""
@@ -337,8 +326,8 @@ async def search(
             )
 
         song_tasks = [_fetch_song(s) for s in abslist]
-        song_results = await asyncio.gather(*song_tasks)
-        results = [r for r in song_results if r is not None]
+        song_results = await asyncio.gather(*song_tasks, return_exceptions=True)
+        results = [r for r in song_results if r is not None and not isinstance(r, Exception)]
 
         return results
 
@@ -522,11 +511,11 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
             cover_url = None
             album_pic_short = song.get("web_albumpic_short") or ""
             if album_pic_short:
-                cover_url = ("https://img3.kuwo.cn/star/albumcover/" + album_pic_short).replace("/120", "/500")
+                cover_url = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + album_pic_short)
             if not cover_url:
                 artist_pic_short = song.get("web_artistpic_short") or ""
                 if artist_pic_short:
-                    cover_url = ("https://star.kuwo.cn/star/starheads/" + artist_pic_short).replace("/120", "/500")
+                    cover_url = re.sub(r'/120(?=/|$)', '/500', "https://star.kuwo.cn/star/starheads/" + artist_pic_short)
 
             # 音质走 N_MINFO
             nminfo = song.get("N_MINFO") or song.get("nMinfo") or ""
@@ -554,8 +543,8 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
             )
 
         song_tasks = [_parse_artist_song(s) for s in songs[:20]]
-        song_results = await asyncio.gather(*song_tasks)
-        result["top_songs"] = [r for r in song_results if r is not None]
+        song_results = await asyncio.gather(*song_tasks, return_exceptions=True)
+        result["top_songs"] = [r for r in song_results if r is not None and not isinstance(r, Exception)]
 
         # 2. 获取歌手专辑列表（PC 端 albumlist 接口，参考 sqmusic ArtistAlbumListUrl）
         albums_url = (
@@ -587,7 +576,7 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
             alb_pic_short = alb.get("pic") or ""
             alb_pic = ""
             if alb_pic_short:
-                alb_pic = ("https://img3.kuwo.cn/star/albumcover/" + alb_pic_short).replace("/120", "/500")
+                alb_pic = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + alb_pic_short)
             if not alb_pic:
                 alb_pic = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{alb_id}.jpg"
             alb_year = str(alb.get("pub") or "").strip()
@@ -663,7 +652,7 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
         # 封面：优先 img，其次 pic，最后按 albumid 兜底
         cover = (data.get("img") or data.get("pic") or "").strip()
         if cover and not cover.startswith("http"):
-            cover = ("https://img3.kuwo.cn/star/albumcover/" + cover).replace("/120", "/500")
+            cover = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + cover)
         if not cover:
             cover = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{album_id}.jpg"
         result["cover"] = cover
@@ -694,7 +683,7 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
             track_cover = result["cover"]
             album_pic_short = song.get("web_albumpic_short") or ""
             if album_pic_short:
-                track_cover = ("https://img3.kuwo.cn/star/albumcover/" + album_pic_short).replace("/120", "/500")
+                track_cover = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + album_pic_short)
 
             # 音质走 N_MINFO
             nminfo = song.get("N_MINFO") or song.get("nMinfo") or ""
@@ -722,8 +711,8 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
             )
 
         track_tasks = [_parse_track(s) for s in songs]
-        track_results = await asyncio.gather(*track_tasks)
-        result["tracks"] = [r for r in track_results if r is not None]
+        track_results = await asyncio.gather(*track_tasks, return_exceptions=True)
+        result["tracks"] = [r for r in track_results if r is not None and not isinstance(r, Exception)]
 
         logger.debug(
             "[Kuwo] 专辑详情: name=%s tracks=%d",

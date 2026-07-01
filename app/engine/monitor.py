@@ -66,6 +66,16 @@ class ConversationMonitor:
                 return m.get("query", "")
         return None
 
+    def get_last_unhandled_query(self, device_id: str, within_sec: float = 30.0) -> Optional[str]:
+        """获取设备最近 within_sec 秒内未处理的对话 query（供轨道2反查，跳过已处理）"""
+        cutoff_ms = int((time.time() - within_sec) * 1000)
+        for m in reversed(self._message_buffer):
+            if (m.get("device_id") == device_id
+                and m.get("timestamp_ms", 0) >= cutoff_ms
+                and not m.get("handled", False)):
+                return m.get("query", "")
+        return None
+
     def mark_query_handled(self, device_id: str, query: str) -> None:
         """标记某个 query 已被处理（供轨道2避免重复触发）"""
         # 简单实现：写入一个标记字段，下次 get_last_query 跳过它
@@ -167,11 +177,17 @@ class ConversationMonitor:
         """轮询所有已勾选的设备（跳过未勾选的）"""
         from app.config import config as app_config
         selections: dict = app_config.get("device_selections", {})
-        for device_id in list(self._last_timestamps.keys()):
-            # 仅轮询已勾选的设备
-            if not selections.get(device_id, False):
-                continue
-            await self._poll_device(device_id)
+        selected_ids = [
+            did for did in list(self._last_timestamps.keys())
+            if selections.get(did, False)
+        ]
+        if not selected_ids:
+            return
+        # 并发轮询所有设备，避免单设备耗时拉长整个周期
+        await asyncio.gather(
+            *[self._poll_device(did) for did in selected_ids],
+            return_exceptions=True
+        )
 
     async def _poll_device(self, device_id: str) -> None:
         """轮询单个设备的对话记录

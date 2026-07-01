@@ -1384,7 +1384,7 @@ async function refreshDashboard() {
     if (msgs.data && msgs.data.length > 0) {
         container.innerHTML = msgs.data.slice(-10).reverse().map(m =>
             `<div class="mb-2 pb-2 border-bottom border-secondary">
-                <small class="text-muted">${m.time || formatTs(m.timestamp_ms)}</small>
+                <small class="text-muted">${escHtml(m.time || formatTs(m.timestamp_ms))}</small>
                 <strong class="text-info">${escHtml(m.device_name || m.device_id?.slice(0,8))}</strong>
                 <div><span class="text-warning">Q:</span> ${escHtml(m.query || '?')}</div>
                 <div><span class="text-success">A:</span> ${escHtml(m.answer || '?')}</div>
@@ -1699,7 +1699,7 @@ function renderSongs(songs) {
                 <button class="btn btn-sm btn-outline-accent add-to-pl-btn" data-filepath="${escAttr(s.filepath)}" onclick="showAddToPlaylist(this.dataset.filepath, event)" title="加入歌单">
                     <i class="bi bi-plus-circle"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-danger del-song-btn" onclick="deleteSong(${s._idx})" title="删除">
+                <button class="btn btn-sm btn-outline-danger del-song-btn" data-filepath="${escAttr(s.filepath)}" onclick="deleteSong(this.dataset.filepath)" title="删除">
                     <i class="bi bi-trash"></i>
                 </button>
                 </div>
@@ -1749,7 +1749,7 @@ function renderCurrentSongPage() {
                 <button class="btn btn-sm btn-outline-accent add-to-pl-btn" data-filepath="${escAttr(s.filepath)}" onclick="showAddToPlaylist(this.dataset.filepath, event)" title="加入歌单">
                     <i class="bi bi-plus-circle"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-danger del-song-btn" onclick="deleteSong(${s._idx})" title="删除">
+                <button class="btn btn-sm btn-outline-danger del-song-btn" data-filepath="${escAttr(s.filepath)}" onclick="deleteSong(this.dataset.filepath)" title="删除">
                     <i class="bi bi-trash"></i>
                 </button>
                 </div>
@@ -1867,7 +1867,7 @@ function renderAlbumGrid() {
     }
 
     const container = document.getElementById('albumGridView');
-    document.getElementById('albumCount').textContent = `(${albumList.length}张)`;
+    document.getElementById('albumCount').textContent = `共 ${albumList.length} 张`;
 
     // Album pagination
     const totalAlbumPages = Math.ceil(albumList.length / albumPageSize) || 1;
@@ -1943,7 +1943,7 @@ function escAttr(s) {
 function showArtistSongs(artist) {
     const songs = songsCache.filter(s => (s.artist || '') === artist);
     document.getElementById('albumSongsModalTitle').textContent =
-        artist + ' (' + songs.length + '首)';
+        artist + ' 共 ' + songs.length + ' 首';
     document.getElementById('albumSongsTableBody').innerHTML = songs.map((s, i) => `
         <tr>
             <td style="width:40px;color:var(--text-primary);vertical-align:middle;">${i + 1}</td>
@@ -1958,7 +1958,7 @@ function showArtistSongs(artist) {
         </tr>
     `).join('');
     window._artistSongsList = songs;
-    const modal = new bootstrap.Modal(document.getElementById('albumSongsModal'));
+    const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('albumSongsModal'));
     modal.show();
 }
 
@@ -1967,7 +1967,7 @@ function showAlbumSongs(album, artist) {
         (s.album || '未知专辑') === album && (s.artist || '') === artist
     );
     document.getElementById('albumSongsModalTitle').textContent =
-        album + ' - ' + (artist || '未知歌手') + ' (' + songs.length + '首)';
+        album + ' - ' + (artist || '未知歌手') + ' 共 ' + songs.length + ' 首';
     document.getElementById('albumSongsTableBody').innerHTML = songs.map((s, i) => `
         <tr>
             <td style="width:40px;color:var(--text-primary);vertical-align:middle;">${i + 1}</td>
@@ -1982,7 +1982,7 @@ function showAlbumSongs(album, artist) {
         </tr>
     `).join('');
     window._albumSongsList = songs;
-    const modal = new bootstrap.Modal(document.getElementById('albumSongsModal'));
+    const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('albumSongsModal'));
     modal.show();
 }
 
@@ -2217,6 +2217,10 @@ async function fetchPlayerState() {
             stopProgressPoll();
             updateProgress(0, 0);
             document.getElementById('playerCover').style.display = 'none';
+            // 重置高亮状态，避免残留高亮行
+            currentPlayingIdx = null;
+            currentPlayingIndex = null;
+            highlightCurrentSong();
         }
         return r.data;
     }
@@ -2427,6 +2431,8 @@ async function refreshPlaylistPanel() {
 
     // 使用 play_state 中的播放列表（而非全库歌曲），确保播放1首专辑时只显示1首
     const songs = state.playlist || [];
+    // 缓存当前播放列表，供 playlistPlaySong 使用，避免点击播放时又拉全库
+    window._currentPlaylist = songs;
     const currentIdx = state.current_index;
 
     if (songs.length === 0) {
@@ -2445,8 +2451,9 @@ async function refreshPlaylistPanel() {
 }
 
 async function playlistPlaySong(index) {
-    const songsR = await api('/api/music/songs?limit=5000');
-    const songs = songsR.data?.songs || [];
+    // 使用缓存的当前播放列表（由 refreshPlaylistPanel 写入），而非重拉全库
+    const songs = window._currentPlaylist || [];
+    if (index < 0 || index >= songs.length) return;
     const r = await api('/api/player/play', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -3084,13 +3091,13 @@ async function loadPlaylists() {
                     <span class="badge bg-secondary ms-2">${songPaths.length} 首</span>
                 </span>
                 <div onclick="event.stopPropagation()">
-                    <button class="btn btn-sm btn-accent me-1" onclick='playPlaylistSongs("${pl.id}")' title="播放全部">
+                    <button class="btn btn-sm btn-accent me-1" data-id="${escAttr(pl.id)}" onclick="playPlaylistSongs(this.dataset.id)" title="播放全部">
                         <i class="bi bi-play-fill"></i> 播放全部
                     </button>
-                    <button class="btn btn-sm btn-outline-accent" onclick="renamePlaylist('${pl.id}', '${escHtml(pl.name).replace(/'/g, "\\'")}')" title="重命名">
+                    <button class="btn btn-sm btn-outline-accent" data-id="${escAttr(pl.id)}" data-name="${escAttr(pl.name)}" onclick="renamePlaylist(this.dataset.id, this.dataset.name)" title="重命名">
                         <i class="bi bi-pencil"></i>
                     </button>
-                    <button class="btn btn-sm btn-outline-danger" onclick="deletePlaylist('${pl.id}')" title="删除">
+                    <button class="btn btn-sm btn-outline-danger" data-id="${escAttr(pl.id)}" onclick="deletePlaylist(this.dataset.id)" title="删除">
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
@@ -3188,7 +3195,7 @@ async function showAddToPlaylist(filepath, event) {
                  data-playlist-id="${escAttr(pl.id)}" data-filepath="${escAttr(filepath)}"
                  onclick="addToPlaylist(this.dataset.playlistId, this.dataset.filepath)">
                 <i class="bi bi-collection-play me-2 text-accent"></i>${escHtml(pl.name)}
-                <span class="text-muted small ms-1">(${(pl.songs||[]).length} 首)</span>
+                <span class="text-muted small ms-1">共 ${(pl.songs||[]).length} 首</span>
             </div>
         `).join('')}
     `;
@@ -3419,10 +3426,10 @@ function renderSongResults() {
             ? '<span class="badge bg-warning text-dark">酷我</span>'
             : '<span class="badge bg-danger">网易云</span>';
         const artistHtml = s.artist_id
-            ? '<small style="color:#5b9aff;cursor:pointer;" onclick="openArtist(\'' + s.source + '\', \'' + s.artist_id + '\')">' + escHtml(s.artist || '-') + '</small>'
+            ? '<small style="color:#5b9aff;cursor:pointer;" data-source="' + escAttr(s.source) + '" data-artist-id="' + escAttr(s.artist_id) + '" onclick="openArtist(this.dataset.source, this.dataset.artistId)">' + escHtml(s.artist || '-') + '</small>'
             : '<small>' + escHtml(s.artist || '-') + '</small>';
         const albumHtml = s.album_id
-            ? '<small style="color:#5b9aff;cursor:pointer;" onclick="openAlbum(\'' + s.source + '\', \'' + s.album_id + '\')">' + escHtml(s.album || '-') + '</small>'
+            ? '<small style="color:#5b9aff;cursor:pointer;" data-source="' + escAttr(s.source) + '" data-album-id="' + escAttr(s.album_id) + '" onclick="openAlbum(this.dataset.source, this.dataset.albumId)">' + escHtml(s.album || '-') + '</small>'
             : '<small>' + escHtml(s.album || '-') + '</small>';
 
         return '<tr>' +
@@ -3452,7 +3459,7 @@ function renderArtistResults() {
         const coverSrc = s.cover || '/static/vinyl.svg';
         // 使用 artist_id 字段（后端已返回纯数字 ID，无需剥离前缀）
         const artistId = s.artist_id || s.id.replace(/^(kuwo_artist_|kuwo_album_|kuwo_|netease_)/, '');
-        return '<tr onclick="openArtist(\'' + s.source + '\', \'' + artistId + '\')" style="cursor:pointer;">' +
+        return '<tr style="cursor:pointer;" data-source="' + escAttr(s.source) + '" data-artist-id="' + escAttr(artistId) + '" onclick="openArtist(this.dataset.source, this.dataset.artistId)">' +
             '<td style="vertical-align:middle;"><img src="' + coverSrc + '" style="width:40px;height:40px;border-radius:50%;object-fit:cover;" onerror="this.src=\'/static/vinyl.svg\'"></td>' +
             '<td colspan="3" style="vertical-align:middle;"><div style="font-size:14px;color:#fff;">' + escHtml(s.title) + '</div></td>' +
             '<td style="vertical-align:middle;"><span class="badge bg-' + (s.source === 'kuwo' ? 'warning text-dark' : 'danger') + '">' + (s.source === 'kuwo' ? '酷我' : '网易云') + '</span></td>' +
@@ -3476,7 +3483,7 @@ function renderAlbumResults() {
         const coverSrc = s.cover || '/static/vinyl.svg';
         // 使用 album_id 字段（后端已返回纯数字 ID，无需剥离前缀）
         const albumId = s.album_id || s.id.replace(/^(kuwo_artist_|kuwo_album_|kuwo_|netease_)/, '');
-        return '<tr onclick="openAlbum(\'' + s.source + '\', \'' + albumId + '\')" style="cursor:pointer;">' +
+        return '<tr style="cursor:pointer;" data-source="' + escAttr(s.source) + '" data-album-id="' + escAttr(albumId) + '" onclick="openAlbum(this.dataset.source, this.dataset.albumId)">' +
             '<td style="vertical-align:middle;"><img src="' + coverSrc + '" style="width:40px;height:40px;border-radius:4px;object-fit:cover;" onerror="this.src=\'/static/vinyl.svg\'"></td>' +
             '<td colspan="3" style="vertical-align:middle;"><div style="font-size:14px;color:#fff;">' + escHtml(s.title) + '</div><small style="color:#aaa;">' + escHtml(s.artist || '-') + '</small></td>' +
             '<td style="vertical-align:middle;"><span class="badge bg-' + (s.source === 'kuwo' ? 'warning text-dark' : 'danger') + '">' + (s.source === 'kuwo' ? '酷我' : '网易云') + '</span></td>' +
@@ -3542,7 +3549,7 @@ async function openArtist(source, artistId) {
             albums.forEach(a => {
                 const cover = a.cover || '';
                 albumHtml += '<div class="col-6 col-md-3 mb-2">' +
-                    '<div class="card-dark" style="cursor:pointer;" onclick="openAlbum(\'' + source + '\', \'' + (a.id || '') + '\')">' +
+                    '<div class="card-dark" style="cursor:pointer;" data-source="' + escAttr(source) + '" data-album-id="' + escAttr(a.id || '') + '" onclick="openAlbum(this.dataset.source, this.dataset.albumId)">' +
                     '<img src="' + cover + '" style="width:100%;height:120px;object-fit:cover;border-radius:4px 4px 0 0;" onerror="this.style.display=\'none\'">' +
                     '<div class="p-2"><small style="color:#fff;">' + escHtml(a.name || a.title || '未知专辑') + '</small></div>' +
                     '</div></div>';
@@ -3742,7 +3749,7 @@ async function downloadSingleSong(idx) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             source: song.source,
-            music_id: song.id.replace(song.source + '_', ''),
+            music_id: (song.id || '').replace(song.source + '_', ''),
             title: song.title,
             artist: song.artist,
             album: song.album,
@@ -3771,7 +3778,7 @@ async function downloadSong(idx) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             source: song.source,
-            music_id: song.id.replace(song.source + '_', ''),
+            music_id: (song.id || '').replace(song.source + '_', ''),
             title: song.title,
             artist: song.artist,
             album: song.album,
@@ -3818,6 +3825,14 @@ async function refreshDownloadTasks() {
         _prevDownloadStatus[t.task_id] = t.status;
     }
 
+    // 清理已不存在的 task 的状态，避免 _prevDownloadStatus 永不清理
+    const _currentTaskIds = new Set(tasks.map(t => t.task_id));
+    for (const _id of Object.keys(_prevDownloadStatus)) {
+        if (!_currentTaskIds.has(_id)) {
+            delete _prevDownloadStatus[_id];
+        }
+    }
+
     document.getElementById('statDownloadWaiting').textContent = stats.waiting || 0;
     document.getElementById('statDownloadLoading').textContent = stats.loading || 0;
     document.getElementById('statDownloadSuccess').textContent = stats.success || 0;
@@ -3843,12 +3858,12 @@ async function refreshDownloadTasks() {
         ops.push('<button class="btn btn-sm btn-outline-danger" onclick="deleteDownloadTask(\'' + t.task_id + '\')"><i class="bi bi-trash"></i></button>');
 
         return '<tr style="vertical-align:middle;">' +
-            '<td class="small"><code>' + t.task_id.substring(0, 12) + '</code></td>' +
+            '<td class="small"><code>' + (t.task_id || '').substring(0, 12) + '</code></td>' +
             '<td>' + escHtml(t.title) + '</td>' +
             '<td class="small">' + escHtml(t.artist || '-') + '</td>' +
             '<td>' + (t.source === 'kuwo' ? '<span class="badge bg-warning text-dark">酷我</span>' : '<span class="badge bg-danger">网易云</span>') + '</td>' +
-            '<td><span class="badge bg-info">' + escHtml(t.format_type.toUpperCase()) + '</span></td>' +
-            '<td>' + statusBadge + (t.error_msg ? '<br><small class="text-danger">' + escHtml(t.error_msg.substring(0, 60)) + '</small>' : '') + '</td>' +
+            '<td><span class="badge bg-info">' + escHtml((t.format_type || '').toUpperCase()) + '</span></td>' +
+            '<td>' + statusBadge + (t.error_msg ? '<br><small class="text-danger">' + escHtml(String(t.error_msg || '').substring(0, 60)) + '</small>' : '') + '</td>' +
             '<td><div class="d-flex gap-1">' + ops.join(' ') + '</div></td>' +
             '</tr>';
     }).join('');
@@ -4078,7 +4093,7 @@ async function renderArtistList(kw) {
     if (kw) {
         artists = artists.filter(a => (a.name || '').toLowerCase().includes(kw));
     }
-    document.getElementById('artistCount').textContent = '(' + artists.length + ' 个)';
+    document.getElementById('artistCount').textContent = '共 ' + artists.length + ' 个';
     const sort = document.getElementById('artistSortSelect').value;
     if (sort === 'name-desc') artists.sort((a,b) => b.name.localeCompare(a.name));
     else if (sort === 'songs-desc') artists.sort((a,b) => b.song_count - a.song_count);
@@ -4109,9 +4124,14 @@ async function playArtistSongs(name) {
     playSongByList(artistSongs, 0);
 }
 
-async function deleteSong(idx) {
+async function deleteSong(filepath) {
     if (!confirm('确定要删除这首歌曲吗？将同时删除歌词文件。')) return;
-    const r = await api('/api/music/song/' + idx + '/delete', {method: 'POST'});
+    // 后端删除接口已改为按 filepath 定位（DELETE /api/music/song）
+    const r = await api('/api/music/song', {
+        method: 'DELETE',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({filepath: filepath})
+    });
     if (r.code === 0) {
         showToast('已删除');
         currentPage = 1;

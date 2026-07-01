@@ -47,17 +47,31 @@ class MinaHTTPClient:
         self._client = httpx.AsyncClient(timeout=15.0)
         # 401 过期回调（由 token_refresh 模块注入）
         self._on_token_expired = None
-        # 最近一次 musicnest 自己触发的播放时间戳（供轨道2区分"自己触发"vs"小爱原生播放"）
+        # 最近一次 musicnest 自己触发的播放时间戳（per-device，供轨道2区分"自己触发"vs"小爱原生播放"）
         # 在 play_url / play_music_url 成功后立即写入
-        self._last_own_play_at: float = 0.0
+        self._last_own_play_at: dict[str, float] = {}  # device_id -> timestamp
+        # 注册 token 刷新回调，token 刷新成功后自动同步
+        from app.miot import token_refresh
+        token_refresh.register_client_callback(self._on_token_refreshed)
 
-    def mark_own_play(self) -> None:
+    def mark_own_play(self, device_id: str = "") -> None:
         """标记最近一次播放是 musicnest 自己触发的（供 media_watcher 判断）"""
-        self._last_own_play_at = time.time()
+        if device_id:
+            self._last_own_play_at[device_id] = time.time()
 
-    def is_own_play_recent(self, within_sec: float = 3.0) -> bool:
-        """检查最近 within_sec 秒内是否自己触发过播放"""
-        return (time.time() - self._last_own_play_at) < within_sec
+    def is_own_play_recent(self, device_id: str = "", within_sec: float = 3.0) -> bool:
+        """检查指定设备最近 within_sec 秒内是否自己触发过播放"""
+        if not device_id:
+            # 没有指定设备时，检查所有设备（向后兼容）
+            now = time.time()
+            return any(now - ts < within_sec for ts in self._last_own_play_at.values())
+        ts = self._last_own_play_at.get(device_id, 0.0)
+        return (time.time() - ts) < within_sec
+
+    def _on_token_refreshed(self, new_token: str) -> None:
+        """token 刷新回调：同步新 token"""
+        self._service_token = new_token
+        logger.info("[MIoT] token 已通过回调更新")
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -105,7 +119,7 @@ class MinaHTTPClient:
         logger.debug("[MIoT] play_url 完整响应: %s", result)
         ok = result is not None
         if ok:
-            self.mark_own_play()  # 标记为 musicnest 自己触发的播放
+            self.mark_own_play(device_id)  # 标记为 musicnest 自己触发的播放
         return ok
 
     async def play_music_url(self, device_id: str, audio_url: str, keep_light: bool = False) -> bool:
@@ -149,7 +163,7 @@ class MinaHTTPClient:
         logger.debug("[MIoT] play_music_url 响应: %s", result)
         ok = result is not None
         if ok:
-            self.mark_own_play()  # 标记为 musicnest 自己触发的播放
+            self.mark_own_play(device_id)  # 标记为 musicnest 自己触发的播放
         return ok
 
     async def player_play(self, device_id: str) -> bool:
@@ -171,29 +185,33 @@ class MinaHTTPClient:
     async def stop_all_media(self, device_id: str) -> None:
         """停止音箱所有媒体通道的播放（并发发送，最快停止）"""
         tasks = [
-            self.player_pause(device_id),
-            self._ubus_request(
+            asyncio.wait_for(self.player_pause(device_id), timeout=3.0),
+            asyncio.wait_for(self._ubus_request(
                 device_id, "player_play_operation", "mediaplayer",
                 {"action": "stop", "media": "app_ios"}
-            ),
-            self._ubus_request(
+            ), timeout=3.0),
+            asyncio.wait_for(self._ubus_request(
                 device_id, "player_play_operation", "mediaplayer",
                 {"action": "stop", "media": "1"}
-            ),
-            self._ubus_request(
+            ), timeout=3.0),
+            asyncio.wait_for(self._ubus_request(
                 device_id, "player_play_operation", "mediaplayer",
                 {"action": "stop", "media": "2"}
-            ),
-            self._ubus_request(
+            ), timeout=3.0),
+            asyncio.wait_for(self._ubus_request(
                 device_id, "player_play_operation", "mediaplayer",
                 {"action": "stop", "media": ""}
-            ),
-            self._ubus_request(
+            ), timeout=3.0),
+            asyncio.wait_for(self._ubus_request(
                 device_id, "player_play_tts", "mediaplayer", {"text": ""}
-            ),
+            ), timeout=3.0),
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info(f"[MIoT] 已停止设备所有媒体通道: {device_id[:12]}...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        success_count = sum(1 for r in results if not isinstance(r, Exception))
+        if success_count == 0:
+            logger.warning(f"[MIoT] stop_all_media 全部失败: device_id={device_id[:12]}...")
+        else:
+            logger.info(f"[MIoT] stop_all_media 成功 {success_count}/{len(results)}: {device_id[:12]}...")
 
     async def set_volume(self, device_id: str, volume: int) -> bool:
         """设置音量 (0-100)"""
@@ -460,9 +478,12 @@ class MinaHTTPClient:
             return False
         try:
             ok = await self._on_token_expired()
+            # 无论刷新是否成功，都检查 config 中是否有更新的 token（节流期间可能由其他实例刷新）
+            config_token = config.get("miot_token", "")
+            if config_token and config_token != self._service_token:
+                logger.info("[MIoT] 从 config 同步新 token")
+                self._service_token = config_token
             if ok:
-                # 从 config 读取刷新后的 token
-                self._service_token = config.get("miot_token", "")
                 logger.info("[MIoT] token 已刷新，重试请求")
             return ok
         except Exception as e:

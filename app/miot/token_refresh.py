@@ -31,12 +31,20 @@ _token_created_at: float = 0.0
 _last_relogin_at: float = 0.0
 _refresh_task: Optional[asyncio.Task] = None
 
+# client 更新回调列表（token 刷新成功后通知 client 实例同步）
+_client_callbacks: list = []
+
 
 def record_token_created() -> None:
     """记录 token 创建时间（登录/刷新成功后调用）"""
     global _token_created_at
     _token_created_at = time.time()
     logger.debug("[TokenRefresh] token 创建时间已记录")
+
+
+def register_client_callback(cb) -> None:
+    """注册 client 更新回调，token 刷新成功后调用"""
+    _client_callbacks.append(cb)
 
 
 def start_refresh_loop(miauth: MiAuth) -> None:
@@ -103,8 +111,6 @@ async def _do_refresh(miauth: MiAuth) -> bool:
     """执行 token 刷新（使用 passToken 降级链）"""
     global _last_relogin_at
 
-    _last_relogin_at = time.time()
-
     pass_token = config.get("miot_pass_token", "")
     user_id = config.get("miot_user_id", "")
     ssecurity = config.get("miot_ssecurity", "")
@@ -125,6 +131,8 @@ async def _do_refresh(miauth: MiAuth) -> bool:
     # 方式 2: 已有的 serviceToken + ssecurity 可能仍然有效，仅记录探活
     if not new_token and ssecurity:
         logger.info("[TokenRefresh] passToken 刷新失败，保留现有 token（等待 401 自动重试）")
+        # 失败时设较短退避（5秒后可重试）
+        _last_relogin_at = time.time() - (RELOGIN_THROTTLE_SEC - 5)
         return False
 
     if new_token:
@@ -136,10 +144,20 @@ async def _do_refresh(miauth: MiAuth) -> bool:
                 "miot_ssecurity": new_ssecurity,
             })
             record_token_created()
+            # 刷新成功后才置位节流
+            _last_relogin_at = time.time()
+            # 通知所有注册的 client 回调
+            for cb in _client_callbacks:
+                try:
+                    cb(service_token)
+                except Exception as e:
+                    logger.warning("[TokenRefresh] client 回调失败: %s", e)
             logger.info("[TokenRefresh] token 已更新并持久化")
             return True
 
     logger.warning("[TokenRefresh] 刷新失败，无可用 token")
+    # 失败时设较短退避（5秒后可重试）
+    _last_relogin_at = time.time() - (RELOGIN_THROTTLE_SEC - 5)
     return False
 
 

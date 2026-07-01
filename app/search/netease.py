@@ -50,27 +50,27 @@ async def _netease_request(
     urls_to_try = [base_url_override] if base_url_override else NETEASE_API_BASE_URLS
 
     last_error = None
-    for base_url in urls_to_try:
-        url = f"{base_url}{endpoint}"
-        # 加时间戳到 URL 防网关缓存（Post JSON body 不会影响缓存 key）
-        import time as _tz
-        url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(_tz.time() * 1000))
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for base_url in urls_to_try:
+            url = f"{base_url}{endpoint}"
+            # 加时间戳到 URL 防网关缓存（Post JSON body 不会影响缓存 key）
+            import time as _tz
+            url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(_tz.time() * 1000))
+            try:
                 resp = await client.post(url, json=params, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
                 # 成功返回
                 return data
-        except httpx.TimeoutException as e:
-            last_error = f"timeout: {e}"
-            logger.warning(f"[Netease] {url} 超时，尝试下一个网关")
-        except httpx.RequestError as e:
-            last_error = f"request: {e}"
-            logger.warning(f"[Netease] {url} 请求失败: {e}，尝试下一个网关")
-        except Exception as e:
-            last_error = f"exception: {e}"
-            logger.warning(f"[Netease] {url} 异常: {e}，尝试下一个网关")
+            except httpx.TimeoutException as e:
+                last_error = f"timeout: {e}"
+                logger.warning(f"[Netease] {url} 超时，尝试下一个网关")
+            except httpx.RequestError as e:
+                last_error = f"request: {e}"
+                logger.warning(f"[Netease] {url} 请求失败: {e}，尝试下一个网关")
+            except Exception as e:
+                last_error = f"exception: {e}"
+                logger.warning(f"[Netease] {url} 异常: {e}，尝试下一个网关")
 
     logger.error(f"[Netease] 所有网关均失败: {last_error}")
     return {"code": -1, "msg": f"所有网关失败: {last_error}"}
@@ -90,23 +90,23 @@ def _build_quality_formats(song: dict) -> List[MusicFormat]:
     formats = []
 
     l = song.get("l")
-    if l and l.get("size", 0) > 0:
+    if isinstance(l, dict) and l.get("size", 0) > 0:
         formats.append(MusicFormat(name="128K", bitrate=128, type="mp3"))
 
     m = song.get("m")
-    if m and m.get("size", 0) > 0:
+    if isinstance(m, dict) and m.get("size", 0) > 0:
         formats.append(MusicFormat(name="192K", bitrate=192, type="mp3"))
 
     h = song.get("h")
-    if h and h.get("size", 0) > 0:
+    if isinstance(h, dict) and h.get("size", 0) > 0:
         formats.append(MusicFormat(name="320K", bitrate=320, type="mp3"))
 
     sq = song.get("sq")
-    if sq and sq.get("size", 0) > 0:
+    if isinstance(sq, dict) and sq.get("size", 0) > 0:
         formats.append(MusicFormat(name="FLAC", bitrate=2000, type="flac"))
 
     hr = song.get("hr")
-    if hr and hr.get("size", 0) > 0:
+    if isinstance(hr, dict) and hr.get("size", 0) > 0:
         formats.append(MusicFormat(name="Hi-Res FLAC", bitrate=3000, type="flac"))
 
     # 如果没有任何音质字段，至少保留一个 128K 兜底
@@ -133,10 +133,10 @@ def _parse_song(song: dict, source: str = "netease") -> Optional[SearchResult]:
     # 歌手
     ar = song.get("ar")
     if ar and isinstance(ar, list):
-        artists = [a.get("name", "") for a in ar if a.get("name")]
+        artists = [a.get("name", "") for a in ar if isinstance(a, dict) and a.get("name")]
         artist_name = "/".join(artists) if artists else "未知歌手"
         # 提取第一个歌手的 ID
-        artist_id = str(ar[0].get("id", "")) if ar else ""
+        artist_id = str(ar[0].get("id", "")) if ar and isinstance(ar[0], dict) else ""
     else:
         artist_name = "未知歌手"
         artist_id = ""
@@ -226,16 +226,6 @@ async def search(
             # 各类型的结果列表
             type_results = {"music": songs, "artist": artists, "album": albums}
             current_results = type_results.get(search_type, [])
-
-            # 校验：歌曲搜索结果的第一首歌标题是否包含关键词
-            if current_results and search_type == "music":
-                first_title = current_results[0].get("name", "")
-                if keyword.lower() not in first_title.lower():
-                    logger.warning("[Netease] 网关 %s 返回结果不匹配('%s'≠'%s')，尝试下一个",
-                                   base_url, keyword, first_title[:20])
-                    # 重置 res_data 以便继续尝试下一个网关
-                    res_data = None
-                    continue
 
             # 0 结果时继续尝试下一个网关（而非直接 break）
             if not current_results:
@@ -355,9 +345,14 @@ async def get_download_url(
     # 如果 /song/download/url 全部网关失败，尝试 /song/url
     if result.get("code") != 200:
         logger.debug("[Netease] /song/download/url 失败，尝试 /song/url 端点")
+        fallback_params = {"id": song_id}
+        if br >= 999000:
+            fallback_params["type"] = "flac"
+        else:
+            fallback_params["br"] = br
         result = await _netease_request(
             "/song/url",
-            params={"id": song_id, "br": br},
+            params=fallback_params,
             cookie=cookie,
             timeout=timeout,
         )
@@ -373,7 +368,7 @@ async def get_download_url(
     # data 可能是 dict 或 list
     if isinstance(data, dict):
         return data.get("url")
-    if isinstance(data, list) and len(data) > 0:
+    if isinstance(data, list) and data and isinstance(data[0], dict):
         return data[0].get("url")
 
     return None
@@ -726,7 +721,7 @@ async def get_artist_detail(
         )
 
         if detail_result.get("code") == 200:
-            artist_data = detail_result.get("data", {}).get("artist", {})
+            artist_data = (detail_result.get("data") or {}).get("artist", {})
             if artist_data:
                 if not result["name"]:
                     result["name"] = (artist_data.get("name") or "").strip()

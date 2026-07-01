@@ -71,6 +71,9 @@ class PlaylistManager:
         # 语音挂起
         self._voice_suspended_at: float = 0.0
 
+        # 暂停时刻记录（用于 resume 时补偿切歌定时器漂移）
+        self._paused_at: float = 0.0
+
     # ===== 属性 =====
 
     @property
@@ -149,6 +152,8 @@ class PlaylistManager:
 
     async def pause(self) -> None:
         """暂停播放."""
+        if self._state != PlayState.PLAYING:
+            return
         self._stop_auto_next()
         self._clear_voice_suspend()
         self._state = PlayState.PAUSED
@@ -156,6 +161,7 @@ class PlaylistManager:
         if self._device_id:
             await self._miot.player_pause(self._device_id)
 
+        self._paused_at = time.monotonic()  # 记录暂停时刻，供 resume 补偿
         logger.info("PlaylistManager: Playback paused")
 
     async def resume(self) -> bool:
@@ -165,6 +171,12 @@ class PlaylistManager:
 
         self._stop_auto_next()
 
+        # 补偿暂停期间的时间到 _play_start_time，避免切歌定时器漂移导致提前切歌
+        if self._paused_at > 0:
+            pause_duration = time.monotonic() - self._paused_at
+            self._play_start_time += pause_duration
+            self._paused_at = 0.0
+
         ok = await self._miot.player_play(self._device_id)
         if not ok:
             logger.warning("PlaylistManager: resume play failed")
@@ -172,7 +184,7 @@ class PlaylistManager:
 
         self._state = PlayState.PLAYING
 
-        # 重置切歌定时器
+        # 重新计算剩余时间并启动 auto_next
         song = self._current_song()
         if song and song.get("duration", 0) > 0 and self._play_start_time > 0:
             elapsed = time.monotonic() - self._play_start_time
@@ -286,7 +298,10 @@ class PlaylistManager:
             raw = await miot_client.get_player_status(device_id)
             device_status = self._parse_device_status(raw)
 
-            if device_status["status"] != 1:  # not playing
+            if device_status["status"] == -1:
+                # 解析失败，不确定设备状态，继续轮询而不重播
+                continue
+            if device_status["status"] != 1:  # 真空闲（status=0）
                 device_became_idle = True
                 break
 
@@ -430,7 +445,10 @@ class PlaylistManager:
         except asyncio.CancelledError:
             pass  # 正常取消
         except Exception as e:
-            logger.error(f"PlaylistManager: _auto_next_after error: {e}")
+            logger.error(f"PlaylistManager: _auto_next_after error: {e}", exc_info=True)
+            # 不要让播放卡死，转 STOPPED 状态
+            self._state = PlayState.STOPPED
+            self._auto_next_task = None
 
     async def _on_song_finished(self) -> None:
         """歌曲播放结束回调."""
