@@ -30,6 +30,12 @@ async def _get_client(timeout: float = 10.0) -> httpx.AsyncClient:
 KUWO_SEARCH_URL = "http://search.kuwo.cn/r.s"
 KUWO_MOBI_URL = "https://mobi.kuwo.cn/mobi.s"
 
+# PC 端公共参数（参考 sqmusic 配置）——移动端 artistinfo+ft API 返回空，必须用 PC 端
+_KUWO_PC_PARAMS = (
+    "plat=pc&thost=search.kuwo.cn&vipver=MUSIC_9.1.1.2_BCS2"
+    "&devid=38668888&newver=1&pcjson=1&alflac=1&show_copyright_off=1&pcmp4=1"
+)
+
 # 音质定义: (name, br参数, bitrate, type)
 FORMAT_DEFS = [
     ("FLAC", "2000kflac", 2000, "flac"),
@@ -448,10 +454,10 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
 
     try:
         client = await _get_client(timeout=timeout)
-        # 1. 获取歌手热门歌曲
+        # 1. 获取歌手热门歌曲（PC 端 artist2music 接口，参考 sqmusic ArtistSongListUrl）
         songs_url = (
-            f"{KUWO_SEARCH_URL}?pn=0&rn=50&stype=artistinfo"
-            f"&artistid={artist_id}&ft=music&rformat=json&encoding=utf8"
+            f"{KUWO_SEARCH_URL}?pn=0&rn=50&artistid={artist_id}"
+            f"&stype=artist2music&sortby=0&encoding=utf8&{_KUWO_PC_PARAMS}"
         )
         logger.debug("[Kuwo] 歌手歌曲请求: url=%s", songs_url)
         resp = await client.get(songs_url, timeout=httpx.Timeout(timeout))
@@ -464,44 +470,52 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
             logger.error(f"[Kuwo] 歌手歌曲JSON解析失败")
             return result
 
-        # 提取歌手名和头像
-        songs = data.get("abslist", [])
-        if songs:
-            first = songs[0]
-            result["name"] = (first.get("ARTIST") or "").strip()
-            # 尝试从 pictitle 或其它字段获取头像
-            pic = first.get("pictitle") or first.get("hts_MVPIC") or ""
-            if pic and not pic.startswith("http"):
-                pic = "https://star.kuwo.cn/star/starheads/" + pic.lstrip("/")
-            if pic:
-                result["image"] = pic.replace("/120", "/500")
+        # PC 端 artist 字段在顶层，musiclist 是歌曲列表
+        result["name"] = (data.get("artist") or "").strip()
+        songs = data.get("musiclist", [])
 
-        # 解析热门歌曲（含音质）
+        # 解析热门歌曲（含音质，字段为小写：name/artist/album/musicrid 等）
         async def _parse_artist_song(song: dict) -> Optional[SearchResult]:
-            song_id_raw = song.get("MUSICRID", "")
+            # musicrid 形如 "MUSIC_12345"，提取纯数字 ID
+            song_id_raw = str(song.get("musicrid") or song.get("id") or "")
             pure_id: Optional[str] = None
-            if song_id_raw:
-                match = re.search(r"\d+", str(song_id_raw))
-                if match:
-                    pure_id = match.group(0)
+            match = re.search(r"\d+", song_id_raw)
+            if match:
+                pure_id = match.group(0)
             if not pure_id:
                 return None
 
-            song_name = (song.get("NAME") or "").strip()
-            artist_name = (song.get("ARTIST") or "").strip()
-            album_name = (song.get("ALBUM") or "").strip()
-            duration = int(song.get("DURATION", 180))
+            song_name = (song.get("name") or "").strip()
+            artist_name = (song.get("artist") or song.get("aartist") or "").strip()
+            album_name = (song.get("album") or "").strip()
+            try:
+                duration = int(song.get("duration", 180))
+            except (TypeError, ValueError):
+                duration = 180
 
-            raw_album_id = song.get("ALBUMID", "")
-            album_id_val = str(raw_album_id).strip() if raw_album_id else ""
+            album_id_val = str(song.get("albumid") or "").strip()
 
+            # 封面：优先专辑封面短路径，无则用歌手封面短路径（参考 sqmusic）
             cover_url = None
-            if album_id_val and album_id_val != "0":
-                cover_url = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{album_id_val}.jpg"
+            album_pic_short = song.get("web_albumpic_short") or ""
+            if album_pic_short:
+                cover_url = ("https://img3.kuwo.cn/star/albumcover/" + album_pic_short).replace("/120", "/500")
+            if not cover_url:
+                artist_pic_short = song.get("web_artistpic_short") or ""
+                if artist_pic_short:
+                    cover_url = ("https://star.kuwo.cn/star/starheads/" + artist_pic_short).replace("/120", "/500")
 
-            # 音质走 nMinfo（不另外调 API）
-            nminfo = song.get("nMinfo", "") or song.get("NMINFO", "") or ""
+            # 音质走 N_MINFO
+            nminfo = song.get("N_MINFO") or song.get("nMinfo") or ""
             formats = _parse_nminfo(nminfo)
+
+            # 取 allartistid 第一个作为 artist_id 回填
+            raw_artist_id = song.get("artistid") or ""
+            if not raw_artist_id:
+                all_ids = song.get("allartistid") or ""
+                if all_ids:
+                    raw_artist_id = str(all_ids).split("&")[0].strip()
+            song_artist_id = str(raw_artist_id).strip() if raw_artist_id else artist_id
 
             return SearchResult(
                 id=f"kuwo_{pure_id}",
@@ -512,7 +526,7 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
                 source="kuwo",
                 duration=duration,
                 formats=formats,
-                artist_id=artist_id,
+                artist_id=song_artist_id,
                 album_id=album_id_val,
             )
 
@@ -520,10 +534,10 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
         song_results = await asyncio.gather(*song_tasks)
         result["top_songs"] = [r for r in song_results if r is not None]
 
-        # 2. 获取歌手专辑列表
+        # 2. 获取歌手专辑列表（PC 端 albumlist 接口，参考 sqmusic ArtistAlbumListUrl）
         albums_url = (
-            f"{KUWO_SEARCH_URL}?pn=0&rn=50&stype=artistinfo"
-            f"&artistid={artist_id}&ft=album&rformat=json&encoding=utf8"
+            f"{KUWO_SEARCH_URL}?pn=0&rn=10000&artistid={artist_id}"
+            f"&stype=albumlist&sortby=1&encoding=utf8&{_KUWO_PC_PARAMS}"
         )
         logger.debug("[Kuwo] 歌手专辑请求: url=%s", albums_url)
         resp2 = await client.get(albums_url, timeout=httpx.Timeout(timeout))
@@ -536,25 +550,28 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
             logger.error(f"[Kuwo] 歌手专辑JSON解析失败")
             return result
 
-        album_list = album_data.get("abslist", [])
+        # PC 端返回 albumlist，字段：albumid/name/artist/artistid/pic/pub
+        album_list = album_data.get("albumlist", [])
         for alb in album_list[:20]:
-            alb_id = str(alb.get("ALBUMID", "")).strip()
-            alb_name = (alb.get("NAME") or alb.get("ALBUM") or "").strip()
-            alb_pic = alb.get("pictitle") or ""
-            if alb_pic and not alb_pic.startswith("http"):
-                alb_pic = "https://star.kuwo.cn/star/starheads/" + alb_pic.lstrip("/")
-            if not alb_pic and alb_id:
+            alb_id = str(alb.get("albumid") or "").strip()
+            if not alb_id:
+                continue
+            alb_name = (alb.get("name") or "").strip()
+            # 封面：SongCoverUrl + pic，/120 → /500
+            alb_pic_short = alb.get("pic") or ""
+            alb_pic = ""
+            if alb_pic_short:
+                alb_pic = ("https://img3.kuwo.cn/star/albumcover/" + alb_pic_short).replace("/120", "/500")
+            if not alb_pic:
                 alb_pic = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{alb_id}.jpg"
-            alb_pic = alb_pic.replace("/120", "/500")
-            alb_year = str(alb.get("YEAR") or alb.get("year") or "").strip()
+            alb_year = str(alb.get("pub") or "").strip()
 
-            if alb_id:
-                result["albums"].append({
-                    "id": alb_id,
-                    "name": alb_name or "未知专辑",
-                    "cover": alb_pic,
-                    "year": alb_year,
-                })
+            result["albums"].append({
+                "id": alb_id,
+                "name": alb_name or "未知专辑",
+                "cover": alb_pic,
+                "year": alb_year,
+            })
 
         logger.debug(
             "[Kuwo] 歌手详情: name=%s songs=%d albums=%d",
@@ -595,10 +612,10 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
 
     try:
         client = await _get_client(timeout=timeout)
-        # 获取专辑歌曲列表
+        # PC 端 albuminfo 接口（参考 sqmusic AlbumInfoUrl），无 ft=music
         songs_url = (
-            f"{KUWO_SEARCH_URL}?pn=0&rn=100&stype=albuminfo"
-            f"&albumid={album_id}&ft=music&rformat=json&encoding=utf8"
+            f"{KUWO_SEARCH_URL}?pn=0&rn=100&albumid={album_id}"
+            f"&stype=albuminfo&encoding=utf8&{_KUWO_PC_PARAMS}"
         )
         logger.debug("[Kuwo] 专辑歌曲请求: url=%s", songs_url)
         resp = await client.get(songs_url, timeout=httpx.Timeout(timeout))
@@ -611,44 +628,63 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
             logger.error(f"[Kuwo] 专辑歌曲JSON解析失败")
             return result
 
-        songs = data.get("abslist", [])
-        if songs:
-            first = songs[0]
-            result["name"] = (first.get("ALBUM") or "").strip()
-            result["artist"] = (first.get("ARTIST") or "").strip()
+        # PC 端专辑元信息在顶层：name/artist/aartist/img/pic/albumid
+        result["name"] = (data.get("name") or "").strip()
+        result["artist"] = (data.get("artist") or data.get("aartist") or "").strip()
+        # 封面：优先 img，其次 pic，最后按 albumid 兜底
+        cover = (data.get("img") or data.get("pic") or "").strip()
+        if cover and not cover.startswith("http"):
+            cover = ("https://img3.kuwo.cn/star/albumcover/" + cover).replace("/120", "/500")
+        if not cover:
+            cover = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{album_id}.jpg"
+        result["cover"] = cover
 
-        # 专辑封面
-        result["cover"] = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{album_id}.jpg"
+        # 曲目列表在 musiclist（PC 端小写字段）
+        songs = data.get("musiclist", [])
 
-        # 解析曲目（含音质）
+        # 解析曲目（含音质，字段小写：name/artist/album/musicrid 等）
         async def _parse_track(song: dict) -> Optional[SearchResult]:
-            song_id_raw = song.get("MUSICRID", "")
+            # musicrid 形如 "MUSIC_12345"，提取纯数字 ID
+            song_id_raw = str(song.get("musicrid") or song.get("id") or "")
             pure_id: Optional[str] = None
-            if song_id_raw:
-                match = re.search(r"\d+", str(song_id_raw))
-                if match:
-                    pure_id = match.group(0)
+            match = re.search(r"\d+", song_id_raw)
+            if match:
+                pure_id = match.group(0)
             if not pure_id:
                 return None
 
-            song_name = (song.get("NAME") or "").strip()
-            artist_name = (song.get("ARTIST") or "").strip()
-            album_name = (song.get("ALBUM") or "").strip()
-            duration = int(song.get("DURATION", 180))
+            song_name = (song.get("name") or "").strip()
+            artist_name = (song.get("artist") or song.get("aartist") or "").strip()
+            album_name = (song.get("album") or result["name"] or "").strip()
+            try:
+                duration = int(song.get("duration", 180))
+            except (TypeError, ValueError):
+                duration = 180
 
-            raw_artist_id = song.get("ARTISTID", "")
-            track_artist_id = str(raw_artist_id).strip() if raw_artist_id else ""
+            # 曲目封面：优先 web_albumpic_short，否则用专辑封面
+            track_cover = result["cover"]
+            album_pic_short = song.get("web_albumpic_short") or ""
+            if album_pic_short:
+                track_cover = ("https://img3.kuwo.cn/star/albumcover/" + album_pic_short).replace("/120", "/500")
 
-            # 音质走 nMinfo
-            nminfo = song.get("nMinfo", "") or song.get("NMINFO", "") or ""
+            # 音质走 N_MINFO
+            nminfo = song.get("N_MINFO") or song.get("nMinfo") or ""
             formats = _parse_nminfo(nminfo)
+
+            # artistid 优先，无则取 allartistid 第一个
+            raw_artist_id = song.get("artistid") or ""
+            if not raw_artist_id:
+                all_ids = song.get("allartistid") or ""
+                if all_ids:
+                    raw_artist_id = str(all_ids).split("&")[0].strip()
+            track_artist_id = str(raw_artist_id).strip() if raw_artist_id else ""
 
             return SearchResult(
                 id=f"kuwo_{pure_id}",
                 title=song_name or "未知歌曲",
                 artist=artist_name or "未知歌手",
                 album=album_name or "未知专辑",
-                cover=result["cover"],
+                cover=track_cover,
                 source="kuwo",
                 duration=duration,
                 formats=formats,
