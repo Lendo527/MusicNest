@@ -261,9 +261,8 @@ class MinaHTTPClient:
 
     async def get_player_status(self, device_id: str) -> Optional[dict]:
         """获取播放器状态"""
-        logger.debug("[MIoT] get_player_status: device=%s", device_id[:12])
         result = await self._ubus_request(device_id, "player_get_play_status", "mediaplayer", {})
-        logger.debug("[MIoT] get_player_status 响应: %s", str(result)[:300] if result else "None")
+        # 不打印完整响应（MediaWatcher 每 0.2s 轮询一次，会导致日志爆炸）
         return result
 
     async def seek(self, device_id: str, position: int) -> bool:
@@ -301,16 +300,12 @@ class MinaHTTPClient:
         }
 
         logger.debug(
-            "[MIoT] _get_latest_ask_via_userprofile: device=%s hardware=%s limit=%d url=%s",
-            device_id[:12], hardware, limit, api_url[:120]
+            "[MIoT] _get_latest_ask_via_userprofile: device=%s hardware=%s limit=%d",
+            device_id[:12], hardware, limit
         )
 
         try:
             resp = await self._client.get(api_url, headers=headers)
-            logger.debug(
-                "[MIoT] userprofile 响应: status=%d content_type=%s",
-                resp.status_code, resp.headers.get("content-type", "")
-            )
             if resp.status_code != 200:
                 logger.warning(f"[MIoT] userprofile API 返回 {resp.status_code}")
                 return []
@@ -359,13 +354,9 @@ class MinaHTTPClient:
                 "query": query,
                 "answer": answer_text,
             })
-            logger.debug(
-                "[MIoT] userprofile 记录: ts=%s query=%r answer=%r",
-                ts, query[:60], answer_text[:60]
-            )
 
-        if messages:
-            pass  # app/monitor.py 负责在发现新消息时打印日志，此处不重复记录
+        # 不在此处打印每条记录的日志（monitor 每 0.2s 轮询一次，会导致日志爆炸）
+        # app/monitor.py 负责在发现新消息时打印日志
         return messages
 
     async def get_latest_ask_by_ubus(self, device_id: str) -> list[dict]:
@@ -416,15 +407,20 @@ class MinaHTTPClient:
             "requestId": request_id,
         }
 
-        logger.debug(
-            "[MIoT] _ubus_request: method=%s path=%s device=%s form_data=%s",
-            method, path, device_id[:12], {k: str(v)[:100] for k, v in form_data.items()}
-        )
+        # 高频轮询方法（player_get_play_status）跳过 DEBUG 日志，避免日志爆炸
+        # （MediaWatcher 每 0.2s 调用一次，1秒 5 条请求日志 + 5 条响应日志 = 10 条/秒）
+        is_high_freq = method == "player_get_play_status"
+        if not is_high_freq:
+            logger.debug(
+                "[MIoT] _ubus_request: method=%s path=%s device=%s form_data=%s",
+                method, path, device_id[:12], {k: str(v)[:100] for k, v in form_data.items()}
+            )
         result = await self._do_post(url, form_data)
-        logger.debug(
-            "[MIoT] _ubus_request 响应: method=%s code=%s",
-            method, result.get("code") if result else "None"
-        )
+        if not is_high_freq:
+            logger.debug(
+                "[MIoT] _ubus_request 响应: method=%s code=%s",
+                method, result.get("code") if result else "None"
+            )
         return result
 
     async def _do_get(self, url: str) -> Optional[dict]:

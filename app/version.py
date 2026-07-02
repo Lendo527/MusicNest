@@ -7,6 +7,14 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.43 - 降低高频轮询日志噪音：
+           client: _get_latest_ask_via_userprofile删除循环内每条记录的DEBUG日志
+                 (ConversationMonitor每0.2s轮询,5条记录×5次/秒=25条日志/秒);
+             client: _get_latest_ask_via_userprofile删除响应状态码DEBUG日志(高频噪音);
+             client: get_player_status删除完整响应DEBUG日志(高频噪音);
+             client: _ubus_request对player_get_play_status方法跳过DEBUG日志
+                 (MediaWatcher每0.2s轮询,1秒10条日志);
+             保留低频方法(play_music_url/player_play_operation等)的DEBUG日志便于排查;
   0.0.42 - 修复本地播放竞态条件导致播放"挂了"：
            main: play_song指令中stop_all_media从fire-and-forget改为await后再play;
                  之前stop命令(6个并发UBus)与play_music_url并发执行,
@@ -201,4 +209,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.42"
+__version__ = "0.0.43"
