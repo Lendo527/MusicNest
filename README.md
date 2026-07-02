@@ -10,6 +10,8 @@
 
 [功能](#-核心功能) · [架构](#-架构总览) · [快速开始](#-快速开始) · [语音指令](#️-语音指令) · [API](#-api-一览) · [更新日志](#-更新日志)
 
+> 本项目为纯 AI 开发项目，全部代码由 AI 编写，未经过人工编写。
+
 </div>
 
 ---
@@ -144,7 +146,7 @@ services:
       - "58092:58092"
     volumes:
       - ./data:/data              # 配置/缓存/数据库/日志（持久化）
-      - /volume1/music:/music     # 你的音乐库（只读即可）
+      - /volume1/music:/music     # 你的音乐库（需读写权限：支持删除歌曲/下载新歌）
     environment:
       - TZ=Asia/Shanghai
 ```
@@ -162,7 +164,7 @@ docker compose up -d --build
 1. 浏览器访问 `http://NAS_IP:58092`
 2. 进入「设备管理」→ 使用**小米账号扫码登录**（获取 MiOT token）
 3. 勾选要参与播放的小爱音箱
-4. 进入「系统设置」→ 启用「对话监控」+「媒体监控」
+4. 进入「系统设置」→ 启用「对话监控」（媒体状态轮询自动启用，无需单独配置）
 5. 对小爱说"**播放歌单**"或"**播放周杰伦的歌**"即可开始
 
 ---
@@ -233,10 +235,10 @@ music_path: "/music"
 auto_scan_interval: 0              # 自动扫描间隔（秒），0=禁用
 
 # 监控
-conversation_monitor_enabled: false  # 对话轮询（轨道1）
-media_watcher_enabled: true           # 媒体状态轮询（轨道2）
-media_watcher_interval: 0.2          # 轮询间隔（秒）
-poll_interval: 0.2                   # 对话轮询间隔
+conversation_monitor_enabled: false  # 对话轮询开关（轨道1，Web 界面可切换）
+media_watcher_enabled: true           # 媒体状态轮询（轨道2，默认启用，无独立 UI 开关）
+media_watcher_interval: 0.2          # 轨道2 轮询间隔（秒）
+poll_interval: 0.2                   # 轨道1 对话轮询间隔
 
 # 下载
 download:
@@ -371,7 +373,7 @@ docker compose up -d --build
 | 现象 | 排查 |
 |------|------|
 | 扫码登录失败 | 检查 `./data/debug.log` 中 `[Auth]` 相关日志 |
-| 小爱不响应语音 | 确认「对话监控」+「媒体监控」已启用，设备已勾选 |
+| 小爱不响应语音 | 确认「对话监控」已启用，设备已勾选（媒体状态轮询默认启用） |
 | 下载失败 | 检查网易云 cookie 是否过期，酷我搜索是否可访问 |
 | 播放卡顿 | 本地 flac 转码可能较慢，考虑预转 mp3 |
 | 进度条不更新 | 检查 `/api/player/progress` 响应，UBus 可能未返回 media_data |
