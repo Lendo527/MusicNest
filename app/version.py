@@ -7,6 +7,13 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.42 - 修复本地播放竞态条件导致播放"挂了"：
+           main: play_song指令中stop_all_media从fire-and-forget改为await后再play;
+                 之前stop命令(6个并发UBus)与play_music_url并发执行,
+                 stop可能在play之后到达音箱,把刚启动的播放给停掉(本地路径尤甚);
+             本地路径:await stop_task后再_play_on_device(确保stop先到);
+             在线路径:play前也await stop_task(防止kuwo搜索过快时竞态);
+             stop_task用_create_background_task包装(异常不丢失)+wait_for(3.5s超时兜底);
   0.0.41 - 修复 debug.log 日志级别配置 bug：
            main: _setup_debug_logging 中3个logger名称错误(musicnest.miot/monitor/player不存在);
                  导致 app.miot.client 的 DEBUG 日志(play_music_url/_ubus_request)无法输出;
@@ -194,4 +201,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.41"
+__version__ = "0.0.42"

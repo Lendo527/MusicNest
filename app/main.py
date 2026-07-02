@@ -635,15 +635,24 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
 
     try:
         if result.command.type == "play_song":
-            # 立即 stop_all_media（fire-and-forget，不等返回）
-            # 这是"抢先劫持"的核心：尽快打断小爱原生播放
+            # 立即启动 stop_all_media（抢先劫持，打断小爱原生播放）
+            # 注意：不能 fire-and-forget，否则 stop 命令可能在 play_music_url 之后到达音箱，
+            # 把刚启动的播放给停掉（本地播放路径的竞态条件）。
+            # 在线路径因 kuwo 搜索耗时，stop 会在 play 之前完成；本地路径必须显式 await。
+            stop_task = None
             if miot_client and device_id:
-                _create_background_task(miot_client.stop_all_media(device_id), "stop_all_media")
+                stop_task = _create_background_task(miot_client.stop_all_media(device_id), "stop_all_media")
 
             song_name = result.argument or query
             local_results = scanner.search(song_name)
 
             if local_results:
+                # 本地命中：等 stop_all_media 完成，确保 stop 命令在 play 之前到达音箱
+                if stop_task:
+                    try:
+                        await asyncio.wait_for(stop_task, timeout=3.5)
+                    except Exception as e:
+                        logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
                 # 本地命中：直接 play_url
                 all_songs = scanner.get_songs(limit=5000)
                 target = local_results[0]
@@ -702,6 +711,13 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             _online_urls.popitem(last=False)
                         proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
                         logger.info(f"[VoiceCmd] 在线歌曲代理: {play_url_raw[:60]}... -> /api/music/proxy/{url_hash}")
+
+                        # 确保 stop_all_media 在 play 之前完成（防止 stop 命令后到达把播放停掉）
+                        if stop_task:
+                            try:
+                                await asyncio.wait_for(stop_task, timeout=3.5)
+                            except Exception as e:
+                                logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
 
                         hardware = await _get_device_hardware(device_id)
                         if needs_music_api(hardware):
