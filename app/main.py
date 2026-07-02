@@ -107,11 +107,17 @@ def _setup_debug_logging():
         root.addHandler(fh)
         _debug_fh = fh
         # 设置所有 musicnest 相关 logger 到 DEBUG 级别
-        for name in ["musicnest", "musicnest.voice", "musicnest.monitor",
-                      "musicnest.player", "musicnest.miot", "musicnest.kuwo",
-                      "musicnest.kuwo.search", "musicnest.kuwo.format",
-                      "musicnest.auth", "musicnest.config", "musicnest.netease",
-                      "musicnest.token_refresh", "musicnest.download"]:
+        # 注意：部分模块使用 logging.getLogger(__name__)，logger 名称为模块路径
+        for name in [
+            # 使用自定义 logger 名的模块
+            "musicnest", "musicnest.voice", "musicnest.kuwo",
+            "musicnest.auth", "musicnest.config", "musicnest.netease",
+            "musicnest.token_refresh", "musicnest.download", "musicnest.tracker",
+            # 使用 __name__ 的模块（logger 名 = 模块路径）
+            "app.miot.client",
+            "app.engine.monitor", "app.engine.media_watcher", "app.engine.player",
+            "app.music.scanner",
+        ]:
             logging.getLogger(name).setLevel(logging.DEBUG)
         # 确保第三方库的 ERROR 级别日志也能被捕获（web 端报错的关键来源）
         # 设置 propagate=True 使 uvicorn/fastapi 日志传播到 root logger（写入 debug.log）

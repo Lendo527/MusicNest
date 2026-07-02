@@ -7,6 +7,11 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.41 - 修复 debug.log 日志级别配置 bug：
+           main: _setup_debug_logging 中3个logger名称错误(musicnest.miot/monitor/player不存在);
+                 导致 app.miot.client 的 DEBUG 日志(play_music_url/_ubus_request)无法输出;
+                 修正为正确的模块路径 logger 名(app.miot.client/app.engine.monitor/app.engine.player);
+                 补充缺失的 app.engine.media_watcher 和 musicnest.tracker;
   0.0.40 - 定时/闹钟/播放模式深度代码分析修复：
            main: 闹钟_alarm_loop调用_play_on_device前设置current_index(HIGH);
                  之前_play_on_device内部用current_song()取旧索引,闹钟指定歌曲被忽略;
@@ -189,4 +194,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.40"
+__version__ = "0.0.41"
