@@ -7,6 +7,15 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.40 - 定时/闹钟/播放模式深度代码分析修复：
+           main: 闹钟_alarm_loop调用_play_on_device前设置current_index(HIGH);
+                 之前_play_on_device内部用current_song()取旧索引,闹钟指定歌曲被忽略;
+           main: 闹钟触发时校验song_index边界+playlist为空时加载默认歌单(MEDIUM);
+           main: _parse_alarm_from_query第二个正则也捕获歌曲名(MEDIUM);
+                 之前"早上8点播放周杰伦"(无"每天")会丢失歌曲信息;
+           main: 语音next分支无下一曲时调用stop_playing同步状态(MEDIUM);
+                 之前stop_all_media后is_playing仍为True;
+           main: 语音previous分支无当前歌曲时调用stop_playing同步状态(MEDIUM);
   0.0.39 - 两轮深度审阅修复（安全+一致性）：
            worker: 新增_sanitize_filename()清理文件名非法字符(HIGH安全);
            worker: artist/album/title目录和文件名全部清理防路径越界;
@@ -180,4 +189,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.39"
+__version__ = "0.0.40"

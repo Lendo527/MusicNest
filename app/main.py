@@ -370,9 +370,24 @@ async def _alarm_loop(alarm_id: str, hour: int, minute: int, days: list[int], so
                 await client.stop_all_media(play_state.device_id)
 
                 if song_index is not None:
-                    await _play_on_device(play_state.device_id, song_index)
-                    play_state.is_playing = True
-                    logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放歌曲 index={song_index}")
+                    # 确保 playlist 有歌曲（防止启动后未播放过任何歌曲）
+                    if not play_state.playlist:
+                        play_state.playlist = scanner.get_songs(limit=500)
+                    if not play_state.playlist:
+                        logger.warning(f"[Alarm] 闹钟 id={alarm_id} 曲库为空，无法播放")
+                        continue
+                    # 校验 song_index 边界（曲库变化后可能失效）
+                    if song_index < 0 or song_index >= len(play_state.playlist):
+                        logger.warning(f"[Alarm] 闹钟 id={alarm_id} song_index={song_index} 越界(playlist={len(play_state.playlist)})，改用第一首")
+                        song_index = 0
+                    # 必须设置 current_index，否则 _play_on_device 内部 current_song() 用旧索引
+                    play_state.current_index = song_index
+                    ok = await _play_on_device(play_state.device_id, song_index)
+                    play_state.is_playing = ok
+                    if ok:
+                        logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放歌曲 index={song_index}")
+                    else:
+                        logger.warning(f"[Alarm] 闹钟 id={alarm_id} 播放失败")
                 else:
                     # 播放第一首可用歌曲
                     songs = scanner.get_songs(limit=1)
@@ -722,6 +737,8 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 else:
                     result_text = "切换失败"
             elif play_state.playlist:
+                # 已 stop_all_media 但无下一曲，同步停止状态
+                play_state.stop_playing()
                 result_text = "没有下一首了"
             else:
                 result_text = "播放列表为空"
@@ -749,6 +766,8 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 else:
                     result_text = "重播失败"
             else:
+                # 已 stop_all_media 但无当前歌曲，同步停止状态
+                play_state.stop_playing()
                 result_text = "没有正在播放的歌曲"
 
         elif result.command.type == "stop":
@@ -1083,11 +1102,12 @@ def _parse_alarm_from_query(query: str) -> Optional[tuple[int, int, Optional[str
             hour += 12  # 中午1点 = 13:00
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return (hour, minute, song)
-    # 简单模式: X点播放
-    m = re.search(r'(?:每[天日])?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*播放', query)
+    # 简单模式: X点播放（也捕获歌曲名，支持"早上8点播放周杰伦"无"每天"前缀）
+    m = re.search(r'(?:每[天日])?\s*(?:早上|上午|中午|下午|晚上|傍晚|清晨)?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*(?:播放|放)(?:歌曲?\s*)?(.+)?', query)
     if m:
         hour = int(m.group(1))
         minute = int(m.group(2)) if m.group(2) else 0
+        song = m.group(3).strip() if m.group(3) else None
         # 时段转换
         if period in ("下午", "晚上", "傍晚") and 1 <= hour <= 11:
             hour += 12
@@ -1096,7 +1116,7 @@ def _parse_alarm_from_query(query: str) -> Optional[tuple[int, int, Optional[str
         elif period == "中午" and 1 <= hour <= 11:
             hour += 12
         if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return (hour, minute, None)
+            return (hour, minute, song)
     return None
 
 
