@@ -1918,6 +1918,10 @@ async def api_music_song_delete(request: Request) -> dict:
             filepath = songs[idx_legacy].get("filepath", "")
     if not filepath:
         return JSONResponse({"code": 1, "msg": "缺少 filepath"}, status_code=400)
+    # 安全校验：filepath 必须在音乐库目录下（防止路径遍历攻击）
+    if not _is_safe_path(filepath):
+        logger.error(f"[API] 拒绝删除不安全路径: {filepath}")
+        return JSONResponse({"code": 1, "msg": "非法路径"}, status_code=400)
     idx = scanner.get_index_by_filepath(filepath)
     if idx is None:
         return JSONResponse({"code": 1, "msg": "歌曲不存在"}, status_code=404)
@@ -1931,7 +1935,7 @@ async def api_music_song_delete(request: Request) -> dict:
             os.remove(filepath)
             deleted_audio = True
         # 删歌词（仅删除该歌曲对应的 .lrc，保留专辑封面图片）
-        if lyrics_path and os.path.isfile(lyrics_path):
+        if lyrics_path and os.path.isfile(lyrics_path) and _is_safe_path(lyrics_path):
             os.remove(lyrics_path)
         # 专辑目录若完全为空才删除空目录
         song_dir = os.path.dirname(filepath) if filepath else ""

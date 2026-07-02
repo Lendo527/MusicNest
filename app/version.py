@@ -7,6 +7,13 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.39 - 两轮深度审阅修复（安全+一致性）：
+           worker: 新增_sanitize_filename()清理文件名非法字符(HIGH安全);
+           worker: artist/album/title目录和文件名全部清理防路径越界;
+           worker: 歌词文件名也用清理后的title;
+           main: delete端点filepath加_is_safe_path校验(MEDIUM安全);
+           main: delete端点lyrics_path也加_is_safe_path校验;
+           voice: VoiceCommand注释更新(含新增指令类型);
   0.0.38 - 新增下载语音指令（酷我搜索+复用worker下载流程）：
            voice: 新增download_current/download指令类型+优先级8/9；
            voice: download_current keywords=["下载当前歌曲","下载这首歌","下载当前","下载此歌"]；
@@ -173,4 +180,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.38"
+__version__ = "0.0.39"

@@ -30,6 +30,36 @@ RUNNING = False
 # 扫描器增量更新回调（由 main.py 注入，避免循环导入）
 _scan_new_callback = None
 
+# 文件名/目录名非法字符（Windows + Linux 通用）
+# Windows: \ / : * ? " < > |
+# 额外去除前导/尾随空格和点（Windows 不允许）
+_INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+_INVALID_DIRNAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+
+
+def _sanitize_filename(name: str, max_len: int = 200) -> str:
+    """清理文件名/目录名中的非法字符，防止路径越界和创建失败
+
+    Args:
+        name: 原始名称（歌名/歌手/专辑）
+        max_len: 最大长度（防止文件名过长）
+
+    Returns:
+        清理后的安全名称，永远非空（空时返回 'Unknown'）
+    """
+    if not name:
+        return "Unknown"
+    # 替换非法字符为下划线
+    cleaned = _INVALID_FILENAME_CHARS.sub("_", name)
+    # 去除前导/尾随空格和点（Windows 不允许）
+    cleaned = cleaned.strip(" .")
+    # 折叠连续空格
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    # 限制长度（按字符数）
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+    return cleaned or "Unknown"
+
 
 def set_scan_callback(cb) -> None:
     """注入扫描器增量更新回调"""
@@ -271,13 +301,17 @@ async def _process_task(task) -> bool:
         # ==== 第二步：构建目录 ====
         from app.config import config
         music_path = config.get("music_path", "/music")
-        artist_dir = Path(music_path) / resolved_artist
-        album_dir = artist_dir / resolved_album
+        # 清理文件名/目录名中的非法字符，防止路径越界和创建失败
+        safe_artist = _sanitize_filename(resolved_artist)
+        safe_album = _sanitize_filename(resolved_album)
+        safe_title = _sanitize_filename(title)
+        artist_dir = Path(music_path) / safe_artist
+        album_dir = artist_dir / safe_album
         album_dir.mkdir(parents=True, exist_ok=True)
 
         # 确定文件扩展名
         ext = format_type if format_type in ("flac", "mp3", "wav") else "mp3"
-        track_filename = f"{title}.{ext}"
+        track_filename = f"{safe_title}.{ext}"
         track_path = album_dir / track_filename
 
         # 如果已存在同名文件且大小正常（>1KB），只补图片
@@ -302,7 +336,7 @@ async def _process_task(task) -> bool:
         # ==== 第五步：下载歌词 ====
         lyrics = await _fetch_lyrics(source, music_id, title, resolved_artist)
         if lyrics:
-            lrc_path = album_dir / f"{title}.lrc"
+            lrc_path = album_dir / f"{safe_title}.lrc"
             lrc_path.write_text(lyrics, encoding="utf-8")
 
         # ==== 第六步：写入 ID3 标签（用 ffmpeg 写标题/歌手/专辑 + 嵌入封面）====

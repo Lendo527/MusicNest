@@ -26,7 +26,8 @@ class VoiceCommand:
     """语音指令定义
 
     Attributes:
-        type: 指令类型（play_song / play_playlist / set_play_mode / set_volume / next / previous / stop）
+        type: 指令类型（play_song / play_playlist / set_play_mode / set_volume /
+              next / previous / stop / download_current / download / create_alarm）
         keywords: 触发关键词列表
         param: 附加参数（如 set_play_mode 的 random/single/loop/order，set_volume 的 absolute/up/down）
         enabled: 是否启用
