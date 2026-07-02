@@ -1668,17 +1668,17 @@ async def api_music_play(song_index: int, request: Request) -> Response:
     ext = os.path.splitext(filepath)[1].lower()
     mime = _MIME_MAP.get(ext, 'audio/mpeg')
 
-    # 根据请求参数决定是否转码 MP3（针对仅支持 MP3 的音箱）
+    # 根据请求参数决定是否转码 MP3（针对仅支持 MP3 的 音箱）
     transcode = request.query_params.get("transcode", "0") == "1"
     if transcode and not filepath.lower().endswith('.mp3'):
         # 流式转码：边转边播，无需等待整个文件转码完成
         # 使用 asyncio subprocess 避免阻塞事件循环
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-i", filepath,
+            "ffmpeg", "-loglevel", "error", "-i", filepath,
             "-codec:a", "libmp3lame", "-b:a", "192k",
             "-f", "mp3", "pipe:1",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
 
         async def _stream_transcode():
@@ -1695,6 +1695,17 @@ async def api_music_play(song_index: int, request: Request) -> Response:
                 except ProcessLookupError:
                     pass
                 await proc.wait()
+                # 检查 ffmpeg 退出码（-9=SIGKILL 是正常的客户端断开）
+                if proc.returncode is not None and proc.returncode != 0 and proc.returncode != -9:
+                    stderr_text = ""
+                    try:
+                        stderr_data = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+                        stderr_text = stderr_data.decode("utf-8", errors="replace")[-800:] if stderr_data else ""
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"[Transcode] ffmpeg 异常退出 code={proc.returncode} filepath={filepath} stderr={stderr_text}"
+                    )
 
         logger.info(f"[Transcode] 流式转码: {filepath}")
         return StreamingResponse(_stream_transcode(), media_type="audio/mpeg")

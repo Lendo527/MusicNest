@@ -7,6 +7,11 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.44 - 添加转码诊断日志：
+           main: ffmpeg stderr从DEVNULL改为PIPE+添加-loglevel error(避免进度信息阻塞管道);
+             转码结束后检查returncode,非0非-9(非SIGKILL)时记录WARNING日志和stderr内容;
+             用于诊断"起风了"本地FLAC播放时6秒内出现两次转码请求的问题;
+             (可能是ffmpeg崩溃导致流提前结束,音箱重连);
   0.0.43 - 降低高频轮询日志噪音：
            client: _get_latest_ask_via_userprofile删除循环内每条记录的DEBUG日志
                  (ConversationMonitor每0.2s轮询,5条记录×5次/秒=25条日志/秒);
@@ -209,4 +214,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.43"
+__version__ = "0.0.44"
