@@ -7,6 +7,14 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.45 - 修复小爱原生播放延迟启动导致"两个版本重叠"：
+           问题: 小爱收到"播放XX"后会异步播放网易云试听版,
+                 stop_all_media停掉了TTS但音乐播放请求在stop之后才触发,
+                 导致与我们的播放重叠(用户听到两个版本);
+           修复: 在线/本地播放成功后2.5秒执行延迟重播(stop+play),
+                 覆盖小爱延迟启动的播放;
+             新增 _replay_after_delay (在线)和 _replay_local_after_delay (本地);
+             只在仍在播放同一首歌时执行(用户停止/切歌则跳过);
   0.0.44 - 添加转码诊断日志：
            main: ffmpeg stderr从DEVNULL改为PIPE+添加-loglevel error(避免进度信息阻塞管道);
              转码结束后检查returncode,非0非-9(非SIGKILL)时记录WARNING日志和stderr内容;
@@ -214,4 +222,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.44"
+__version__ = "0.0.45"

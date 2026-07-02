@@ -675,6 +675,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 if ok:
                     play_state.is_playing = True
                     logger.info(f"[VoiceCmd] 本地播放: {target.get('title', song_name)}")
+                    # 防止小爱原生播放延迟启动导致"两个版本重叠"（同在线播放）
+                    hardware = await _get_device_hardware(device_id)
+                    asyncio.create_task(_replay_local_after_delay(device_id, real_index, hardware, 2.5))
                 if monitor:
                     monitor.mark_query_handled(device_id, query)
                 return
@@ -728,6 +731,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             play_state.is_playing = True
                             play_state._play_start_time = time.monotonic()
                             logger.info(f"[VoiceCmd] 在线播放: {song['artist']} - {song['title']}")
+                            # 防止小爱原生播放延迟启动导致"两个版本重叠"
+                            # 小爱收到"播放XX"后会异步播放网易云试听版，stop_all_media 停掉了 TTS，
+                            # 但音乐播放请求可能在 stop 之后才触发，导致与我们的播放重叠。
+                            # 解决：2.5 秒后再 stop + play 一次，覆盖小爱延迟启动的播放。
+                            asyncio.create_task(_replay_after_delay(device_id, proxied_url, hardware, 2.5))
                         else:
                             logger.warning(f"[VoiceCmd] 在线播放失败: {song['title']}")
                     else:
@@ -930,6 +938,62 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
     # 仅记录日志，不再 TTS 播报（TTS 已移除）
     if result_text:
         logger.info(f"[VoiceCmd] 结果: {result_text}")
+
+
+async def _replay_after_delay(device_id: str, url: str, hardware: str, delay: float) -> None:
+    """延迟后重新 stop + play，覆盖小爱原生延迟启动的播放
+
+    小爱收到"播放XX"后会异步播放网易云试听版：
+    1. stop_all_media 停掉 TTS 和当前播放
+    2. play_music_url 播放我们的版本
+    3. 但小爱的音乐播放请求可能在 stop 之后才触发，导致两个版本重叠
+
+    此函数在 delay 秒后再次 stop + play，确保覆盖小爱延迟启动的播放。
+    只在仍在播放同一首歌时执行（用户手动停止/切歌则跳过）。
+    """
+    await asyncio.sleep(delay)
+    # 检查用户是否已手动停止或切歌
+    if not play_state.is_playing or play_state.device_id != device_id:
+        logger.debug(f"[Replay] 跳过重播：用户已停止或切歌")
+        return
+    client = await _check_miot()
+    if not client:
+        return
+    try:
+        await client.stop_all_media(device_id)
+        await asyncio.sleep(0.3)  # 给音箱一点时间处理 stop
+        if needs_music_api(hardware):
+            ok = await client.play_music_url(device_id, url)
+        else:
+            ok = await client.play_url(device_id, url)
+        if ok:
+            play_state._play_start_time = time.monotonic()
+            logger.info(f"[Replay] 延迟重播成功：覆盖小爱原生播放")
+        else:
+            logger.warning(f"[Replay] 延迟重播失败")
+    except Exception as e:
+        logger.warning(f"[Replay] 延迟重播异常: {e}")
+
+
+async def _replay_local_after_delay(device_id: str, song_index: int, hardware: str, delay: float) -> None:
+    """本地播放的延迟重播（复用 _play_on_device 重建 URL）"""
+    await asyncio.sleep(delay)
+    if not play_state.is_playing or play_state.device_id != device_id:
+        logger.debug(f"[Replay] 跳过本地重播：用户已停止或切歌")
+        return
+    client = await _check_miot()
+    if not client:
+        return
+    try:
+        await client.stop_all_media(device_id)
+        await asyncio.sleep(0.3)
+        ok = await _play_on_device(device_id, song_index)
+        if ok:
+            logger.info(f"[Replay] 本地延迟重播成功：覆盖小爱原生播放")
+        else:
+            logger.warning(f"[Replay] 本地延迟重播失败")
+    except Exception as e:
+        logger.warning(f"[Replay] 本地延迟重播异常: {e}")
 
 
 async def _enrich_playlist_metadata(song_name: str, real_index: int, all_songs: list) -> None:
