@@ -2,8 +2,8 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 jobs:
@@ -27,16 +27,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute lowercase image name
+      - name: Compute lowercase owner
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE=ghcr.io/${OWNER}/musicnest:latest" >> $GITHUB_ENV
+          echo "OWNER=${OWNER}" >> $GITHUB_ENV
+
+      - name: Extract metadata for tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.OWNER }}/musicnest
+          tags: |
+            # 推 v1.2.3 tag → 生成 1.2.3 标签
+            type=semver,pattern={{version}}
+            # 推 v1.2.3 tag → 生成 1.2 标签（主次版本）
+            type=semver,pattern={{major}}.{{minor}}
+            # 每次发版都更新 latest
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE }}
+          tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
