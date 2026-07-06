@@ -1697,6 +1697,43 @@ async def _cleanup_transcode_cache() -> None:
         logger.warning(f"[Transcode] 缓存清理失败: {e}")
 
 
+async def _ensure_transcode_cached(filepath: str) -> None:
+    """确保转码缓存就绪：若未缓存则预转码整个文件并等待完成。
+
+    在 play 命令前调用，确保音箱请求 URL 时缓存已生成，避免 416 反复重试。
+    """
+    file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
+    TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
+
+    if os.path.isfile(tmp_path):
+        # 缓存命中：更新 mtime
+        with contextlib.suppress(OSError):
+            os.utime(tmp_path, None)
+        logger.debug(f"[Transcode] play前缓存命中: {tmp_path}")
+        return
+
+    # 缓存未命中：预转码整个文件并等待完成
+    logger.info(f"[Transcode] play前预转码开始: {filepath}")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-loglevel", "error", "-i", filepath,
+        "-codec:a", "libmp3lame", "-b:a", "192k",
+        "-f", "mp3", str(tmp_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        stderr_text = stderr.decode("utf-8", errors="replace")[-800:] if stderr else ""
+        logger.warning(f"[Transcode] play前预转码失败 code={proc.returncode} stderr={stderr_text}")
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_path)
+        return
+    logger.info(f"[Transcode] play前预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
+    # 写入新缓存后清理超额（fire-and-forget）
+    _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
+
+
 @app.get("/api/music/play/{song_index}")
 async def api_music_play(song_index: int, request: Request) -> Response:
     """播放指定索引的歌曲（返回音频流）"""
@@ -2287,6 +2324,12 @@ async def _play_on_device(device_id: str, song_index: int) -> bool:
         logger.info(f"[Player] 构造播放URL: server_host={server_host} song_index={song_index} "
                      f"real_index={real_index} filepath={filepath[-40:]} "
                      f"hardware={hardware!r} needs_mp3={needs_mp3_flag} url={url}")
+
+        # 预转码：play 前先确保转码缓存就绪
+        # 原因：play 命令发出后音箱会立即请求 URL，若缓存未生成会得到 416 反复重试，
+        # 导致播放2秒中断后5-8秒才恢复，甚至小爱版趁机接管。
+        if needs_mp3_flag and not filepath.lower().endswith('.mp3'):
+            await _ensure_transcode_cached(filepath)
 
         # 自动选择播放 API
         use_music_api = False
