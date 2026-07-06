@@ -7,6 +7,19 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.49 - 回滚v0.0.45的延迟重播策略(反而导致播放2秒就停):
+           问题: v0.0.45的_replay_after_delay在2.5秒后执行stop+play,
+                 把正在播放的我们的歌曲给停了(用户听到播放2秒就停);
+             日志证据:
+               19:58:30 play_music_url响应(第一次播放启动)
+               19:58:31 音箱请求代理URL(开始播放)
+               19:58:33 stop_all_media 6/6 ← 延迟重播的stop!把我们的播放停了!
+               19:58:34 play_music_url响应(重播)
+               19:58:35 音箱请求代理URL(重新播放)
+           根因: v0.0.42的await stop_task已确保stop_all_media在play之前完成,
+                 小爱原生播放已被停掉,无需延迟重播;
+             延迟重播是针对v0.0.42之前fire-and-forget设计的,v0.0.42后已多余;
+           修复: 移除_replay_after_delay和_replay_local_after_delay函数及调用;
   0.0.48 - 修复 _get_latest_ask_via_userprofile 请求日志每0.2s刷屏:
            v0.0.43漏删了请求日志(只删了循环内记录日志和响应日志);
            client: 删除_get_latest_ask_via_userprofile的请求DEBUG日志;
@@ -246,4 +259,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.48"
+__version__ = "0.0.49"
