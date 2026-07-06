@@ -1,10 +1,13 @@
 """小米 serviceToken 自动刷新管理器
 
 参考 songloft-plugin-miot 的防雪崩设计:
-- 每 2 小时检查一次 token 有效性
-- 剩余有效期 < 3 小时时才刷新，避免无效请求
+- 每 12 小时检查一次 token 有效性
+- 剩余有效期 < 1 天时才刷新，避免无效请求
 - 60 秒重登录节流，防止并发刷新风暴
 - 401 自动重试回调注入 MinaHTTPClient
+
+注意：小米 serviceToken 实际有效期约 30 天，代码按 7 天保守估算。
+主要依赖 401 被动刷新，主动刷新仅作为兜底。
 """
 
 import asyncio
@@ -17,12 +20,12 @@ from app.miot.auth import MiAuth
 
 logger = logging.getLogger("musicnest.token_refresh")
 
-# 刷新间隔（秒）：每 2 小时检查一次
-TOKEN_REFRESH_INTERVAL_SEC = 2 * 3600
-# 刷新阈值（秒）：剩余有效期 < 此值才刷新
-TOKEN_REFRESH_THRESHOLD_SEC = 3 * 3600
-# serviceToken 标称有效期（秒）
-SERVICE_TOKEN_VALID_SEC = 12 * 3600
+# 刷新间隔（秒）：每 12 小时检查一次（避免频繁刷新刷屏日志）
+TOKEN_REFRESH_INTERVAL_SEC = 12 * 3600
+# 刷新阈值（秒）：剩余有效期 < 此值才刷新（1 天）
+TOKEN_REFRESH_THRESHOLD_SEC = 24 * 3600
+# serviceToken 保守估算有效期（秒）：实际约 30 天，按 7 天估算以便提前刷新
+SERVICE_TOKEN_VALID_SEC = 7 * 24 * 3600
 # 重登录节流（秒）
 RELOGIN_THROTTLE_SEC = 60
 
@@ -124,18 +127,22 @@ async def _do_refresh(miauth: MiAuth) -> bool:
     new_token = None
 
     # 方式 1: 用 passToken 刷新（首选）
-    if pass_token:
+    if not pass_token:
+        logger.warning("[TokenRefresh] 无 passToken，无法自动刷新（密码登录未获取到 passToken？）")
+    else:
         try:
             result = await miauth.exchange_token(pass_token, user_id)
             if result and result.get("serviceToken"):
                 new_token = result
                 logger.info("[TokenRefresh] passToken 刷新成功")
+            else:
+                logger.warning("[TokenRefresh] passToken 刷新返回空结果（passToken 可能已过期）")
         except Exception as e:
-            logger.warning("[TokenRefresh] passToken 刷新失败: %s", e)
+            logger.warning("[TokenRefresh] passToken 刷新异常: %s", e)
 
     # 方式 2: 已有的 serviceToken + ssecurity 可能仍然有效，仅记录探活
     if not new_token and ssecurity:
-        logger.info("[TokenRefresh] passToken 刷新失败，保留现有 token（等待 401 自动重试）")
+        logger.info("[TokenRefresh] 保留现有 token（等待 401 被动刷新触发）")
         # 失败时设较短退避（5秒后可重试）
         _last_relogin_at = time.time() - (RELOGIN_THROTTLE_SEC - 5)
         return False

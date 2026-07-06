@@ -503,11 +503,14 @@ class MiAuth:
             return {"ok": False, "error": "network_error", "msg": str(e)}
 
         if result.get("code") == 0:
+            # 从响应或 cookie jar 中提取 passToken（用于后续自动刷新）
+            pass_token = str(result.get("passToken", "")) or self._get_cookie_value("passToken")
             return {
                 "ok": True,
                 "userId": str(result.get("userId", "")),
                 "serviceToken": result.get("serviceToken", ""),
                 "ssecurity": result.get("ssecurity", ""),
+                "passToken": pass_token,
             }
 
         # 需要验证码

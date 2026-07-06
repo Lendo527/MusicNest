@@ -7,6 +7,17 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.46 - 修复小米账号授权过期太快：
+           问题1: 密码登录不保存passToken,导致无法自动刷新token;
+             auth: login_with_password返回值增加passToken(从响应或cookie jar提取);
+             main: 密码登录config.update增加miot_pass_token字段;
+           问题2: SERVICE_TOKEN_VALID_SEC=12小时假设太短(实际约30天),
+                 每2小时刷屏一次"刷新失败"日志;
+             token_refresh: 有效期从12小时改为7天(保守估算);
+             token_refresh: 检查间隔从2小时改为12小时;
+             token_refresh: 刷新阈值从3小时改为1天;
+           问题3: 刷新失败时日志不够详细;
+             token_refresh: _do_refresh区分"无passToken"/"返回空结果"/"异常"三种失败情况;
   0.0.45 - 修复小爱原生播放延迟启动导致"两个版本重叠"：
            问题: 小爱收到"播放XX"后会异步播放网易云试听版,
                  stop_all_media停掉了TTS但音乐播放请求在stop之后才触发,
@@ -222,4 +233,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.45"
+__version__ = "0.0.46"

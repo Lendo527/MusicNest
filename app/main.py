@@ -1562,6 +1562,7 @@ async def api_devices_auth(body: dict) -> dict:
             service_token = result.get("serviceToken", "")
             user_id = result.get("userId", "")
             ssecurity = result.get("ssecurity", "")
+            pass_token = result.get("passToken", "")  # 密码登录也可能返回 passToken
             device_id = _generate_device_id()
             if service_token and user_id:
                 config.update({
@@ -1569,6 +1570,7 @@ async def api_devices_auth(body: dict) -> dict:
                     "miot_user_id": user_id,
                     "miot_ssecurity": ssecurity,
                     "miot_device_id": device_id,
+                    "miot_pass_token": pass_token,  # 持久化 passToken 用于后续自动刷新
                 })
                 await _init_miot_client(user_id, service_token)
                 # 记录 token 创建时间，供刷新循环估算有效期
