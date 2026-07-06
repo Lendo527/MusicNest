@@ -1,48 +1,30 @@
-"""小米 serviceToken 自动刷新管理器
+"""小米 serviceToken 自动刷新管理器（纯被动 401 刷新模式）
 
-参考 songloft-plugin-miot 的防雪崩设计:
-- 每 12 小时检查一次 token 有效性
-- 剩余有效期 < 1 天时才刷新，避免无效请求
-- 60 秒重登录节流，防止并发刷新风暴
-- 401 自动重试回调注入 MinaHTTPClient
+设计理念：
+- 不主动估算 token 有效期，避免因估算错误导致"掉线"或刷屏日志
+- 只在 API 调用返回 401 时被动触发刷新
+- 60 秒节流，防止并发 401 引发刷新风暴
+- 401 刷新失败时提示用户重新登录
 
-注意：小米 serviceToken 实际有效期约 30 天，代码按 7 天保守估算。
-主要依赖 401 被动刷新，主动刷新仅作为兜底。
+小米 serviceToken 实际有效期约 30 天，passToken 约 1 年。
+只要 passToken 未过期，401 时就能自动刷新 serviceToken，无需用户干预。
 """
 
-import asyncio
 import logging
 import time
-from typing import Optional
 
 from app.config import config
 from app.miot.auth import MiAuth
 
 logger = logging.getLogger("musicnest.token_refresh")
 
-# 刷新间隔（秒）：每 12 小时检查一次（避免频繁刷新刷屏日志）
-TOKEN_REFRESH_INTERVAL_SEC = 12 * 3600
-# 刷新阈值（秒）：剩余有效期 < 此值才刷新（1 天）
-TOKEN_REFRESH_THRESHOLD_SEC = 24 * 3600
-# serviceToken 保守估算有效期（秒）：实际约 30 天，按 7 天估算以便提前刷新
-SERVICE_TOKEN_VALID_SEC = 7 * 24 * 3600
-# 重登录节流（秒）
+# 重登录节流（秒）：60 秒内不重复刷新
 RELOGIN_THROTTLE_SEC = 60
 
-# 记录 token 创建时间（用于估算有效期）
-_token_created_at: float = 0.0
 _last_relogin_at: float = 0.0
-_refresh_task: Optional[asyncio.Task] = None
 
 # client 更新回调列表（token 刷新成功后通知 client 实例同步）
 _client_callbacks: list = []
-
-
-def record_token_created() -> None:
-    """记录 token 创建时间（登录/刷新成功后调用）"""
-    global _token_created_at
-    _token_created_at = time.time()
-    logger.debug("[TokenRefresh] token 创建时间已记录")
 
 
 def register_client_callback(cb) -> None:
@@ -56,130 +38,76 @@ def clear_client_callbacks() -> None:
 
 
 def start_refresh_loop(miauth: MiAuth) -> None:
-    """启动 token 刷新定时任务"""
-    global _refresh_task
-    if _refresh_task is not None and not _refresh_task.done():
-        return
-    record_token_created()
-    _refresh_task = asyncio.create_task(_refresh_loop(miauth))
-    logger.info("[TokenRefresh] token 自动刷新任务已启动 (间隔=%ds)", TOKEN_REFRESH_INTERVAL_SEC)
+    """兼容接口：纯被动模式下无主动刷新循环，直接返回
+
+    保留此函数是为了兼容 main.py 的调用（登录成功后调用）。
+    被动模式下，token 刷新完全依赖 401 触发，无需主动轮询。
+    """
+    logger.info("[TokenRefresh] 已启用纯被动 401 刷新模式（无主动轮询）")
 
 
 def stop_refresh_loop() -> None:
-    """停止 token 刷新定时任务"""
-    global _refresh_task
-    if _refresh_task is not None and not _refresh_task.done():
-        _refresh_task.cancel()
-    _refresh_task = None
+    """兼容接口：纯被动模式下无主动刷新循环，直接返回"""
+    pass
 
 
-async def _refresh_loop(miauth: MiAuth) -> None:
-    """定时检查 token 有效性的循环"""
-    while True:
-        await asyncio.sleep(TOKEN_REFRESH_INTERVAL_SEC)
-        try:
-            await _check_and_refresh(miauth)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error("[TokenRefresh] 刷新检查异常: %s", e, exc_info=True)
-
-
-async def _check_and_refresh(miauth: MiAuth) -> None:
-    """检查 token 是否需要刷新"""
-    global _last_relogin_at
-
-    if _token_created_at == 0.0:
-        return
-
-    elapsed = time.time() - _token_created_at
-    remaining = SERVICE_TOKEN_VALID_SEC - elapsed
-
-    if remaining > TOKEN_REFRESH_THRESHOLD_SEC:
-        logger.debug(
-            "[TokenRefresh] token 剩余 %ds，大于阈值 %ds，跳过刷新",
-            int(remaining), TOKEN_REFRESH_THRESHOLD_SEC
-        )
-        return
-
-    # 节流：60 秒内不重复刷新
-    now = time.time()
-    if now - _last_relogin_at < RELOGIN_THROTTLE_SEC:
-        logger.warning(
-            "[TokenRefresh] 距上次刷新不足 %ds，跳过（节流）",
-            RELOGIN_THROTTLE_SEC
-        )
-        return
-
-    logger.info("[TokenRefresh] token 剩余 %ds，开始刷新...", int(remaining))
-    await _do_refresh(miauth)
+def record_token_created() -> None:
+    """兼容接口：纯被动模式下不记录创建时间，直接返回"""
+    pass
 
 
 async def _do_refresh(miauth: MiAuth) -> bool:
-    """执行 token 刷新（使用 passToken 降级链）"""
+    """执行 token 刷新（使用 passToken）
+
+    Returns:
+        True 表示刷新成功，False 表示无法刷新（需用户重新登录）
+    """
     global _last_relogin_at
 
     pass_token = config.get("miot_pass_token", "")
     user_id = config.get("miot_user_id", "")
     ssecurity = config.get("miot_ssecurity", "")
 
-    # 降级链：passToken → serviceToken → 无法自动刷新
-    new_token = None
-
-    # 方式 1: 用 passToken 刷新（首选）
     if not pass_token:
-        logger.warning("[TokenRefresh] 无 passToken，无法自动刷新（密码登录未获取到 passToken？）")
-    else:
-        try:
-            result = await miauth.exchange_token(pass_token, user_id)
-            if result and result.get("serviceToken"):
-                new_token = result
-                logger.info("[TokenRefresh] passToken 刷新成功")
-            else:
-                logger.warning("[TokenRefresh] passToken 刷新返回空结果（passToken 可能已过期）")
-        except Exception as e:
-            logger.warning("[TokenRefresh] passToken 刷新异常: %s", e)
-
-    # 方式 2: 已有的 serviceToken + ssecurity 可能仍然有效，仅记录探活
-    if not new_token and ssecurity:
-        logger.info("[TokenRefresh] 保留现有 token（等待 401 被动刷新触发）")
-        # 失败时设较短退避（5秒后可重试）
-        _last_relogin_at = time.time() - (RELOGIN_THROTTLE_SEC - 5)
+        logger.warning("[TokenRefresh] 无 passToken，无法自动刷新（请重新扫码登录）")
+        _last_relogin_at = time.time()
         return False
 
-    if new_token:
-        service_token = new_token.get("serviceToken", "")
-        new_ssecurity = new_token.get("ssecurity", ssecurity)
-        if service_token:
-            config.update({
-                "miot_token": service_token,
-                "miot_ssecurity": new_ssecurity,
-            })
-            record_token_created()
-            # 刷新成功后才置位节流
+    try:
+        result = await miauth.exchange_token(pass_token, user_id)
+        if not result or not result.get("serviceToken"):
+            logger.warning("[TokenRefresh] passToken 刷新返回空结果（passToken 可能已过期，请重新登录）")
             _last_relogin_at = time.time()
-            # 通知所有注册的 client 回调
-            for cb in _client_callbacks:
-                try:
-                    cb(service_token)
-                except Exception as e:
-                    logger.warning("[TokenRefresh] client 回调失败: %s", e)
-            logger.info("[TokenRefresh] token 已更新并持久化")
-            return True
+            return False
 
-    logger.warning("[TokenRefresh] 刷新失败，无可用 token")
-    # 失败时设较短退避（5秒后可重试）
-    _last_relogin_at = time.time() - (RELOGIN_THROTTLE_SEC - 5)
-    return False
+        service_token = result["serviceToken"]
+        new_ssecurity = result.get("ssecurity", ssecurity)
+        config.update({
+            "miot_token": service_token,
+            "miot_ssecurity": new_ssecurity,
+        })
+        # 通知所有注册的 client 回调同步新 token
+        for cb in _client_callbacks:
+            try:
+                cb(service_token)
+            except Exception as e:
+                logger.warning("[TokenRefresh] client 回调失败: %s", e)
+        logger.info("[TokenRefresh] passToken 刷新成功，token 已更新并持久化")
+        _last_relogin_at = time.time()
+        return True
+
+    except Exception as e:
+        logger.warning("[TokenRefresh] passToken 刷新异常: %s", e)
+        _last_relogin_at = time.time()
+        return False
 
 
 async def handle_token_expired(miauth: MiAuth) -> bool:
     """401 过期回调：尝试刷新 token（含 60s 节流，避免短时间内重复刷新风暴）
 
     Returns:
-        True 表示刷新成功可重试，False 表示无法刷新
+        True 表示刷新成功可重试，False 表示无法刷新（需用户重新登录）
     """
-    # 节流：60 秒内不重复刷新（避免每个 401 请求都触发一次刷新尝试）
     now = time.time()
     elapsed = now - _last_relogin_at
     if elapsed < RELOGIN_THROTTLE_SEC:
@@ -189,10 +117,8 @@ async def handle_token_expired(miauth: MiAuth) -> bool:
         )
         return False
 
-    logger.info("[TokenRefresh] 检测到 401，尝试刷新 token...")
+    logger.info("[TokenRefresh] 检测到 401，尝试用 passToken 刷新 serviceToken...")
     ok = await _do_refresh(miauth)
-    if ok:
-        return True
-    # 无法自动刷新，需要用户重新登录
-    logger.error("[TokenRefresh] 无法自动刷新 token，请重新扫码登录")
-    return False
+    if not ok:
+        logger.error("[TokenRefresh] 无法自动刷新 token，请重新扫码登录")
+    return ok

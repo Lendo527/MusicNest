@@ -7,6 +7,16 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.47 - token刷新改为纯被动401模式（用户要求不主动掉线）:
+           token_refresh: 移除主动刷新循环(_refresh_loop/_check_and_refresh);
+             移除有效期估算(SERVICE_TOKEN_VALID_SEC/TOKEN_REFRESH_THRESHOLD_SEC/_token_created_at);
+             移除主动检查间隔(TOKEN_REFRESH_INTERVAL_SEC);
+             只在API返回401时被动触发刷新(handle_token_expired);
+             60秒节流防并发刷新风暴;
+             401刷新失败时才提示用户重新登录;
+             start_refresh_loop/stop_refresh_loop/record_token_created保留为兼容no-op接口;
+             小米serviceToken实际有效期约30天,passToken约1年,
+             只要passToken未过期,401时就能自动刷新,无需用户干预;
   0.0.46 - 修复小米账号授权过期太快：
            问题1: 密码登录不保存passToken,导致无法自动刷新token;
              auth: login_with_password返回值增加passToken(从响应或cookie jar提取);
@@ -233,4 +243,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.46"
+__version__ = "0.0.47"
