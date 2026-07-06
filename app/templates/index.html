@@ -2132,6 +2132,46 @@ let localTimer = null;
 let apiStarted = false;  // API position 是否开始走了
 let currentPlayingIndex = null;  // 追踪当前播放歌曲在播放列表中的索引（用于检测歌曲切换）
 let currentPlayingIdx = null;    // 追踪当前播放歌曲在音乐库中的 _idx（用于高亮行匹配）
+let _lastPlaylistSignature = '';  // 追踪播放列表变化（长度+当前索引），用于自动刷新面板
+
+// 始终更新播放模式图标（即使没有歌曲在播）
+function updateModeIcon(state) {
+    if (!state || !state.mode) return;
+    const modeIcon = document.getElementById('playerModeIcon');
+    if (modeIcon) {
+        modeIcon.className = 'bi ' + (PLAY_MODE_ICONS[state.mode] || 'bi-music-note');
+    }
+    const modeBtn = document.getElementById('playerModeBtn');
+    if (modeBtn) {
+        modeBtn.title = '播放模式: ' + (PLAY_MODE_TITLES[state.mode] || state.mode);
+    }
+}
+
+// 从已获取的 state 渲染播放列表面板（避免重复请求 /api/player/state）
+function renderPlaylistPanelFromState(state) {
+    if (!state) return;
+    const songs = state.playlist || [];
+    window._currentPlaylist = songs;
+    const currentIdx = state.current_index;
+
+    document.getElementById('playlistCount').textContent =
+        state.playlist_length ? `共 ${state.playlist_length} 首` : '';
+
+    if (songs.length === 0) {
+        document.getElementById('playlistItems').innerHTML =
+            '<li class="text-muted px-3 py-2">暂无歌曲</li>';
+        return;
+    }
+
+    document.getElementById('playlistItems').innerHTML = songs.map((s, i) => `
+        <li class="${i === currentIdx ? 'current' : ''}" onclick="playlistPlaySong(${i})">
+            <span class="pl-index">${i + 1}</span>
+            <span class="pl-title">${escHtml(s.title)}</span>
+            <span class="pl-artist">${escHtml(s.artist || '-')}</span>
+        </li>
+    `).join('');
+}
+
 function updatePlayerUI(state) {
     if (!state) return;
 
@@ -2222,12 +2262,17 @@ function highlightCurrentSong() {
 async function fetchPlayerState() {
     const r = await api('/api/player/state');
     if (r.code === 0 && r.data) {
-        if (r.data.current_index !== null && r.data.current_index !== undefined) {
-            updatePlayerUI(r.data);
+        const data = r.data;
+
+        // 始终更新播放模式图标（语音指令切换模式后，即使没有歌曲在播也要同步图标）
+        updateModeIcon(data);
+
+        if (data.current_index !== null && data.current_index !== undefined) {
+            updatePlayerUI(data);
             document.getElementById('bottomPlayer').classList.remove('d-none');
-        } else if (r.data.is_playing) {
+        } else if (data.is_playing) {
             // 音箱独立播放（非 MusicNest 发起），但仍在播放
-            updatePlayerUI(r.data);
+            updatePlayerUI(data);
             document.getElementById('bottomPlayer').classList.remove('d-none');
         } else {
             // 没有正在播放的歌曲
@@ -2239,7 +2284,19 @@ async function fetchPlayerState() {
             currentPlayingIndex = null;
             highlightCurrentSong();
         }
-        return r.data;
+
+        // 检测播放列表变化：当 playlist 长度或 current_index 变化时，
+        // 若播放列表面板已展开则自动刷新（语音指令改了播放列表/模式后自动同步）
+        const sig = (data.playlist || []).length + ':' + (data.current_index ?? '') + ':' + (data.mode || '');
+        if (sig !== _lastPlaylistSignature) {
+            _lastPlaylistSignature = sig;
+            const panel = document.getElementById('playlistPanel');
+            if (panel && !panel.classList.contains('d-none')) {
+                renderPlaylistPanelFromState(data);
+            }
+        }
+
+        return data;
     }
     return null;
 }
@@ -2443,28 +2500,9 @@ async function refreshPlaylistPanel() {
             '<li class="text-muted px-3 py-2">暂无播放列表</li>';
         return;
     }
-    document.getElementById('playlistCount').textContent =
-        state.playlist_length ? `共 ${state.playlist_length} 首` : '';
-
-    // 使用 play_state 中的播放列表（而非全库歌曲），确保播放1首专辑时只显示1首
-    const songs = state.playlist || [];
-    // 缓存当前播放列表，供 playlistPlaySong 使用，避免点击播放时又拉全库
-    window._currentPlaylist = songs;
-    const currentIdx = state.current_index;
-
-    if (songs.length === 0) {
-        document.getElementById('playlistItems').innerHTML =
-            '<li class="text-muted px-3 py-2">暂无歌曲</li>';
-        return;
-    }
-
-    document.getElementById('playlistItems').innerHTML = songs.map((s, i) => `
-        <li class="${i === currentIdx ? 'current' : ''}" onclick="playlistPlaySong(${i})">
-            <span class="pl-index">${i + 1}</span>
-            <span class="pl-title">${escHtml(s.title)}</span>
-            <span class="pl-artist">${escHtml(s.artist || '-')}</span>
-        </li>
-    `).join('');
+    // fetchPlayerState 已在变化时自动调用 renderPlaylistPanelFromState，
+    // 这里再调一次确保面板刚展开时立即渲染
+    renderPlaylistPanelFromState(state);
 }
 
 async function playlistPlaySong(index) {

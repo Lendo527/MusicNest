@@ -883,8 +883,12 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         real_index = 0
                         play_state.playlist = list(local_results)
                     else:
-                        play_state.playlist = all_songs
+                        play_state.playlist = list(all_songs)
                     play_state.current_index = real_index
+                    play_state.device_id = device_id
+                    # 提前 mark_own_play：避免 MediaWatcher 误拦截
+                    if miot_client:
+                        miot_client.mark_own_play(device_id)
                     ok = await _play_on_device(device_id, real_index)
                     if ok:
                         play_state.is_playing = True
@@ -899,6 +903,20 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             song = online_data[0]
                             play_url_raw = song.get("url", "")
                             if play_url_raw and miot_client:
+                                # 构造 song dict 并更新 play_state（之前缺失，导致 web 界面不同步）
+                                song_dict = {
+                                    "title": song.get("title", arg),
+                                    "artist": song.get("artist", ""),
+                                    "filepath": song.get("url", ""),
+                                    "album": song.get("album", ""),
+                                    "cover_url": song.get("cover_url", ""),
+                                    "duration": song.get("duration", 0),
+                                }
+                                play_state.playlist = [song_dict]
+                                play_state.current_index = 0
+                                play_state.device_id = device_id
+                                play_state.duration = int(song.get("duration", 0) or 0)
+
                                 url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
                                 _online_urls[url_hash] = play_url_raw
                                 server_host = config.get("server_host", "")
@@ -908,6 +926,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                                         await asyncio.wait_for(stop_task2, timeout=3.5)
                                     except Exception as e:
                                         logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+                                # 提前 mark_own_play：避免 MediaWatcher 误拦截
+                                if miot_client:
+                                    miot_client.mark_own_play(device_id)
                                 hardware = await _get_device_hardware(device_id)
                                 if needs_music_api(hardware):
                                     ok = await miot_client.play_music_url(device_id, proxied_url)
@@ -1020,6 +1041,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         logger.error(f"[VoiceCmd] 指令执行异常: {e}", exc_info=True)
         if not result_text:
             result_text = "指令执行失败"
+
+    # 全局标记 query 为已处理（play_song 分支已在内部标记并 return，这里覆盖其余所有指令）
+    # 防止 MediaWatcher 检测到播放状态变化后反查到未处理的 query 并重复触发拦截
+    if monitor and query:
+        monitor.mark_query_handled(device_id, query)
 
     # 仅记录日志，不再 TTS 播报（TTS 已移除）
     if result_text:
@@ -1823,6 +1849,17 @@ async def _ensure_transcode_cached(filepath: str) -> None:
         # 清理可能残留的 .part 文件
         with contextlib.suppress(FileNotFoundError):
             os.remove(tmp_part)
+        # 先获取源文件时长（用于日志诊断和估算转码耗时）
+        probe_proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", filepath,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        probe_stdout, _ = await probe_proc.communicate()
+        src_duration = float(probe_stdout.decode().strip()) if probe_stdout.decode().strip() else 0
+        if src_duration > 0:
+            logger.info(f"[Transcode] 源文件时长: {src_duration:.1f}s, 预计 96k MP3 约 {int(src_duration * 96000 / 8)} 字节")
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error", "-i", filepath,
             "-codec:a", "libmp3lame", "-b:a", "96k",
@@ -1840,7 +1877,11 @@ async def _ensure_transcode_cached(filepath: str) -> None:
             return
         # 原子 rename：.part → .mp3（rename 后 xxx.mp3 才存在，保证读到的是完整文件）
         os.rename(tmp_part, tmp_path)
-        logger.info(f"[Transcode] 预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
+        actual_size = os.path.getsize(tmp_path)
+        actual_br = int(actual_size * 8 / src_duration) if src_duration > 0 else 0
+        logger.info(f"[Transcode] 预转码完成: {tmp_path} size={actual_size} duration={src_duration:.1f}s bitrate={actual_br}bps")
+        if src_duration > 0 and actual_br > 120000:  # 实际比特率远超 96k
+            logger.warning(f"[Transcode] ⚠️ 实际比特率 {actual_br}bps 远超目标 96000bps，检查 ffmpeg 参数")
         _transcode_status[file_hash] = {"status": "done", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
         # 写入新缓存后清理超额（fire-and-forget）
         _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
@@ -2467,8 +2508,11 @@ async def _play_on_device(device_id: str, song_index: int) -> bool:
                         f"api={'play_music_url' if use_music_api else 'play_url'}")
 
         if use_music_api:
+            # mark_own_play：告诉 MediaWatcher 这是 musicnest 自己触发的播放，避免误拦截
+            client.mark_own_play(device_id)
             ok = await client.play_music_url(device_id, url)
         else:
+            client.mark_own_play(device_id)
             ok = await client.play_url(device_id, url)
 
         if ok:

@@ -7,6 +7,33 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.64 - 修复播放列表大BUG(语音指令与web界面不同步) + 起风了播放中断诊断:
+           问题1(起风了播放几秒后停止几秒才继续): 转码文件11.4MB/96kbps≈16分钟,
+                 日志显示22:35:22和22:35:23两次206请求,疑似比特率异常或Range重连;
+                 修复1(诊断): _ensure_transcode_cached添加ffprobe源文件时长探测+
+                       转码完成后实际比特率计算日志(>120kbps时WARNING告警),
+                       用于下次测试确认转码参数是否正确生效;
+           问题2(语音切换播放模式web图标不更新): updatePlayerUI在!hasSong&&!is_playing时
+                 early return,mode图标更新代码在该return之后,无歌曲在播时图标不更新;
+                 修复2(前端): 新增updateModeIcon()函数,在fetchPlayerState()中无条件调用,
+                       不依赖updatePlayerUI执行路径;新增PLAY_MODE_ICONS/PLAY_MODE_TITLES映射;
+           问题3(语音控制的播放未更新web播放列表): 双根因,
+                 根因3a(前端): 播放列表面板只在点击展开时拉取一次,5秒轮询fetchPlayerState不刷新面板;
+                 修复3a(前端): 新增_lastPlaylistSignature变量+renderPlaylistPanelFromState(),
+                       fetchPlayerState检测playlist长度/current_index/mode变化且面板已展开时自动刷新;
+                 根因3b(后端): set_play_mode在线播放路径完全未更新play_state.playlist/current_index/device_id,
+                       导致/api/player/state返回旧播放列表;
+                 修复3b(后端): set_play_mode在线路径构造song_dict并完整更新play_state
+                       (playlist/current_index/device_id/duration);
+           问题4(播放列表整体大BUG): set_play_mode本地播放路径缺少play_state.device_id设置;
+                 _play_on_device不调用mark_own_play,导致next/prev/play_playlist等指令期间
+                 MediaWatcher可能误拦截自己的播放;
+                 修复4a(后端): set_play_mode本地路径补全play_state.device_id;
+                 修复4b(后端): 将mark_own_play移入_play_on_device函数内部,统一覆盖所有调用路径
+                       (voice command/next/prev/web UI);
+                 修复4c(后端): 语音指令处理函数末尾添加全局mark_query_handled,
+                       覆盖所有非play_song分支(防止MediaWatcher反查到未处理query重复触发拦截);
+           简化: refreshPlaylistPanel复用renderPlaylistPanelFromState避免重复请求;
   0.0.63 - 修复MediaWatcher误判机制(用mark_own_play替代mark_query_handled提前):
            v0.0.62问题: mark_query_handled提前后,MediaWatcher在is_query_handled=True时
                  直接跳过,导致小爱版网易云试听版的异步启动无法被MediaWatcher拦截;
@@ -379,4 +406,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.63"
+__version__ = "0.0.64"
