@@ -7,6 +7,14 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.52 - 新占位策略: stop+静音play占位+真实play(替代压制循环):
+           用户方案: stop_all_media停TTS后,立即用静音URL play_music_url(REPLACE_ALL)占位,
+                     占据media通道防止小爱版异步启动,然后搜索歌曲,真实URL REPLACE_ALL替换静音占位;
+           优势: 无需压制循环(省1.5秒),通道始终被我们占据;
+           实现: 新增/api/music/silence端点返回最小静音WAV(45字节);
+                 本地播放: stop+占位play+真实play;
+                 在线播放: stop+占位play+kuwo搜索+真实play;
+           在线播放优化: 占位play在stop完成后立即发送(不等搜索),消除空窗期;
   0.0.51 - 优化:本地播放移除压制循环(不需要):
            日志分析发现:本地播放play响应后音箱同秒请求URL(局域网快),
                          REPLACE_ALL立即生效,小爱版来不及启动;
@@ -273,4 +281,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.51"
+__version__ = "0.0.52"
