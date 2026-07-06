@@ -653,6 +653,14 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         await asyncio.wait_for(stop_task, timeout=3.5)
                     except Exception as e:
                         logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+
+                # 压制循环：持续 stop 防止小爱版网易云试听版启动（同在线播放）
+                suppress_start = time.monotonic()
+                for i in range(5):
+                    await asyncio.sleep(0.3)
+                    await miot_client.stop_all_media(device_id)
+                logger.info(f"[VoiceCmd] 压制循环完成: 耗时{time.monotonic()-suppress_start:.1f}s")
+
                 # 本地命中：直接 play_url
                 all_songs = scanner.get_songs(limit=5000)
                 target = local_results[0]
@@ -718,6 +726,16 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                                 await asyncio.wait_for(stop_task, timeout=3.5)
                             except Exception as e:
                                 logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+
+                        # 压制循环：持续 stop 防止小爱版网易云试听版启动
+                        # 小爱收到"播放XX"后，TTS 被停后会异步启动网易云试听版，
+                        # 单次 stop 停不掉这个异步启动，需要持续压制直到我们的 play_music_url 生效。
+                        # 0.3秒×5次=1.5秒，覆盖 play 命令到音箱实际请求URL的延迟窗口（约1~2秒）。
+                        suppress_start = time.monotonic()
+                        for i in range(5):
+                            await asyncio.sleep(0.3)
+                            await miot_client.stop_all_media(device_id)
+                        logger.info(f"[VoiceCmd] 压制循环完成: 耗时{time.monotonic()-suppress_start:.1f}s")
 
                         hardware = await _get_device_hardware(device_id)
                         if needs_music_api(hardware):
