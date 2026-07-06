@@ -7,6 +7,14 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.53 - 回滚占位play策略(失败),恢复压制循环:
+           日志分析发现:占位play的UBus请求需要2秒生效(发出->响应->音箱请求URL),
+                         这2秒内小爱版已经启动并播放,占位play无法阻止小爱版;
+           用户确认:白龙马还是先播放小爱版,然后才是我们的在线版;
+           压制循环更有效:每0.3秒stop一次,持续1.5秒,不给小爱版启动机会;
+           修复:移除占位play和/api/music/silence端点;
+                 本地播放:stop+play(无压制循环,2.5秒,本地URL快);
+                 在线播放:stop+压制循环(1.5秒)+play(4秒,但能阻止小爱版);
   0.0.52 - 新占位策略: stop+静音play占位+真实play(替代压制循环):
            用户方案: stop_all_media停TTS后,立即用静音URL play_music_url(REPLACE_ALL)占位,
                      占据media通道防止小爱版异步启动,然后搜索歌曲,真实URL REPLACE_ALL替换静音占位;
@@ -281,4 +289,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.52"
+__version__ = "0.0.53"

@@ -654,20 +654,8 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     except Exception as e:
                         logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
 
-                # 占位策略：先用静音URL play_music_url(REPLACE_ALL) 立即占据 media 通道，
-                # 防止小爱版音乐在小爱TTS被停后异步启动占据通道。
-                # 占位play用静音WAV，音箱请求后无声，但通道已被我们占据。
-                # 然后搜索歌曲、构造真实URL，第二次play_music_url(REPLACE_ALL)替换静音占位，开始真正播放。
-                server_host = config.get("server_host", "http://localhost:58092")
-                silence_url = f"{server_host}/api/music/silence"
-                if miot_client:
-                    hardware = await _get_device_hardware(device_id)
-                    if needs_music_api(hardware):
-                        await miot_client.play_music_url(device_id, silence_url)
-                        logger.info(f"[VoiceCmd] 占位play已发送（静音URL）")
-                    else:
-                        await miot_client.play_url(device_id, silence_url)
-                        logger.info(f"[VoiceCmd] 占位play已发送（静音URL, play_url）")
+                # 本地播放不需要压制循环：本地URL响应快(局域网)，play响应后音箱同秒请求URL，
+                # REPLACE_ALL 立即生效，小爱版来不及启动就被替换。
 
                 # 本地命中：直接 play_url
                 all_songs = scanner.get_songs(limit=5000)
@@ -696,25 +684,6 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 return
             else:
                 # 本地未命中：在线搜索
-                # 等 stop_all_media 完成，然后立即发占位 play（静音URL），防止小爱版异步启动
-                if stop_task:
-                    try:
-                        await asyncio.wait_for(stop_task, timeout=3.5)
-                    except Exception as e:
-                        logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
-
-                # 占位 play：stop完成后立即用静音URL占据media通道
-                server_host = config.get("server_host", "http://localhost:58092")
-                silence_url = f"{server_host}/api/music/silence"
-                if miot_client:
-                    hardware = await _get_device_hardware(device_id)
-                    use_music_api = needs_music_api(hardware)
-                    if use_music_api:
-                        await miot_client.play_music_url(device_id, silence_url)
-                    else:
-                        await miot_client.play_url(device_id, silence_url)
-                    logger.info(f"[VoiceCmd] 占位play已发送（静音URL, method={'play_music_url' if use_music_api else 'play_url'}）")
-
                 kw_result = await search_by_keyword(song_name)
                 if kw_result.get("code") == 0 and kw_result.get("data"):
                     song_data = kw_result["data"]
@@ -738,6 +707,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                                 monitor.mark_query_handled(device_id, query)
                             return
 
+                        server_host = config.get("server_host", "http://localhost:58092")
                         url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
                         _online_urls[url_hash] = play_url_raw
                         _online_urls.move_to_end(url_hash)
@@ -746,8 +716,26 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
                         logger.info(f"[VoiceCmd] 在线歌曲代理: {play_url_raw[:60]}... -> /api/music/proxy/{url_hash}")
 
-                        # 真实play：REPLACE_ALL替换静音占位，开始真正播放
-                        if use_music_api:
+                        # 确保 stop_all_media 在 play 之前完成
+                        if stop_task:
+                            try:
+                                await asyncio.wait_for(stop_task, timeout=3.5)
+                            except Exception as e:
+                                logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+
+                        # 压制循环：持续 stop 防止小爱版网易云试听版启动
+                        # 小爱收到"播放XX"后，TTS 被停后会异步启动网易云试听版，
+                        # 单次 stop 停不掉这个异步启动，需要持续压制直到我们的 play_music_url 生效。
+                        # 占位play策略失败：UBus请求需要2秒生效，小爱版已在此期间启动。
+                        # 压制循环每0.3秒stop一次，持续1.5秒，能有效阻止小爱版启动。
+                        suppress_start = time.monotonic()
+                        for i in range(5):
+                            await asyncio.sleep(0.3)
+                            await miot_client.stop_all_media(device_id)
+                        logger.info(f"[VoiceCmd] 压制循环完成: 耗时{time.monotonic()-suppress_start:.1f}s")
+
+                        hardware = await _get_device_hardware(device_id)
+                        if needs_music_api(hardware):
                             ok = await miot_client.play_music_url(device_id, proxied_url)
                         else:
                             ok = await miot_client.play_url(device_id, proxied_url)
@@ -1740,30 +1728,6 @@ async def api_music_play(song_index: int, request: Request) -> Response:
         return StreamingResponse(_stream_transcode(), media_type="audio/mpeg")
 
     return FileResponse(filepath, media_type=mime, filename=os.path.basename(filepath))
-
-
-@app.get("/api/music/silence")
-async def api_music_silence() -> Response:
-    """返回极短静音 WAV，用于 play_music_url 占位（占据 media 通道，不发出声音）"""
-    # 44 字节 WAV header + 0 字节数据 = 0 秒静音
-    # 最小合法 WAV：8Hz 采样率、8bit、mono、1 个采样点
-    wav = bytes([
-        0x52, 0x49, 0x46, 0x46,  # "RIFF"
-        0x24, 0x00, 0x00, 0x00,  # chunk size = 36
-        0x57, 0x41, 0x56, 0x45,  # "WAVE"
-        0x66, 0x6D, 0x74, 0x20,  # "fmt "
-        0x10, 0x00, 0x00, 0x00,  # subchunk1 size = 16
-        0x01, 0x00,              # audio format = 1 (PCM)
-        0x01, 0x00,              # num channels = 1
-        0x40, 0x1F, 0x00, 0x00,  # sample rate = 8000
-        0x40, 0x1F, 0x00, 0x00,  # byte rate = 8000
-        0x01, 0x00,              # block align = 1
-        0x08, 0x00,              # bits per sample = 8
-        0x64, 0x61, 0x74, 0x61,  # "data"
-        0x01, 0x00, 0x00, 0x00,  # data size = 1
-        0x80,                    # 1 个采样点（静音，128 = 0 电平）
-    ])
-    return Response(content=wav, media_type="audio/wav")
 
 
 @app.get("/api/music/proxy/{url_hash}")
