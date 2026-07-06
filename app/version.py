@@ -7,6 +7,9 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.48 - 修复 _get_latest_ask_via_userprofile 请求日志每0.2s刷屏:
+           v0.0.43漏删了请求日志(只删了循环内记录日志和响应日志);
+           client: 删除_get_latest_ask_via_userprofile的请求DEBUG日志;
   0.0.47 - token刷新改为纯被动401模式（用户要求不主动掉线）:
            token_refresh: 移除主动刷新循环(_refresh_loop/_check_and_refresh);
              移除有效期估算(SERVICE_TOKEN_VALID_SEC/TOKEN_REFRESH_THRESHOLD_SEC/_token_created_at);
@@ -243,4 +246,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.47"
+__version__ = "0.0.48"

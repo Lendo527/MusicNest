@@ -299,11 +299,7 @@ class MinaHTTPClient:
             "Cookie": f"userId={self._user_id}; serviceToken={self._service_token}; deviceId={device_id}",
         }
 
-        logger.debug(
-            "[MIoT] _get_latest_ask_via_userprofile: device=%s hardware=%s limit=%d",
-            device_id[:12], hardware, limit
-        )
-
+        # 不打印请求日志（ConversationMonitor 每 0.2s 调用一次，会导致日志爆炸）
         try:
             resp = await self._client.get(api_url, headers=headers)
             if resp.status_code != 200:
