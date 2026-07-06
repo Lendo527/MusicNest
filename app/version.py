@@ -7,6 +7,11 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.55 - 转码缓存增加 1GB 大小限制和 LRU 清理:
+           问题: 预转码缓存不会自动清理,长期运行会无限增长占满磁盘;
+           修复: 写入新缓存后异步检查总大小,超过1GB时按mtime升序删除最久未访问的;
+                 缓存命中时os.utime更新mtime(容器通常noatime,atime不可靠);
+                 清理逻辑fire-and-forget不阻塞响应;
   0.0.54 - 修复本地播放2秒停止 + 在线播放小爱版2秒重叠:
            问题1(本地播放2秒停止): StreamingResponse无Content-Length,
              L05C音箱HTTP客户端5-6秒后断开重连,导致播放2秒停2秒循环;
@@ -301,4 +306,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.54"
+__version__ = "0.0.55"

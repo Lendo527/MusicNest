@@ -1663,6 +1663,40 @@ async def api_music_songs(limit: int = 500, offset: int = 0) -> dict:
     return {"code": 0, "data": {"songs": songs, "total": stats["total_songs"]}}
 
 
+TRANSCODE_CACHE_DIR = Path("/tmp/musicnest_transcode")
+TRANSCODE_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1GB
+
+
+async def _cleanup_transcode_cache() -> None:
+    """清理转码缓存：总大小超过 1GB 时，按 mtime 升序删除最久未访问的文件。
+
+    用 mtime 作为"最后访问时间"：缓存命中时 os.utime 更新 mtime，
+    清理时按 mtime 升序（最老的先删）。
+    """
+    try:
+        files = [(p, p.stat()) for p in TRANSCODE_CACHE_DIR.glob("*.mp3") if p.is_file()]
+        total = sum(st.st_size for _, st in files)
+        if total <= TRANSCODE_CACHE_MAX_BYTES:
+            return
+        # 按 mtime 升序（最久未访问的在前）
+        files.sort(key=lambda x: x[1].st_mtime)
+        removed = 0
+        freed = 0
+        for p, st in files:
+            if total <= TRANSCODE_CACHE_MAX_BYTES:
+                break
+            size = st.st_size
+            with contextlib.suppress(FileNotFoundError):
+                p.unlink()
+            total -= size
+            freed += size
+            removed += 1
+        if removed:
+            logger.info(f"[Transcode] 缓存清理: 删除 {removed} 个文件, 释放 {freed // 1024 // 1024}MB, 当前 {total // 1024 // 1024}MB")
+    except Exception as e:
+        logger.warning(f"[Transcode] 缓存清理失败: {e}")
+
+
 @app.get("/api/music/play/{song_index}")
 async def api_music_play(song_index: int, request: Request) -> Response:
     """播放指定索引的歌曲（返回音频流）"""
@@ -1689,9 +1723,8 @@ async def api_music_play(song_index: int, request: Request) -> Response:
         # 断开重连，导致播放2秒停2秒。FileResponse 带 Content-Length 和 Range 支持，
         # 音箱可以正常缓存和断点续传。
         file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
-        cache_dir = Path("/tmp/musicnest_transcode")
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = cache_dir / f"{file_hash}.mp3"
+        TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
 
         if not os.path.isfile(tmp_path):
             # 缓存未命中：预转码整个文件
@@ -1712,7 +1745,12 @@ async def api_music_play(song_index: int, request: Request) -> Response:
                     os.remove(tmp_path)
                 return JSONResponse({"code": 1, "msg": "转码失败"}, status_code=500)
             logger.info(f"[Transcode] 预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
+            # 写入新缓存后清理超额（fire-and-forget，不阻塞响应）
+            _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
         else:
+            # 缓存命中：更新 mtime 作为"最后访问时间"（容器通常 noatime，atime 不可靠）
+            with contextlib.suppress(OSError):
+                os.utime(tmp_path, None)
             logger.debug(f"[Transcode] 缓存命中: {tmp_path}")
 
         return FileResponse(str(tmp_path), media_type="audio/mpeg",
