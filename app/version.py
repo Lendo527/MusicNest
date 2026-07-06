@@ -7,6 +7,20 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.66 - 修复单曲循环进度条不归零 + 转码缓存清理索引 + 压制循环提速:
+           问题5(循环播放第二遍进度条不归零): 单曲循环时current_index不变,
+                 前端songChanged=false不重启进度轮询;pollProgressApi"只往前推不后退"
+                 导致apiPos回到0时localPosition仍停在duration;
+                 修复5a(前端): pollProgressApi检测apiPos<localPosition-3时重置localPosition
+                       (单曲循环/上一首/手动切歌都能处理);
+                 修复5b(前端): localTimer到达duration末尾时立即拉一次API,快速检测循环;
+                 修复5c(后端): /api/player/progress检测elapsed>=duration-2且position=0时
+                       重置_play_start_time,本地计时归零;
+           问题6(清理转码缓存未清理索引): _cleanup_transcode_cache只删文件,
+                 _transcode_status字典中对应file_hash条目残留;
+                 修复6: 删除文件时从p.stem提取file_hash,pop _transcode_status对应条目;
+           问题7(压制循环间隔): 用户要求从0.5秒改成0.3秒;
+                 修复7: _suppress_native_during_search的asyncio.sleep(0.5)改为0.3;
   0.0.65 - 修复在线播放先播小爱版 + 播放模式语义 + 转码缓存持久化 + 列表自动滚动:
            问题1(白龙马先播3秒小爱版): play_song/set_play_mode在线路径,stop_all_media后
                  到play_music_url之间有搜索空窗期(1-2秒),小爱版异步启动并播放;
@@ -425,4 +439,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.65"
+__version__ = "0.0.66"

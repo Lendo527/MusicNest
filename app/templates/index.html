@@ -2351,6 +2351,9 @@ async function pollProgressApi() {
                 localPosition += 0.2;
                 if (currentDuration > 0 && localPosition > currentDuration) {
                     localPosition = currentDuration;
+                    // 到达末尾时立即拉一次 API，快速检测单曲循环（position 回到 0）
+                    pollProgressApi();
+                    return;
                 }
                 updateProgress(Math.floor(localPosition), currentDuration);
             }, 200);
@@ -2358,8 +2361,13 @@ async function pollProgressApi() {
         return;
     }
 
-    // 已进入本地模式：正向纠偏（只往前推，不后退）
-    if (apiPos > localPosition + 2) {
+    // 已进入本地模式：检测循环/切歌（apiPos 明显回退 → 重置到 apiPos）
+    if (apiPos < localPosition - 3) {
+        // 单曲循环、上一首、手动切歌等情况：设备 position 回到小值，本地需同步回退
+        localPosition = apiPos;
+        apiStarted = true;
+    } else if (apiPos > localPosition + 2) {
+        // 正向纠偏（设备比本地快，如拖动后恢复）
         localPosition = apiPos;
     }
     // 更新 duration

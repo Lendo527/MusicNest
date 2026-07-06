@@ -370,7 +370,7 @@ async def _suppress_native_during_search(device_id: str, search_coro):
             last_stop_holder[0] = _create_background_task(
                 client.stop_all_media(device_id), "suppress_native"
             )
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
     suppress_task = asyncio.create_task(_suppress_loop())
     try:
@@ -1857,6 +1857,10 @@ async def _cleanup_transcode_cache() -> None:
             total -= size
             freed += size
             removed += 1
+            # 同步清理 _transcode_status 索引（文件名格式 {file_hash}.mp3）
+            file_hash = p.stem
+            with contextlib.suppress(KeyError):
+                _transcode_status.pop(file_hash, None)
         if removed:
             logger.info(f"[Transcode] 缓存清理: 删除 {removed} 个文件, 释放 {freed // 1024 // 1024}MB, 当前 {total // 1024 // 1024}MB")
     except Exception as e:
@@ -2876,6 +2880,12 @@ async def api_player_progress() -> dict:
         # 本地回退：设备不报告位置时（如播 URL），用本地计时估算
         if position == 0 and play_state._play_start_time > 0:
             elapsed = int(time.monotonic() - play_state._play_start_time)
+            # 检测单曲循环：本地 elapsed 接近或超过 duration，但设备 position=0，
+            # 说明音箱已循环重新开始，重置 _play_start_time 让本地计时归零
+            if duration > 0 and elapsed >= duration - 2:
+                play_state._play_start_time = time.monotonic()
+                elapsed = 0
+                logger.debug("[Player] 检测到单曲循环，重置 _play_start_time")
             if duration > 0:
                 position = min(elapsed, duration)
             else:
