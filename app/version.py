@@ -7,6 +7,17 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.60 - 边转边播(流式传输) + 修复set_play_mode的stop_task/KeyError bug:
+           修复1(边转边播): 预转码整个文件需5-9秒,这期间音箱没声音,小爱版插进来;
+                 改为 ffmpeg -f mp3 pipe:1 输出到stdout,StreamingResponse边读边输出;
+                 1秒内首块数据到达音箱,音箱立即开始播放;
+                 同时写一份到.part文件,完成后rename到.mp3作为缓存;
+                 缓存命中时返回FileResponse(带Content-Length,支持Range);
+                 移除_play_on_device的fire-and-forget预热(避免与流式转码冲突);
+           修复2(stop_task UnboundLocalError): set_play_mode分支引用了stop_task,
+                 但它只在play_song分支定义;改为stop_task2独立变量;
+           修复3(KeyError: 0): kw_result["data"]可能是空list或非list,
+                 改为isinstance(list) and len>0检查;
   0.0.59 - 修复转码416反复重试(原子写入) + 循环播放歌曲名识别:
            修复1(416根因): ffmpeg创建输出文件但还在写入时,os.path.isfile()返回True但文件不完整;
                  HTTP端点返回不完整文件,音箱Range超出→416反复重试8秒;
@@ -342,4 +353,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.59"
+__version__ = "0.0.60"

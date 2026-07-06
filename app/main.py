@@ -850,12 +850,16 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             arg = result.argument.strip()
             if arg and miot_client and device_id:
                 logger.info(f"[VoiceCmd] set_play_mode 带歌曲名，尝试播放: {arg}")
+                # 启动 stop_all_media（set_play_mode 分支没有 stop_task，这里创建）
+                stop_task2 = None
+                if miot_client and device_id:
+                    stop_task2 = _create_background_task(miot_client.stop_all_media(device_id), "stop_all_media")
                 # 复用 play_song 的处理逻辑
                 local_results = [] if config.get("online_only_voice", False) else scanner.search(arg)
                 if local_results:
-                    if stop_task:
+                    if stop_task2:
                         try:
-                            await asyncio.wait_for(stop_task, timeout=3.5)
+                            await asyncio.wait_for(stop_task2, timeout=3.5)
                         except Exception as e:
                             logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
                     all_songs = scanner.get_songs(limit=5000)
@@ -879,29 +883,34 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     # 在线搜索
                     kw_result = await search_by_keyword(arg)
                     if kw_result.get("code") == 0 and kw_result.get("data"):
-                        song = kw_result["data"][0]
-                        song_id = song.get("id", "")
-                        play_url_raw = song.get("url", "")
-                        if play_url_raw and miot_client:
-                            url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
-                            _online_urls[url_hash] = play_url_raw
-                            server_host = config.get("server_host", "")
-                            proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
-                            if stop_task:
-                                try:
-                                    await asyncio.wait_for(stop_task, timeout=3.5)
-                                except Exception as e:
-                                    logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
-                            hardware = await _get_device_hardware(device_id)
-                            if needs_music_api(hardware):
-                                ok = await miot_client.play_music_url(device_id, proxied_url)
+                        online_data = kw_result["data"]
+                        if isinstance(online_data, list) and len(online_data) > 0:
+                            song = online_data[0]
+                            play_url_raw = song.get("url", "")
+                            if play_url_raw and miot_client:
+                                url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
+                                _online_urls[url_hash] = play_url_raw
+                                server_host = config.get("server_host", "")
+                                proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
+                                if stop_task2:
+                                    try:
+                                        await asyncio.wait_for(stop_task2, timeout=3.5)
+                                    except Exception as e:
+                                        logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+                                hardware = await _get_device_hardware(device_id)
+                                if needs_music_api(hardware):
+                                    ok = await miot_client.play_music_url(device_id, proxied_url)
+                                else:
+                                    ok = await miot_client.play_url(device_id, proxied_url)
+                                if ok:
+                                    play_state.is_playing = True
+                                    play_state._play_start_time = time.monotonic()
+                                    logger.info(f"[VoiceCmd] 模式+在线播放: {song.get('artist')} - {song.get('title')}")
+                                    result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {song.get('title', arg)}"
                             else:
-                                ok = await miot_client.play_url(device_id, proxied_url)
-                            if ok:
-                                play_state.is_playing = True
-                                play_state._play_start_time = time.monotonic()
-                                logger.info(f"[VoiceCmd] 模式+在线播放: {song.get('artist')} - {song.get('title')}")
-                                result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {song.get('title', arg)}"
+                                logger.warning(f"[VoiceCmd] 在线歌曲无URL: {arg}")
+                        else:
+                            logger.info(f"[VoiceCmd] 在线搜索无结果: {arg}")
                     else:
                         logger.info(f"[VoiceCmd] 未找到歌曲: {arg}")
 
@@ -1881,26 +1890,89 @@ async def api_music_play(song_index: int, request: Request) -> Response:
     # 根据请求参数决定是否转码 MP3（针对仅支持 MP3 的 音箱）
     transcode = request.query_params.get("transcode", "0") == "1"
     if transcode and not filepath.lower().endswith('.mp3'):
-        # 预转码到临时文件（缓存），用 FileResponse 返回
-        # 原因：StreamingResponse 无 Content-Length，L05C 音箱 HTTP 客户端会在 5-6 秒后
-        # 断开重连，导致播放2秒停2秒。FileResponse 带 Content-Length 和 Range 支持，
-        # 音箱可以正常缓存和断点续传。
-        #
-        # 转码流程：
-        # - _play_on_device 中 fire-and-forget 启动 _ensure_transcode_cached（不阻塞 play）
-        # - 音箱请求 URL 时，此处 await _ensure_transcode_cached 等待转码完成
-        # - 转码完成后 FileResponse 返回完整文件（不会 416）
-        # - per-file 锁确保同一文件只转码一次，play预热和HTTP请求共享转码结果
-        await _ensure_transcode_cached(filepath)
+        # 边转边播（流式传输）+ 缓存复用
+        # 原因：预转码整个文件需5-9秒，这期间音箱没声音，小爱版可能插进来。
+        # 边转边播：ffmpeg 输出到 stdout，StreamingResponse 边读边输出，1秒内开始播放。
+        # 同时写一份到 .part 文件，完成后 rename 到 .mp3 作为缓存。
         file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
+        TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
+        tmp_part = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3.part"
 
-        if not os.path.isfile(tmp_path):
-            # 转码失败（_ensure_transcode_cached 已记录日志）
+        # 缓存命中：直接返回 FileResponse（带 Content-Length，支持 Range）
+        if os.path.isfile(tmp_path):
+            with contextlib.suppress(OSError):
+                os.utime(tmp_path, None)
+            logger.debug(f"[Transcode] HTTP缓存命中: {tmp_path}")
+            return FileResponse(str(tmp_path), media_type="audio/mpeg",
+                                filename=os.path.basename(tmp_path))
+
+        # 缓存未命中：边转边播（流式）
+        # 如果已在转码中（.part 文件存在且锁被持有），等待转码完成后再返回（避免并发转码）
+        if file_hash in _transcode_locks and _transcode_locks[file_hash].locked():
+            # 已有转码在进行，等待完成后返回 FileResponse
+            logger.debug(f"[Transcode] HTTP等待已有转码完成: {tmp_path}")
+            await _ensure_transcode_cached(filepath)
+            if os.path.isfile(tmp_path):
+                return FileResponse(str(tmp_path), media_type="audio/mpeg",
+                                    filename=os.path.basename(tmp_path))
             return JSONResponse({"code": 1, "msg": "转码失败"}, status_code=500)
 
-        return FileResponse(str(tmp_path), media_type="audio/mpeg",
-                            filename=os.path.basename(tmp_path))
+        # 没有转码在进行：启动边转边播
+        logger.info(f"[Transcode] 边转边播开始: {filepath}")
+        _transcode_status[file_hash] = {"status": "transcoding", "filepath": filepath, "started_at": time.time(), "completed_at": 0}
+
+        async def _stream_transcode():
+            """边转码边输出 MP3 流，同时写一份到 .part 文件作为缓存"""
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_part)
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-loglevel", "error", "-i", filepath,
+                "-codec:a", "libmp3lame", "-b:a", "128k",
+                "-f", "mp3", "pipe:1",   # 输出到 stdout
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            fp = None
+            try:
+                fp = open(tmp_part, "wb")
+                first_chunk = True
+                while True:
+                    chunk = await proc.stdout.read(64 * 1024)  # 64KB
+                    if not chunk:
+                        break
+                    if first_chunk:
+                        logger.info(f"[Transcode] 首块数据已输出: {tmp_path}")
+                        first_chunk = False
+                    fp.write(chunk)
+                    yield chunk
+                fp.close()
+                fp = None
+                await proc.wait()
+                if proc.returncode == 0:
+                    os.rename(tmp_part, tmp_path)
+                    _transcode_status[file_hash] = {"status": "done", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
+                    logger.info(f"[Transcode] 边转边播完成: {tmp_path} size={os.path.getsize(tmp_path)}")
+                    _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
+                else:
+                    stderr = await proc.stderr.read()
+                    stderr_text = stderr.decode("utf-8", errors="replace")[-800:] if stderr else ""
+                    logger.warning(f"[Transcode] 边转边播失败 code={proc.returncode} stderr={stderr_text}")
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(tmp_part)
+                    _transcode_status[file_hash] = {"status": "failed", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
+            except Exception as e:
+                logger.warning(f"[Transcode] 流式转码异常: {e}")
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(tmp_part)
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                _transcode_status[file_hash] = {"status": "failed", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
+            finally:
+                if fp is not None and not fp.closed:
+                    fp.close()
+
+        return StreamingResponse(_stream_transcode(), media_type="audio/mpeg")
 
     return FileResponse(filepath, media_type=mime, filename=os.path.basename(filepath))
 
@@ -2434,13 +2506,9 @@ async def _play_on_device(device_id: str, song_index: int) -> bool:
                      f"real_index={real_index} filepath={filepath[-40:]} "
                      f"hardware={hardware!r} needs_mp3={needs_mp3_flag} url={url}")
 
-        # 预转码：fire-and-forget 启动转码（不阻塞 play 命令）
-        # 原因：若 await 转码完成（8秒），这 8 秒空窗期小爱版会插进来。
-        # 改为：立即 play 抢占通道（REPLACE_ALL），后台并行启动转码。
-        # 音箱请求 URL 时，HTTP 端点会 await _ensure_transcode_cached 等待转码完成，
-        # 确保 FileResponse 返回完整文件（不会 416）。
-        if needs_mp3_flag and not filepath.lower().endswith('.mp3'):
-            _create_background_task(_ensure_transcode_cached(filepath), "pretranscode")
+        # 转码：边转边播（HTTP 端点处理），无需预热
+        # 原因：边转边播在音箱请求 URL 时立即开始转码并流式输出，1秒内首块数据到达。
+        # 不再 fire-and-forget 预热，避免与 HTTP 端点的流式转码冲突。
 
         # 自动选择播放 API
         use_music_api = False
