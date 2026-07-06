@@ -679,15 +679,18 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 # 元数据查询改 fire-and-forget（不阻塞播放）
                 _create_background_task(_enrich_playlist_metadata(song_name, real_index, all_songs), "enrich_metadata")
 
-                # 提前标记 query 已处理，避免 MediaWatcher 在 _play_on_device 执行期间
-                # 检测到原生播放并触发重复拦截（UBus请求需1-2秒，期间 MediaWatcher 会轮询）
-                if monitor:
-                    monitor.mark_query_handled(device_id, query)
+                # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 _play_on_device
+                # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
+                # is_own_play_recent 检查最近10秒，覆盖 _play_on_device 的执行时间。
+                if miot_client:
+                    miot_client.mark_own_play(device_id)
 
                 ok = await _play_on_device(device_id, real_index)
                 if ok:
                     play_state.is_playing = True
                     logger.info(f"[VoiceCmd] 本地播放: {target.get('title', song_name)}")
+                if monitor:
+                    monitor.mark_query_handled(device_id, query)
                 return
             else:
                 # 本地未命中：在线搜索
@@ -730,10 +733,10 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             except Exception as e:
                                 logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
 
-                        # 提前标记 query 已处理，避免 MediaWatcher 在 play_music_url 执行期间
-                        # 检测到原生播放并触发重复拦截（UBus请求需1-2秒）
-                        if monitor:
-                            monitor.mark_query_handled(device_id, query)
+                        # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 play_music_url
+                        # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
+                        if miot_client:
+                            miot_client.mark_own_play(device_id)
 
                         # 立即 play：不再使用压制循环
                         # 原因：每次 await stop_all_media() 阻塞约1-2秒（6个UBus请求并发但要等最慢的），
@@ -757,6 +760,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         logger.warning("[VoiceCmd] 未登录小米账号，无法播放")
                 else:
                     logger.info(f"[VoiceCmd] 未找到歌曲: {song_name}")
+
+                if monitor:
+                    monitor.mark_query_handled(device_id, query)
                 return
 
         elif result.command.type == "next":

@@ -7,6 +7,15 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.63 - 修复MediaWatcher误判机制(用mark_own_play替代mark_query_handled提前):
+           v0.0.62问题: mark_query_handled提前后,MediaWatcher在is_query_handled=True时
+                 直接跳过,导致小爱版网易云试听版的异步启动无法被MediaWatcher拦截;
+           根因: mark_query_handled只标记"query已被处理",但VoiceCmd处理期间_play_on_device
+                 需1-2秒,这期间小爱版可能异步启动,MediaWatcher应作为第二道防线拦截;
+           修复: 回滚mark_query_handled到_play_on_device之后调用(原位置),
+                 改为在_play_on_device之前调用mark_own_play(标记最近自己触发播放);
+                 MediaWatcher的is_own_play_recent检查(10秒窗口)会返回True,跳过拦截;
+                 mark_own_play覆盖整个_play_on_device执行时间(1-2秒)+转码等待时间;
   0.0.62 - 修复MediaWatcher重复拦截导致先播小爱版再播我们的版本:
            根因: mark_query_handled 在 _play_on_device 之后才调用,
                  但 UBus 请求需1-2秒,期间 MediaWatcher 检测到原生播放,
@@ -370,4 +379,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.62"
+__version__ = "0.0.63"
