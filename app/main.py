@@ -654,12 +654,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     except Exception as e:
                         logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
 
-                # 压制循环：持续 stop 防止小爱版网易云试听版启动（同在线播放）
-                suppress_start = time.monotonic()
-                for i in range(5):
-                    await asyncio.sleep(0.3)
-                    await miot_client.stop_all_media(device_id)
-                logger.info(f"[VoiceCmd] 压制循环完成: 耗时{time.monotonic()-suppress_start:.1f}s")
+                # 本地播放不需要压制循环：本地URL响应快(局域网)，play响应后音箱同秒请求URL，
+                # REPLACE_ALL 立即生效，小爱版来不及启动就被替换。
+                # 压制循环只用于在线播放（代理URL有额外网络延迟，REPLACE_ALL 生效慢）。
 
                 # 本地命中：直接 play_url
                 all_songs = scanner.get_songs(limit=5000)
