@@ -2170,6 +2170,12 @@ function renderPlaylistPanelFromState(state) {
             <span class="pl-artist">${escHtml(s.artist || '-')}</span>
         </li>
     `).join('');
+
+    // 自动滚动到当前播放歌曲（居中显示）
+    const currentEl = document.querySelector('#playlistItems li.current');
+    if (currentEl) {
+        currentEl.scrollIntoView({behavior: 'smooth', block: 'center'});
+    }
 }
 
 function updatePlayerUI(state) {

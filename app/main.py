@@ -345,6 +345,48 @@ async def _safe_cancel(task):
             pass
 
 
+async def _suppress_native_during_search(device_id: str, search_coro):
+    """在在线搜索期间持续压制小爱版异步启动。
+
+    问题：小爱收到"播放XX"后，stop_all_media 停掉 TTS，但网易云试听版会异步启动，
+    单次 stop 停不掉这个异步启动。搜索期间（1-2秒）小爱版会播放。
+
+    方案：搜索期间每0.5秒 fire-and-forget 一次 stop_all_media，持续压制小爱版。
+    搜索完成后，await 最后一个 stop 完成（确保 stop 在 play 之前到达音箱），
+    然后 return 搜索结果，调用方立即 play。
+
+    Returns:
+        search_coro 的结果
+    """
+    client = await _check_miot()
+    if not client:
+        return await search_coro
+
+    # 用 list 包装保存最后一个 stop 的 task（便于闭包内修改）
+    last_stop_holder = [_create_background_task(client.stop_all_media(device_id), "suppress_init")]
+
+    async def _suppress_loop():
+        while True:
+            last_stop_holder[0] = _create_background_task(
+                client.stop_all_media(device_id), "suppress_native"
+            )
+            await asyncio.sleep(0.5)
+
+    suppress_task = asyncio.create_task(_suppress_loop())
+    try:
+        result = await search_coro
+    finally:
+        # 停止压制循环
+        await _safe_cancel(suppress_task)
+        # 等待最后一个 stop 完成（确保 stop 在 play 之前到达音箱，避免停掉 play）
+        if last_stop_holder[0] and not last_stop_holder[0].done():
+            try:
+                await asyncio.wait_for(last_stop_holder[0], timeout=2.0)
+            except Exception as e:
+                logger.warning(f"[Suppress] 等待最后一个 stop 失败: {e}")
+    return result
+
+
 async def _alarm_loop(alarm_id: str, hour: int, minute: int, days: list[int], song_index: Optional[int] = None):
     """闹钟循环，每天指定时间触发"""
     logger.info(f"[Alarm] 闹钟已启动: id={alarm_id} time={hour:02d}:{minute:02d} days={days} song_index={song_index}")
@@ -694,7 +736,10 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 return
             else:
                 # 本地未命中：在线搜索
-                kw_result = await search_by_keyword(song_name)
+                # 搜索期间持续压制小爱版异步启动（每0.5秒 stop 一次）
+                kw_result = await _suppress_native_during_search(
+                    device_id, search_by_keyword(song_name)
+                )
                 if kw_result.get("code") == 0 and kw_result.get("data"):
                     song_data = kw_result["data"]
                     song = {
@@ -850,6 +895,14 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 "order": PlayMode.LIST,
             }
             mode_names = {"random": "随机", "single": "单曲循环", "loop": "列表循环", "order": "顺序"}
+
+            # "循环播放XXX" 带歌曲名时，用户期望单曲循环（循环播放这首歌）
+            # 否则"循环播放"（不带歌曲名）仍为列表循环
+            arg = result.argument.strip()
+            if param == "loop" and arg:
+                param = "single"
+                logger.info(f"[VoiceCmd] 带歌曲名的'循环播放'识别为单曲循环: {arg}")
+
             if param in mode_map:
                 play_state.mode = mode_map[param]
                 logger.info(f"[VoiceCmd] 播放模式切换为: {play_state.mode.value}")
@@ -858,7 +911,6 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 result_text = "模式切换失败"
 
             # 特殊处理："循环播放XXX" / "随机播放XXX" 等，XXX 是歌曲名时，切换模式后播放该歌曲
-            arg = result.argument.strip()
             if arg and miot_client and device_id:
                 logger.info(f"[VoiceCmd] set_play_mode 带歌曲名，尝试播放: {arg}")
                 # 启动 stop_all_media（set_play_mode 分支没有 stop_task，这里创建）
@@ -895,8 +947,10 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                         logger.info(f"[VoiceCmd] 模式+本地播放: {target.get('title', arg)}")
                         result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {target.get('title', arg)}"
                 else:
-                    # 在线搜索
-                    kw_result = await search_by_keyword(arg)
+                    # 在线搜索（搜索期间持续压制小爱版异步启动）
+                    kw_result = await _suppress_native_during_search(
+                        device_id, search_by_keyword(arg)
+                    )
                     if kw_result.get("code") == 0 and kw_result.get("data"):
                         online_data = kw_result["data"]
                         if isinstance(online_data, list) and len(online_data) > 0:
@@ -1772,7 +1826,7 @@ async def api_music_songs(limit: int = 500, offset: int = 0) -> dict:
     return {"code": 0, "data": {"songs": songs, "total": stats["total_songs"]}}
 
 
-TRANSCODE_CACHE_DIR = Path("/tmp/musicnest_transcode")
+TRANSCODE_CACHE_DIR = Path("/data/musicnest_transcode")  # 持久化路径，避免容器重启丢失缓存
 TRANSCODE_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1GB
 _transcode_locks: dict[str, asyncio.Lock] = {}  # per-file 转码锁，防止并发转码同一文件
 # 转码状态追踪: file_hash -> {"status": "transcoding"|"done"|"failed", "started_at": float, "completed_at": float, "filepath": str}

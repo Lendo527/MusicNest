@@ -7,6 +7,25 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.65 - 修复在线播放先播小爱版 + 播放模式语义 + 转码缓存持久化 + 列表自动滚动:
+           问题1(白龙马先播3秒小爱版): play_song/set_play_mode在线路径,stop_all_media后
+                 到play_music_url之间有搜索空窗期(1-2秒),小爱版异步启动并播放;
+                 修复1: 新增_suppress_native_during_search函数,搜索期间每0.5秒
+                       fire-and-forget一次stop_all_media持续压制小爱版;
+                       搜索完成后await最后一个stop完成(确保stop在play之前到达音箱),
+                       然后立即play_music_url(REPLACE_ALL)接管;
+                       play_song和set_play_mode在线路径都用此函数包裹搜索;
+           问题2(循环播放let it go web图标不更新): "循环播放"映射到LIST_LOOP(列表循环),
+                 但用户期望单曲循环;voice.py中"循环播放"→param="loop";
+                 修复2: set_play_mode处理中,若param="loop"且arg非空(带歌曲名),
+                       改为param="single"(SINGLE_LOOP);"循环播放"(不带歌曲名)仍为列表循环;
+           问题3(转码缓存每次重头转): TRANSCODE_CACHE_DIR在/tmp,容器重启后丢失;
+                 修复3: 转码缓存目录从/tmp/musicnest_transcode改到/data/musicnest_transcode
+                       (持久化路径,容器重启不丢失);
+                 说明: MP3源文件已免转码(_play_on_device和/api/music/play都判断.endswith('.mp3'));
+           问题4(播放列表高亮项不自动滚动): renderPlaylistPanelFromState渲染后无scrollIntoView,
+                 歌曲多时需手动滑动很久才能看到当前播放;
+                 修复4: 渲染后查询li.current元素,scrollIntoView({block:'center'})居中显示;
   0.0.64 - 修复播放列表大BUG(语音指令与web界面不同步) + 起风了播放中断诊断:
            问题1(起风了播放几秒后停止几秒才继续): 转码文件11.4MB/96kbps≈16分钟,
                  日志显示22:35:22和22:35:23两次206请求,疑似比特率异常或Range重连;
@@ -406,4 +425,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.64"
+__version__ = "0.0.65"
