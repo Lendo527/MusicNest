@@ -846,6 +846,65 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             else:
                 result_text = "模式切换失败"
 
+            # 特殊处理："循环播放XXX" / "随机播放XXX" 等，XXX 是歌曲名时，切换模式后播放该歌曲
+            arg = result.argument.strip()
+            if arg and miot_client and device_id:
+                logger.info(f"[VoiceCmd] set_play_mode 带歌曲名，尝试播放: {arg}")
+                # 复用 play_song 的处理逻辑
+                local_results = [] if config.get("online_only_voice", False) else scanner.search(arg)
+                if local_results:
+                    if stop_task:
+                        try:
+                            await asyncio.wait_for(stop_task, timeout=3.5)
+                        except Exception as e:
+                            logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+                    all_songs = scanner.get_songs(limit=5000)
+                    target = local_results[0]
+                    target_path = target.get("filepath", "")
+                    real_index = next(
+                        (i for i, s in enumerate(all_songs) if s.get("filepath") == target_path), None
+                    )
+                    if real_index is None:
+                        real_index = 0
+                        play_state.playlist = list(local_results)
+                    else:
+                        play_state.playlist = all_songs
+                    play_state.current_index = real_index
+                    ok = await _play_on_device(device_id, real_index)
+                    if ok:
+                        play_state.is_playing = True
+                        logger.info(f"[VoiceCmd] 模式+本地播放: {target.get('title', arg)}")
+                        result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {target.get('title', arg)}"
+                else:
+                    # 在线搜索
+                    kw_result = await search_by_keyword(arg)
+                    if kw_result.get("code") == 0 and kw_result.get("data"):
+                        song = kw_result["data"][0]
+                        song_id = song.get("id", "")
+                        play_url_raw = song.get("url", "")
+                        if play_url_raw and miot_client:
+                            url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
+                            _online_urls[url_hash] = play_url_raw
+                            server_host = config.get("server_host", "")
+                            proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
+                            if stop_task:
+                                try:
+                                    await asyncio.wait_for(stop_task, timeout=3.5)
+                                except Exception as e:
+                                    logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+                            hardware = await _get_device_hardware(device_id)
+                            if needs_music_api(hardware):
+                                ok = await miot_client.play_music_url(device_id, proxied_url)
+                            else:
+                                ok = await miot_client.play_url(device_id, proxied_url)
+                            if ok:
+                                play_state.is_playing = True
+                                play_state._play_start_time = time.monotonic()
+                                logger.info(f"[VoiceCmd] 模式+在线播放: {song.get('artist')} - {song.get('title')}")
+                                result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {song.get('title', arg)}"
+                    else:
+                        logger.info(f"[VoiceCmd] 未找到歌曲: {arg}")
+
         elif result.command.type == "set_volume":
             param = result.command.param
             arg = result.argument
@@ -1709,12 +1768,16 @@ async def _ensure_transcode_cached(filepath: str) -> None:
 
     使用 per-file asyncio.Lock 确保同一文件只转码一次，
     多个协程（play前预热、HTTP请求）可以并发等待同一文件的转码完成。
+
+    原子写入：ffmpeg 输出到 xxx.mp3.tmp，完成后 rename 到 xxx.mp3。
+    这样 xxx.mp3 存在就意味着转码完成，不会读到不完整的文件。
     """
     file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
     TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
+    tmp_part = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3.part"  # 转码中的临时文件
 
-    # 快速路径：缓存命中（无需加锁）
+    # 快速路径：缓存命中（xxx.mp3 存在 = 转码完成，无需加锁）
     if os.path.isfile(tmp_path):
         with contextlib.suppress(OSError):
             os.utime(tmp_path, None)
@@ -1734,13 +1797,16 @@ async def _ensure_transcode_cached(filepath: str) -> None:
             logger.debug(f"[Transcode] 缓存命中(锁内): {tmp_path}")
             return
 
-        # 预转码整个文件并等待完成
+        # 预转码整个文件并等待完成（写入 .part 文件，完成后 rename）
         logger.info(f"[Transcode] 预转码开始: {filepath}")
         _transcode_status[file_hash] = {"status": "transcoding", "filepath": filepath, "started_at": time.time(), "completed_at": 0}
+        # 清理可能残留的 .part 文件
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_part)
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error", "-i", filepath,
             "-codec:a", "libmp3lame", "-b:a", "128k",
-            "-f", "mp3", str(tmp_path),
+            "-f", "mp3", str(tmp_part),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1749,9 +1815,11 @@ async def _ensure_transcode_cached(filepath: str) -> None:
             stderr_text = stderr.decode("utf-8", errors="replace")[-800:] if stderr else ""
             logger.warning(f"[Transcode] 预转码失败 code={proc.returncode} stderr={stderr_text}")
             with contextlib.suppress(FileNotFoundError):
-                os.remove(tmp_path)
+                os.remove(tmp_part)
             _transcode_status[file_hash] = {"status": "failed", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
             return
+        # 原子 rename：.part → .mp3（rename 后 xxx.mp3 才存在，保证读到的是完整文件）
+        os.rename(tmp_part, tmp_path)
         logger.info(f"[Transcode] 预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
         _transcode_status[file_hash] = {"status": "done", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
         # 写入新缓存后清理超额（fire-and-forget）
