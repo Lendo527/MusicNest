@@ -1665,6 +1665,7 @@ async def api_music_songs(limit: int = 500, offset: int = 0) -> dict:
 
 TRANSCODE_CACHE_DIR = Path("/tmp/musicnest_transcode")
 TRANSCODE_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1GB
+_transcode_locks: dict[str, asyncio.Lock] = {}  # per-file 转码锁，防止并发转码同一文件
 
 
 async def _cleanup_transcode_cache() -> None:
@@ -1700,38 +1701,50 @@ async def _cleanup_transcode_cache() -> None:
 async def _ensure_transcode_cached(filepath: str) -> None:
     """确保转码缓存就绪：若未缓存则预转码整个文件并等待完成。
 
-    在 play 命令前调用，确保音箱请求 URL 时缓存已生成，避免 416 反复重试。
+    使用 per-file asyncio.Lock 确保同一文件只转码一次，
+    多个协程（play前预热、HTTP请求）可以并发等待同一文件的转码完成。
     """
     file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
     TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
 
+    # 快速路径：缓存命中（无需加锁）
     if os.path.isfile(tmp_path):
-        # 缓存命中：更新 mtime
         with contextlib.suppress(OSError):
             os.utime(tmp_path, None)
-        logger.debug(f"[Transcode] play前缓存命中: {tmp_path}")
+        logger.debug(f"[Transcode] 缓存命中: {tmp_path}")
         return
 
-    # 缓存未命中：预转码整个文件并等待完成
-    logger.info(f"[Transcode] play前预转码开始: {filepath}")
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-loglevel", "error", "-i", filepath,
-        "-codec:a", "libmp3lame", "-b:a", "192k",
-        "-f", "mp3", str(tmp_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        stderr_text = stderr.decode("utf-8", errors="replace")[-800:] if stderr else ""
-        logger.warning(f"[Transcode] play前预转码失败 code={proc.returncode} stderr={stderr_text}")
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(tmp_path)
-        return
-    logger.info(f"[Transcode] play前预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
-    # 写入新缓存后清理超额（fire-and-forget）
-    _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
+    # 加锁，确保同一文件只转码一次（其他协程等待）
+    if file_hash not in _transcode_locks:
+        _transcode_locks[file_hash] = asyncio.Lock()
+    async with _transcode_locks[file_hash]:
+        # 双重检查：可能其他协程已经转码完成
+        if os.path.isfile(tmp_path):
+            with contextlib.suppress(OSError):
+                os.utime(tmp_path, None)
+            logger.debug(f"[Transcode] 缓存命中(锁内): {tmp_path}")
+            return
+
+        # 预转码整个文件并等待完成
+        logger.info(f"[Transcode] 预转码开始: {filepath}")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-loglevel", "error", "-i", filepath,
+            "-codec:a", "libmp3lame", "-b:a", "128k",
+            "-f", "mp3", str(tmp_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            stderr_text = stderr.decode("utf-8", errors="replace")[-800:] if stderr else ""
+            logger.warning(f"[Transcode] 预转码失败 code={proc.returncode} stderr={stderr_text}")
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_path)
+            return
+        logger.info(f"[Transcode] 预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
+        # 写入新缓存后清理超额（fire-and-forget）
+        _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
 
 
 @app.get("/api/music/play/{song_index}")
@@ -1759,36 +1772,19 @@ async def api_music_play(song_index: int, request: Request) -> Response:
         # 原因：StreamingResponse 无 Content-Length，L05C 音箱 HTTP 客户端会在 5-6 秒后
         # 断开重连，导致播放2秒停2秒。FileResponse 带 Content-Length 和 Range 支持，
         # 音箱可以正常缓存和断点续传。
+        #
+        # 转码流程：
+        # - _play_on_device 中 fire-and-forget 启动 _ensure_transcode_cached（不阻塞 play）
+        # - 音箱请求 URL 时，此处 await _ensure_transcode_cached 等待转码完成
+        # - 转码完成后 FileResponse 返回完整文件（不会 416）
+        # - per-file 锁确保同一文件只转码一次，play预热和HTTP请求共享转码结果
+        await _ensure_transcode_cached(filepath)
         file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
-        TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
 
         if not os.path.isfile(tmp_path):
-            # 缓存未命中：预转码整个文件
-            logger.info(f"[Transcode] 预转码开始: {filepath}")
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-loglevel", "error", "-i", filepath,
-                "-codec:a", "libmp3lame", "-b:a", "192k",
-                "-f", "mp3", str(tmp_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                stderr_text = stderr.decode("utf-8", errors="replace")[-800:] if stderr else ""
-                logger.warning(f"[Transcode] ffmpeg 失败 code={proc.returncode} stderr={stderr_text}")
-                # 清理失败的临时文件
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(tmp_path)
-                return JSONResponse({"code": 1, "msg": "转码失败"}, status_code=500)
-            logger.info(f"[Transcode] 预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
-            # 写入新缓存后清理超额（fire-and-forget，不阻塞响应）
-            _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
-        else:
-            # 缓存命中：更新 mtime 作为"最后访问时间"（容器通常 noatime，atime 不可靠）
-            with contextlib.suppress(OSError):
-                os.utime(tmp_path, None)
-            logger.debug(f"[Transcode] 缓存命中: {tmp_path}")
+            # 转码失败（_ensure_transcode_cached 已记录日志）
+            return JSONResponse({"code": 1, "msg": "转码失败"}, status_code=500)
 
         return FileResponse(str(tmp_path), media_type="audio/mpeg",
                             filename=os.path.basename(tmp_path))
@@ -2325,11 +2321,13 @@ async def _play_on_device(device_id: str, song_index: int) -> bool:
                      f"real_index={real_index} filepath={filepath[-40:]} "
                      f"hardware={hardware!r} needs_mp3={needs_mp3_flag} url={url}")
 
-        # 预转码：play 前先确保转码缓存就绪
-        # 原因：play 命令发出后音箱会立即请求 URL，若缓存未生成会得到 416 反复重试，
-        # 导致播放2秒中断后5-8秒才恢复，甚至小爱版趁机接管。
+        # 预转码：fire-and-forget 启动转码（不阻塞 play 命令）
+        # 原因：若 await 转码完成（8秒），这 8 秒空窗期小爱版会插进来。
+        # 改为：立即 play 抢占通道（REPLACE_ALL），后台并行启动转码。
+        # 音箱请求 URL 时，HTTP 端点会 await _ensure_transcode_cached 等待转码完成，
+        # 确保 FileResponse 返回完整文件（不会 416）。
         if needs_mp3_flag and not filepath.lower().endswith('.mp3'):
-            await _ensure_transcode_cached(filepath)
+            _create_background_task(_ensure_transcode_cached(filepath), "pretranscode")
 
         # 自动选择播放 API
         use_music_api = False

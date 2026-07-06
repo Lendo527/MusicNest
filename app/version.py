@@ -15,8 +15,10 @@ app/main.py 和 build_oci.py 也从本文件读取；
              21:04:03 play响应成功 + 转码开始
              21:04:09 音箱请求URL → 416(转码未完成)
              21:04:11 转码完成(8秒), 音箱请求URL → 206(成功)
-           修复: 新增_ensure_transcode_cached函数, _play_on_device发play命令前先await转码完成;
-                 转码逻辑从HTTP端点抽出来复用; 首次播放需等转码几秒,但播放不会中断;
+           修复1(架构): 转码逻辑抽为_ensure_transcode_cached函数,per-file锁防并发;
+                 _play_on_device中fire-and-forget启动转码(不阻塞play,抢占通道防小爱);
+                 HTTP端点await _ensure_transcode_cached等待转码完成再返回FileResponse(不416);
+           修复2(加速): 转码比特率192k→128k,约30%加速,音箱听不出差别;
   0.0.55 - 转码缓存增加 1GB 大小限制和 LRU 清理:
            问题: 预转码缓存不会自动清理,长期运行会无限增长占满磁盘;
            修复: 写入新缓存后异步检查总大小,超过1GB时按mtime升序删除最久未访问的;
