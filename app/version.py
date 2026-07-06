@@ -7,6 +7,14 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.62 - 修复MediaWatcher重复拦截导致先播小爱版再播我们的版本:
+           根因: mark_query_handled 在 _play_on_device 之后才调用,
+                 但 UBus 请求需1-2秒,期间 MediaWatcher 检测到原生播放,
+                 检查 is_query_handled 返回 False(还没标记),触发重复拦截;
+                 拦截回调又调用 VoiceCmd 处理流程,导致重复 stop+play;
+           日志证据: 起风了被处理两次(22:10:32 和 22:10:34),两次本地播放;
+           修复: mark_query_handled 提前到 _play_on_device/play_music_url 之前调用,
+                 MediaWatcher 检查时就知道 query 已被处理,跳过拦截;
   0.0.61 - 回滚边转边播(音箱不支持无Content-Length流式响应) + 降到96k:
            问题1(边转边播失败): L05C音箱不支持无Content-Length的StreamingResponse,
                  5-7秒断开重连,每次重连又启动新转码,.part文件被删除,永远生成不了.mp3缓存;
@@ -362,4 +370,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.61"
+__version__ = "0.0.62"
