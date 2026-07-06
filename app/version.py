@@ -7,6 +7,15 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.61 - 回滚边转边播(音箱不支持无Content-Length流式响应) + 降到96k:
+           问题1(边转边播失败): L05C音箱不支持无Content-Length的StreamingResponse,
+                 5-7秒断开重连,每次重连又启动新转码,.part文件被删除,永远生成不了.mp3缓存;
+                 日志证据: 22:11:30到22:12:54,84秒内转码12次,每次都是"边转边播开始"+"首块数据已输出";
+           修复1: 回滚到v0.0.59的预转码+FileResponse方案(带Content-Length,支持Range);
+                 恢复_play_on_device的fire-and-forget预热;
+                 首次转码5-8秒延迟,但播放不会中断;后续缓存命中秒开;
+           修复2: 比特率128k→96k,转码速度提升约25%,缓解5-8秒空窗期;
+           保留: v0.0.60的set_play_mode stop_task/KeyError修复;
   0.0.60 - 边转边播(流式传输) + 修复set_play_mode的stop_task/KeyError bug:
            修复1(边转边播): 预转码整个文件需5-9秒,这期间音箱没声音,小爱版插进来;
                  改为 ffmpeg -f mp3 pipe:1 输出到stdout,StreamingResponse边读边输出;
@@ -353,4 +362,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.60"
+__version__ = "0.0.61"
