@@ -723,16 +723,12 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             except Exception as e:
                                 logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
 
-                        # 压制循环：持续 stop 防止小爱版网易云试听版启动
-                        # 小爱收到"播放XX"后，TTS 被停后会异步启动网易云试听版，
-                        # 单次 stop 停不掉这个异步启动，需要持续压制直到我们的 play_music_url 生效。
-                        # 占位play策略失败：UBus请求需要2秒生效，小爱版已在此期间启动。
-                        # 压制循环每0.3秒stop一次，持续1.5秒，能有效阻止小爱版启动。
-                        suppress_start = time.monotonic()
-                        for i in range(5):
-                            await asyncio.sleep(0.3)
-                            await miot_client.stop_all_media(device_id)
-                        logger.info(f"[VoiceCmd] 压制循环完成: 耗时{time.monotonic()-suppress_start:.1f}s")
+                        # 立即 play：不再使用压制循环
+                        # 原因：每次 await stop_all_media() 阻塞约1-2秒（6个UBus请求并发但要等最慢的），
+                        # 5次迭代实际耗时5.1秒（非设计的1.5秒），这5秒期间没有play命令，
+                        # 小爱版网易云试听版趁机播放。
+                        # 现在策略：stop 完成后立即 play_music_url(REPLACE_ALL)，
+                        # 让 REPLACE_ALL 尽早抢占通道，小爱版最多播放1-2秒（play生效时间）。
 
                         hardware = await _get_device_hardware(device_id)
                         if needs_music_api(hardware):
@@ -1688,44 +1684,39 @@ async def api_music_play(song_index: int, request: Request) -> Response:
     # 根据请求参数决定是否转码 MP3（针对仅支持 MP3 的 音箱）
     transcode = request.query_params.get("transcode", "0") == "1"
     if transcode and not filepath.lower().endswith('.mp3'):
-        # 流式转码：边转边播，无需等待整个文件转码完成
-        # 使用 asyncio subprocess 避免阻塞事件循环
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-loglevel", "error", "-i", filepath,
-            "-codec:a", "libmp3lame", "-b:a", "192k",
-            "-f", "mp3", "pipe:1",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        # 预转码到临时文件（缓存），用 FileResponse 返回
+        # 原因：StreamingResponse 无 Content-Length，L05C 音箱 HTTP 客户端会在 5-6 秒后
+        # 断开重连，导致播放2秒停2秒。FileResponse 带 Content-Length 和 Range 支持，
+        # 音箱可以正常缓存和断点续传。
+        file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
+        cache_dir = Path("/tmp/musicnest_transcode")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_dir / f"{file_hash}.mp3"
 
-        async def _stream_transcode():
-            try:
-                while True:
-                    chunk = await proc.stdout.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                # 必须先 kill 子进程再 wait，否则 ffmpeg 阻塞在管道写入导致死锁
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
-                # 检查 ffmpeg 退出码（-9=SIGKILL 是正常的客户端断开）
-                if proc.returncode is not None and proc.returncode != 0 and proc.returncode != -9:
-                    stderr_text = ""
-                    try:
-                        stderr_data = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
-                        stderr_text = stderr_data.decode("utf-8", errors="replace")[-800:] if stderr_data else ""
-                    except Exception:
-                        pass
-                    logger.warning(
-                        f"[Transcode] ffmpeg 异常退出 code={proc.returncode} filepath={filepath} stderr={stderr_text}"
-                    )
+        if not os.path.isfile(tmp_path):
+            # 缓存未命中：预转码整个文件
+            logger.info(f"[Transcode] 预转码开始: {filepath}")
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-loglevel", "error", "-i", filepath,
+                "-codec:a", "libmp3lame", "-b:a", "192k",
+                "-f", "mp3", str(tmp_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                stderr_text = stderr.decode("utf-8", errors="replace")[-800:] if stderr else ""
+                logger.warning(f"[Transcode] ffmpeg 失败 code={proc.returncode} stderr={stderr_text}")
+                # 清理失败的临时文件
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(tmp_path)
+                return JSONResponse({"code": 1, "msg": "转码失败"}, status_code=500)
+            logger.info(f"[Transcode] 预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
+        else:
+            logger.debug(f"[Transcode] 缓存命中: {tmp_path}")
 
-        logger.info(f"[Transcode] 流式转码: {filepath}")
-        return StreamingResponse(_stream_transcode(), media_type="audio/mpeg")
+        return FileResponse(str(tmp_path), media_type="audio/mpeg",
+                            filename=os.path.basename(tmp_path))
 
     return FileResponse(filepath, media_type=mime, filename=os.path.basename(filepath))
 
