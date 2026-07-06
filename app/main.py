@@ -351,7 +351,8 @@ async def _suppress_native_during_search(device_id: str, search_coro):
     问题：小爱收到"播放XX"后，stop_all_media 停掉 TTS，但网易云试听版会异步启动，
     单次 stop 停不掉这个异步启动。搜索期间（1-2秒）小爱版会播放。
 
-    方案：搜索期间每0.5秒 fire-and-forget 一次 stop_all_media，持续压制小爱版。
+    方案：搜索期间每0.3秒 fire-and-forget 一次轻量 stop（只发1个UBus请求，
+    不是 stop_all_media 的6个），持续压制小爱版。
     搜索完成后，await 最后一个 stop 完成（确保 stop 在 play 之前到达音箱），
     然后 return 搜索结果，调用方立即 play。
 
@@ -362,14 +363,26 @@ async def _suppress_native_during_search(device_id: str, search_coro):
     if not client:
         return await search_coro
 
+    # 轻量 stop：只发1个 stop UBus 请求（不是 stop_all_media 的6个），
+    # 避免每0.3秒×6个请求=每秒20个UBus请求导致请求积压
+    async def _light_stop():
+        try:
+            await asyncio.wait_for(
+                client._ubus_request(
+                    device_id, "player_play_operation", "mediaplayer",
+                    {"action": "stop", "media": "1"}
+                ),
+                timeout=2.0,
+            )
+        except Exception:
+            pass  # fire-and-forget，忽略超时和错误
+
     # 用 list 包装保存最后一个 stop 的 task（便于闭包内修改）
-    last_stop_holder = [_create_background_task(client.stop_all_media(device_id), "suppress_init")]
+    last_stop_holder = [asyncio.create_task(_light_stop())]
 
     async def _suppress_loop():
         while True:
-            last_stop_holder[0] = _create_background_task(
-                client.stop_all_media(device_id), "suppress_native"
-            )
+            last_stop_holder[0] = asyncio.create_task(_light_stop())
             await asyncio.sleep(0.3)
 
     suppress_task = asyncio.create_task(_suppress_loop())
@@ -1857,8 +1870,8 @@ async def _cleanup_transcode_cache() -> None:
             total -= size
             freed += size
             removed += 1
-            # 同步清理 _transcode_status 索引（文件名格式 {file_hash}.mp3）
-            file_hash = p.stem
+            # 同步清理 _transcode_status 索引（文件名格式 {file_hash}_v2.mp3）
+            file_hash = p.stem.replace("_v2", "")
             with contextlib.suppress(KeyError):
                 _transcode_status.pop(file_hash, None)
         if removed:
@@ -1878,8 +1891,10 @@ async def _ensure_transcode_cached(filepath: str) -> None:
     """
     file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
     TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
-    tmp_part = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3.part"  # 转码中的临时文件
+    # 文件名含版本后缀 v2：v1 的缓存用错误ffmpeg参数（含封面图）生成，文件膨胀3倍
+    # v2 加 -vn 跳过封面图，文件大小正确
+    tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}_v2.mp3"
+    tmp_part = TRANSCODE_CACHE_DIR / f"{file_hash}_v2.mp3.part"  # 转码中的临时文件
 
     # 快速路径：缓存命中（xxx.mp3 存在 = 转码完成，无需加锁）
     if os.path.isfile(tmp_path):
@@ -1920,7 +1935,9 @@ async def _ensure_transcode_cached(filepath: str) -> None:
             logger.info(f"[Transcode] 源文件时长: {src_duration:.1f}s, 预计 96k MP3 约 {int(src_duration * 96000 / 8)} 字节")
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error", "-i", filepath,
+            "-vn",  # 跳过视频流（FLAC封面图），否则封面图被编码进MP3导致文件膨胀3倍
             "-codec:a", "libmp3lame", "-b:a", "96k",
+            "-ar", "44100", "-ac", "2",
             "-f", "mp3", str(tmp_part),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1958,7 +1975,7 @@ async def api_music_transcode_status(song_index: int) -> JSONResponse:
         return JSONResponse({"code": 0, "data": {"status": "not_required"}})
 
     file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
-    tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
+    tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}_v2.mp3"
 
     # 缓存文件存在 = 已完成（即使状态字典被清理过）
     if os.path.isfile(tmp_path):
@@ -2007,7 +2024,7 @@ async def api_music_play(song_index: int, request: Request) -> Response:
         # 首次转码需5-8秒，但播放不会中断；后续缓存命中秒开。
         await _ensure_transcode_cached(filepath)
         file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
-        tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
+        tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}_v2.mp3"
 
         if not os.path.isfile(tmp_path):
             # 转码失败（_ensure_transcode_cached 已记录日志）

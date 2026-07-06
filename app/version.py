@@ -7,6 +7,23 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.67 - 修复转码文件膨胀3倍(封面图) + MediaWatcher误判窗口 + 压制循环请求积压:
+           问题1(白龙马先播小爱版): 压制循环每0.3秒发stop_all_media(6个UBus请求),
+                 每秒20个请求+2秒响应延迟=请求积压,stop无法及时到达音箱;
+                 修复1: _suppress_native_during_search改用轻量stop(只发1个UBus请求),
+                       避免请求积压,0.3秒间隔不变;
+           问题2(只播放小爱版/LET IT GO): mark_own_play的10秒窗口太短,
+                 转码5秒+音箱请求URL延迟14秒=19秒,超过窗口后MediaWatcher误判为原生播放;
+                 RECENT_QUERY_WINDOW_SEC=5秒也太短,query过期后MediaWatcher不拦截;
+                 修复2: OWN_PLAY_WINDOW_SEC从10秒增加到60秒,
+                       RECENT_QUERY_WINDOW_SEC从5秒增加到30秒;
+           问题3(停几秒再继续播放): 转码比特率293kbps(目标96k),文件11.4MB(预期3.9MB);
+                 根因: FLAC文件包含封面图(embedded artwork),ffmpeg默认把封面图
+                       编码进MP3的ID3标签(APIC frame),导致文件膨胀3倍;
+                 修复3: ffmpeg命令加-vn跳过视频流+封面图,
+                       加-ar 44100 -ac 2明确采样率和声道;
+                 缓存失效: 旧缓存文件名{hash}.mp3改为{hash}_v2.mp3,
+                       旧错误缓存不会被命中,会重新用正确参数转码;
   0.0.66 - 修复单曲循环进度条不归零 + 转码缓存清理索引 + 压制循环提速:
            问题5(循环播放第二遍进度条不归零): 单曲循环时current_index不变,
                  前端songChanged=false不重启进度轮询;pollProgressApi"只往前推不后退"
@@ -439,4 +456,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.66"
+__version__ = "0.0.67"

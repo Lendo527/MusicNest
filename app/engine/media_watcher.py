@@ -36,11 +36,12 @@ logger = logging.getLogger(__name__)
 # 默认轮询间隔（秒）— 200ms 平衡了响应速度和服务器压力
 DEFAULT_WATCH_INTERVAL = 0.2
 
-# "自己触发的播放"判定窗口（秒）— 10 秒（覆盖播放缓冲和切歌延迟，避免误判）
-OWN_PLAY_WINDOW_SEC = 10.0
+# "自己触发的播放"判定窗口（秒）— 60 秒
+# 覆盖转码5秒 + 音箱请求URL延迟14秒 + 播放启动缓冲，避免MediaWatcher误判自己的播放
+OWN_PLAY_WINDOW_SEC = 60.0
 
-# 反查对话记录的窗口（秒）
-RECENT_QUERY_WINDOW_SEC = 5.0
+# 反查对话记录的窗口（秒）— 扩大到 30 秒，覆盖转码+播放启动的全流程
+RECENT_QUERY_WINDOW_SEC = 30.0
 
 # 连续失败多少次后暂停 watcher
 MAX_CONSECUTIVE_FAILURES = 20
