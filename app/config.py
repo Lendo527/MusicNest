@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
     "auto_scan_interval": 0,
     "voice_engine_enabled": True,
     "auto_music_api": True,         # 自动根据设备型号选择播放 API（play_music_url vs play_url）
+    "online_only_voice": False,     # 语音指令只走在线播放（不播NAS，避免转码耗时）；web页面点播不受影响
     "debug_logging": True,          # 启用调试日志（输出到 /data/debug.log）
     "device_selections": {},  # deviceID -> bool: 勾选的设备才参与拦截和播放
     "voice_commands": [

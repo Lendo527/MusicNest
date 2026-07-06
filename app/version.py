@@ -7,6 +7,19 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.58 - 新增"只播放在线歌曲"开关 + web转码进度展示:
+           功能1(只播放在线歌曲):
+             config: 新增online_only_voice字段(默认False);
+             main: 语音指令play_song路径检查开关,开启时跳过本地搜索直接走在线;
+             说明: 仅影响语音指令,web页面点播不受影响,仍播NAS;
+             场景: 避免NAS转码耗时(首次5-6秒),语音指令全走在线秒开;
+           功能2(web转码进度展示):
+             main: _ensure_transcode_cached记录状态到_transcode_status字典;
+             main: 新增/api/music/transcode/status/{song_index}端点;
+             main: /api/player/play响应附加needs_transcode和transcode_real_index字段;
+             index.html: 播放器加转码状态元素(转码中...Xs);
+             index.html: playSong/playSongByList播放后启动轮询,1秒一次;
+             index.html: 转码完成/失败/无需转码时停止轮询;
   0.0.57 - 修复本地播放416中断+小爱版接管,转码降到128k:
            根因: play命令发出后音箱立即请求URL,但此时转码尚未完成,
                  音箱得到HTTP 416 Range Not Satisfiable,反复重试8秒直到转码完成;
@@ -319,4 +332,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.57"
+__version__ = "0.0.58"

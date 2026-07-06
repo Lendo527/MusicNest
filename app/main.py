@@ -644,7 +644,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 stop_task = _create_background_task(miot_client.stop_all_media(device_id), "stop_all_media")
 
             song_name = result.argument or query
-            local_results = scanner.search(song_name)
+            # online_only_voice 开关：语音指令只走在线播放（避免NAS转码耗时），web页面点播不受影响
+            online_only_voice = config.get("online_only_voice", False)
+            local_results = [] if online_only_voice else scanner.search(song_name)
+            if online_only_voice:
+                logger.info(f"[VoiceCmd] online_only_voice 已开启，跳过本地搜索直接走在线: {song_name}")
 
             if local_results:
                 # 本地命中：等 stop_all_media 完成，确保 stop 命令在 play 之前到达音箱
@@ -1666,6 +1670,8 @@ async def api_music_songs(limit: int = 500, offset: int = 0) -> dict:
 TRANSCODE_CACHE_DIR = Path("/tmp/musicnest_transcode")
 TRANSCODE_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1GB
 _transcode_locks: dict[str, asyncio.Lock] = {}  # per-file 转码锁，防止并发转码同一文件
+# 转码状态追踪: file_hash -> {"status": "transcoding"|"done"|"failed", "started_at": float, "completed_at": float, "filepath": str}
+_transcode_status: dict[str, dict] = {}
 
 
 async def _cleanup_transcode_cache() -> None:
@@ -1712,6 +1718,7 @@ async def _ensure_transcode_cached(filepath: str) -> None:
     if os.path.isfile(tmp_path):
         with contextlib.suppress(OSError):
             os.utime(tmp_path, None)
+        _transcode_status[file_hash] = {"status": "done", "filepath": filepath, "started_at": 0, "completed_at": os.path.getmtime(tmp_path)}
         logger.debug(f"[Transcode] 缓存命中: {tmp_path}")
         return
 
@@ -1723,11 +1730,13 @@ async def _ensure_transcode_cached(filepath: str) -> None:
         if os.path.isfile(tmp_path):
             with contextlib.suppress(OSError):
                 os.utime(tmp_path, None)
+            _transcode_status[file_hash] = {"status": "done", "filepath": filepath, "started_at": 0, "completed_at": os.path.getmtime(tmp_path)}
             logger.debug(f"[Transcode] 缓存命中(锁内): {tmp_path}")
             return
 
         # 预转码整个文件并等待完成
         logger.info(f"[Transcode] 预转码开始: {filepath}")
+        _transcode_status[file_hash] = {"status": "transcoding", "filepath": filepath, "started_at": time.time(), "completed_at": 0}
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error", "-i", filepath,
             "-codec:a", "libmp3lame", "-b:a", "128k",
@@ -1741,10 +1750,46 @@ async def _ensure_transcode_cached(filepath: str) -> None:
             logger.warning(f"[Transcode] 预转码失败 code={proc.returncode} stderr={stderr_text}")
             with contextlib.suppress(FileNotFoundError):
                 os.remove(tmp_path)
+            _transcode_status[file_hash] = {"status": "failed", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
             return
         logger.info(f"[Transcode] 预转码完成: {tmp_path} size={os.path.getsize(tmp_path)}")
+        _transcode_status[file_hash] = {"status": "done", "filepath": filepath, "started_at": _transcode_status[file_hash].get("started_at", 0), "completed_at": time.time()}
         # 写入新缓存后清理超额（fire-and-forget）
         _create_background_task(_cleanup_transcode_cache(), "cleanup_transcode")
+
+
+@app.get("/api/music/transcode/status/{song_index}")
+async def api_music_transcode_status(song_index: int) -> JSONResponse:
+    """查询指定歌曲的转码状态（供前端展示转码进度）"""
+    songs = scanner.get_songs(limit=1, offset=song_index)
+    if not songs:
+        return JSONResponse({"code": 1, "msg": "歌曲不存在"}, status_code=404)
+    filepath = songs[0].get("filepath", "")
+
+    # 不需要转码的文件直接返回 not_required
+    if filepath.lower().endswith('.mp3'):
+        return JSONResponse({"code": 0, "data": {"status": "not_required"}})
+
+    file_hash = hashlib.md5(filepath.encode()).hexdigest()[:16]
+    tmp_path = TRANSCODE_CACHE_DIR / f"{file_hash}.mp3"
+
+    # 缓存文件存在 = 已完成（即使状态字典被清理过）
+    if os.path.isfile(tmp_path):
+        return JSONResponse({"code": 0, "data": {
+            "status": "done",
+            "size": os.path.getsize(tmp_path),
+        }})
+
+    # 查状态字典
+    st = _transcode_status.get(file_hash)
+    if st:
+        return JSONResponse({"code": 0, "data": {
+            "status": st["status"],
+            "elapsed": time.time() - st.get("started_at", 0) if st["status"] == "transcoding" else 0,
+        }})
+
+    # 未开始
+    return JSONResponse({"code": 0, "data": {"status": "not_started"}})
 
 
 @app.get("/api/music/play/{song_index}")
@@ -2481,7 +2526,20 @@ async def api_player_play(body: dict) -> dict:
     ok = await _play_on_device(play_state.device_id, song_index)
     if ok:
         play_state.is_playing = True
-        return {"code": 0, "data": play_state.get_state_dict()}
+        state = play_state.get_state_dict()
+        # 附加转码信息供前端展示进度
+        try:
+            cur_song = play_state.current_song() or {}
+            fp = cur_song.get("filepath", "")
+            real_idx = scanner.get_index_by_filepath(fp)
+            if real_idx is not None and fp and not fp.lower().endswith('.mp3'):
+                state["transcode_real_index"] = real_idx
+                state["needs_transcode"] = True
+            else:
+                state["needs_transcode"] = False
+        except Exception:
+            state["needs_transcode"] = False
+        return {"code": 0, "data": state}
     else:
         play_state.stop_playing()
         return {"code": 1, "msg": "播放指令发送失败"}

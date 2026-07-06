@@ -921,6 +921,13 @@
                         <span style="font-size:11px;color:#c8ccd4;margin-left:8px;">输出详细日志到 /data/debug.log，排查问题时开启</span>
                     </label>
                 </div>
+                <div class="form-check form-switch mb-3">
+                    <input class="form-check-input" type="checkbox" role="switch" id="cfgOnlineOnlyVoice" onchange="onConfigFieldChanged()">
+                    <label class="form-check-label" for="cfgOnlineOnlyVoice">
+                        只播放在线歌曲
+                        <span style="font-size:11px;color:#c8ccd4;margin-left:8px;">语音指令全走在线播放（不播NAS，避免转码耗时）；web页面点播不受影响</span>
+                    </label>
+                </div>
                 <hr style="border-color:var(--border-color);">
                 <h6 class="text-white mb-2">音源绑定</h6>
                 <div class="mb-3">
@@ -1191,6 +1198,10 @@
           <div class="player-song-info">
             <div class="player-song-name" id="playerSongName">未播放</div>
             <div class="player-song-artist small" id="playerSongArtist" style="color:#9ca3b0;">-</div>
+            <div id="playerTranscodeStatus" class="small" style="color:#ffc107;display:none;">
+              <span class="spinner-border spinner-border-sm" role="status" style="width:0.7rem;height:0.7rem;margin-right:4px;"></span>
+              <span id="playerTranscodeText">转码中...</span>
+            </div>
           </div>
         </div>
       </div>
@@ -2044,6 +2055,12 @@ async function playSong(index) {
             // 显示底部播放器
             updatePlayerUI(r.data);
             document.getElementById('bottomPlayer').classList.remove('d-none');
+            // 转码进度展示
+            if (r.data.needs_transcode && r.data.transcode_real_index !== undefined) {
+                startTranscodePolling(r.data.transcode_real_index);
+            } else {
+                stopTranscodePolling();
+            }
         } else {
             alert('播放失败: ' + (r.msg || '未知错误'));
         }
@@ -2534,6 +2551,7 @@ function takeConfigSnapshot() {
         monitorEnabled: document.getElementById('cfgMonitorEnabled').checked,
         voiceEnabled: document.getElementById('cfgVoiceEnabled').checked,
         debugLogging: document.getElementById('cfgDebugLogging').checked,
+        onlineOnlyVoice: document.getElementById('cfgOnlineOnlyVoice').checked,
         neteaseCookie: document.getElementById('cfgNeteaseCookie').value,
         flacPriority: document.getElementById('cfgFlacPriority').checked,
     };
@@ -2552,6 +2570,7 @@ function checkConfigChanged() {
         monitorEnabled: document.getElementById('cfgMonitorEnabled').checked,
         voiceEnabled: document.getElementById('cfgVoiceEnabled').checked,
         debugLogging: document.getElementById('cfgDebugLogging').checked,
+        onlineOnlyVoice: document.getElementById('cfgOnlineOnlyVoice').checked,
         neteaseCookie: document.getElementById('cfgNeteaseCookie').value,
         flacPriority: document.getElementById('cfgFlacPriority').checked,
     };
@@ -2563,6 +2582,7 @@ function checkConfigChanged() {
         || cur.monitorEnabled !== snap.monitorEnabled
         || cur.voiceEnabled !== snap.voiceEnabled
         || cur.debugLogging !== snap.debugLogging
+        || cur.onlineOnlyVoice !== snap.onlineOnlyVoice
         || cur.neteaseCookie !== snap.neteaseCookie
         || cur.flacPriority !== snap.flacPriority;
     document.getElementById('btnSaveConfig').disabled = !changed;
@@ -3300,12 +3320,62 @@ async function playSongByList(songs, startIndex) {
         if (r.code === 0) {
             updatePlayerUI(r.data);
             document.getElementById('bottomPlayer').classList.remove('d-none');
+            // 转码进度展示
+            if (r.data.needs_transcode && r.data.transcode_real_index !== undefined) {
+                startTranscodePolling(r.data.transcode_real_index);
+            } else {
+                stopTranscodePolling();
+            }
         } else {
             alert('播放失败: ' + (r.msg || '未知错误'));
         }
     } catch (e) {
         alert('播放出错: ' + e.message);
     }
+}
+
+// ===== 转码进度轮询 =====
+let _transcodePollTimer = null;
+let _transcodePollStart = 0;
+
+function startTranscodePolling(realIndex) {
+    stopTranscodePolling();
+    _transcodePollStart = Date.now();
+    const el = document.getElementById('playerTranscodeStatus');
+    const txt = document.getElementById('playerTranscodeText');
+    if (el) el.style.display = '';
+    if (txt) txt.textContent = '转码中...';
+
+    const poll = async () => {
+        try {
+            const r = await api(`/api/music/transcode/status/${realIndex}`);
+            if (!r || r.code !== 0) return;
+            const status = r.data && r.data.status;
+            if (status === 'done' || status === 'not_required') {
+                stopTranscodePolling();
+                return;
+            }
+            if (status === 'failed') {
+                if (txt) txt.textContent = '转码失败';
+                stopTranscodePolling();
+                return;
+            }
+            // transcoding / not_started：更新已耗时
+            const elapsed = r.data && r.data.elapsed ? Math.round(r.data.elapsed) : Math.round((Date.now() - _transcodePollStart) / 1000);
+            if (txt) txt.textContent = `转码中... ${elapsed}s`;
+        } catch (e) { /* ignore */ }
+    };
+    poll(); // 立即查一次
+    _transcodePollTimer = setInterval(poll, 1000);
+}
+
+function stopTranscodePolling() {
+    if (_transcodePollTimer) {
+        clearInterval(_transcodePollTimer);
+        _transcodePollTimer = null;
+    }
+    const el = document.getElementById('playerTranscodeStatus');
+    if (el) el.style.display = 'none';
 }
 
 async function playPlaylistSongs(playlistId) {
@@ -4017,6 +4087,7 @@ loadConfig = async function() {
     document.getElementById('cfgMonitorEnabled').checked = cfg.conversation_monitor_enabled || false;
     document.getElementById('cfgVoiceEnabled').checked = cfg.voice_engine_enabled !== false;
     document.getElementById('cfgDebugLogging').checked = cfg.debug_logging !== false;
+    document.getElementById('cfgOnlineOnlyVoice').checked = cfg.online_only_voice === true;
     // 新增字段
     if (document.getElementById('cfgFlacPriority')) {
         document.getElementById('cfgFlacPriority').checked = (cfg.download && cfg.download.flac_priority !== false);
@@ -4038,6 +4109,7 @@ saveConfig = async function() {
         conversation_monitor_enabled: document.getElementById('cfgMonitorEnabled').checked,
         voice_engine_enabled: document.getElementById('cfgVoiceEnabled').checked,
         debug_logging: document.getElementById('cfgDebugLogging').checked,
+        online_only_voice: document.getElementById('cfgOnlineOnlyVoice').checked,
     };
     // 新增字段
     if (document.getElementById('cfgFlacPriority')) {
