@@ -40,7 +40,7 @@ class SearchResult:
             "artist_id": self.artist_id,
             "album_id": self.album_id,
             "formats": [
-                {"name": f.name, "bitrate": f.bitrate, "type": f.type}
+                {"name": f.name, "bitrate": f.bitrate, "type": f.type, "url": f.url}
                 for f in self.formats
             ],
         }

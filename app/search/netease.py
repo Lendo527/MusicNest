@@ -1,6 +1,7 @@
 """网易云音乐搜索 - 通过第三方网关 POST JSON 模式（sqmusic 风格）"""
 
 import logging
+import re
 import time
 from typing import Optional, List
 
@@ -54,8 +55,7 @@ async def _netease_request(
         for base_url in urls_to_try:
             url = f"{base_url}{endpoint}"
             # 加时间戳到 URL 防网关缓存（Post JSON body 不会影响缓存 key）
-            import time as _tz
-            url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(_tz.time() * 1000))
+            url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(time.time() * 1000))
             try:
                 resp = await client.post(url, json=params, headers=headers)
                 resp.raise_for_status()
@@ -109,9 +109,7 @@ def _build_quality_formats(song: dict) -> List[MusicFormat]:
     if isinstance(hr, dict) and hr.get("size", 0) > 0:
         formats.append(MusicFormat(name="Hi-Res FLAC", bitrate=3000, type="flac"))
 
-    # 如果没有任何音质字段，至少保留一个 128K 兜底
-    if not formats:
-        formats.append(MusicFormat(name="128K", bitrate=128, type="mp3"))
+    # 全空时返回空列表，不强行兜底 128K（避免掩盖真实问题）
 
     # 按 bitrate 降序排列（高音质在前）
     formats.sort(key=lambda f: f.bitrate, reverse=True)
@@ -135,8 +133,12 @@ def _parse_song(song: dict, source: str = "netease") -> Optional[SearchResult]:
     if ar and isinstance(ar, list):
         artists = [a.get("name", "") for a in ar if isinstance(a, dict) and a.get("name")]
         artist_name = "/".join(artists) if artists else "未知歌手"
-        # 提取第一个歌手的 ID
-        artist_id = str(ar[0].get("id", "")) if ar and isinstance(ar[0], dict) else ""
+        # 提取第一个同时有 name 和 id 的歌手 ID（避免越界风险）
+        artist_id = ""
+        for a in ar:
+            if isinstance(a, dict) and a.get("name") and a.get("id"):
+                artist_id = str(a.get("id"))
+                break
     else:
         artist_name = "未知歌手"
         artist_id = ""
@@ -149,11 +151,14 @@ def _parse_song(song: dict, source: str = "netease") -> Optional[SearchResult]:
 
     # 时长: dt 是毫秒，转秒
     dt = song.get("dt", 0)
-    if dt:
-        duration = int(dt) // 1000
-    else:
-        # fallback: 兼容 duration 字段（也是毫秒）
-        duration = int(song.get("duration", 0)) // 1000
+    try:
+        if dt:
+            duration = int(dt) // 1000
+        else:
+            # fallback: 兼容 duration 字段（也是毫秒）
+            duration = int(song.get("duration", 0)) // 1000
+    except (TypeError, ValueError):
+        duration = 0
 
     formats = _build_quality_formats(song)
 
@@ -198,53 +203,41 @@ async def search(
     # 映射 search_type 到 type 参数
     type_map = {"music": 1, "artist": 100, "album": 10}
     stype = type_map.get(search_type, 1)
-    # 逐个网关尝试，直到返回的结果匹配关键词
-    import time as _time
 
-    res_data = None
-    for base_url in NETEASE_API_BASE_URLS:
-        result = await _netease_request(
-            "/cloudsearch",
-            params={
-                "keywords": keyword,
-                "limit": limit,
-                "type": stype,
-                "offset": 0,
-                "timestamp": int(_time.time() * 1000),
-            },
-            cookie=cookie,
-            timeout=timeout,
-            base_url_override=base_url,
-        )
+    # 调一次 _netease_request，由其内部遍历所有网关（避免 N² 复杂度）
+    result = await _netease_request(
+        "/cloudsearch",
+        params={
+            "keywords": keyword,
+            "limit": limit,
+            "type": stype,
+            "offset": 0,
+            "timestamp": int(time.time() * 1000),
+        },
+        cookie=cookie,
+        timeout=timeout,
+    )
 
-        if result.get("code") == 200:
-            res_data = result.get("result", {})
-            songs = res_data.get("songs", []) if search_type == "music" else []
-            artists = res_data.get("artists", []) if search_type == "artist" else []
-            albums = res_data.get("albums", []) if search_type == "album" else []
-
-            # 各类型的结果列表
-            type_results = {"music": songs, "artist": artists, "album": albums}
-            current_results = type_results.get(search_type, [])
-
-            # 0 结果时继续尝试下一个网关（而非直接 break）
-            if not current_results:
-                logger.debug("[Netease] 网关 %s 返回 0 条 %s 结果，尝试下一个",
-                             base_url, search_type)
-                res_data = None
-                continue
-
-            logger.info("[Netease] 搜索 '%s' → %s 返回 %d 条, 首条: %s",
-                         keyword, base_url, len(current_results),
-                         current_results[0].get("name", "?") if current_results else "(无)")
-            break  # 找到有效结果，跳出循环
-    else:
-        # 所有网关都失败或无匹配结果
-        logger.warning("[Netease] 所有网关搜索 '%s' 均失败或无匹配结果", keyword)
+    if result.get("code") != 200:
+        logger.warning("[Netease] 搜索 '%s' 失败: %s", keyword, result.get("msg", "未知错误"))
         return []
 
-    if not res_data:
+    res_data = result.get("result", {})
+    songs = res_data.get("songs", []) if search_type == "music" else []
+    artists = res_data.get("artists", []) if search_type == "artist" else []
+    albums = res_data.get("albums", []) if search_type == "album" else []
+
+    # 各类型的结果列表
+    type_results = {"music": songs, "artist": artists, "album": albums}
+    current_results = type_results.get(search_type, [])
+
+    if not current_results:
+        logger.debug("[Netease] 搜索 '%s' 返回 0 条 %s 结果", keyword, search_type)
         return []
+
+    logger.info("[Netease] 搜索 '%s' 返回 %d 条, 首条: %s",
+                 keyword, len(current_results),
+                 current_results[0].get("name", "?") if current_results else "(无)")
 
     # 根据搜索类型解析不同字段
     if search_type == "artist":
@@ -490,7 +483,6 @@ async def get_lyrics(song_id: str, cookie: str = "", timeout: float = 10.0) -> s
     Returns:
         LRC 格式歌词字符串，失败返回空字符串
     """
-    import re
     try:
         result = await _netease_request(
             "/lyric",
@@ -606,52 +598,8 @@ async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
             except Exception as e:
                 logger.debug("[Netease] %s %s 失败: %s", base_url, endpoint, e)
 
-    # 阶段 2：试搜索验证（部分网关搜索不校验 cookie，但至少证明网关可达）
-    logger.info("[Netease] 端点验证均失败，尝试搜索验证...")
-    try:
-        for base_url in NETEASE_API_BASE_URLS:
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    url = f"{base_url}/cloudsearch"
-                    headers = {"Content-Type": "application/json; charset=utf-8", "Cookie": cookie}
-                    resp = await client.post(url, json={"keywords": "test", "limit": 1, "type": 1, "offset": 0}, headers=headers)
-                    data = resp.json()
-                    if data.get("code") == 200:
-                        songs = data.get("result", {}).get("songs")
-                        if songs:
-                            logger.info("[Netease] 搜索验证通过 (%s): 返回 %d 条", base_url, len(songs))
-                            return True
-                        logger.debug("[Netease] %s 搜索返回 200 但无 songs: %s", base_url, str(data)[:200])
-                    else:
-                        logger.debug("[Netease] %s 搜索返回 code=%s", base_url, data.get("code"))
-            except Exception as e:
-                logger.debug("[Netease] %s 搜索失败: %s", base_url, e)
-    except Exception as e:
-        logger.debug("[Netease] 搜索验证阶段异常: %s", e)
-
-    # 阶段 3：作为最后手段，尝试获取一首歌的下载链接（需要 cookie）
-    logger.info("[Netease] 搜索验证未通过，尝试下载验证...")
-    try:
-        for base_url in NETEASE_API_BASE_URLS:
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    url = f"{base_url}/song/url"
-                    headers = {"Content-Type": "application/json; charset=utf-8", "Cookie": cookie}
-                    # 用一个大数字 ID 测试（童话镇 - 陈一发儿）
-                    resp = await client.post(url, json={"id": 445548278, "br": 320000}, headers=headers)
-                    data = resp.json()
-                    if data.get("code") == 200:
-                        song_url = data.get("data", {}).get("url") if isinstance(data.get("data"), dict) else None
-                        if song_url:
-                            logger.info("[Netease] 下载验证通过 (%s): 有 URL", base_url)
-                            return True
-                        logger.debug("[Netease] %s 下载返回 200 但无 URL", base_url)
-                    else:
-                        logger.debug("[Netease] %s 下载返回 code=%s", base_url, data.get("code"))
-            except Exception as e:
-                logger.debug("[Netease] %s 下载验证失败: %s", base_url, e)
-    except Exception as e:
-        logger.debug("[Netease] 下载验证阶段异常: %s", e)
+    # 只保留阶段 1（/user/account 等端点验证）；
+    # 搜索/下载验证已删除：部分网关搜索不校验 cookie，会误判无效 Cookie 为有效
 
     logger.warning("[Netease] 所有验证方式均失败，Cookie 无效或网关不可达")
     return False
@@ -736,8 +684,7 @@ async def get_artist_detail(
         )
 
         if albums_result.get("code") == 200:
-            hot_albums = albums_result.get("hotAlbums", [])
-            albums_data = albums_result.get("albums", hot_albums)
+            albums_data = albums_result.get("hotAlbums") or albums_result.get("albums") or []
             for alb in albums_data[:20]:
                 alb_id = str(alb.get("id", ""))
                 alb_name = (alb.get("name") or "").strip()

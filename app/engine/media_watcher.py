@@ -36,15 +36,18 @@ logger = logging.getLogger(__name__)
 # 默认轮询间隔（秒）— 200ms 平衡了响应速度和服务器压力
 DEFAULT_WATCH_INTERVAL = 0.2
 
-# "自己触发的播放"判定窗口（秒）— 60 秒
-# 覆盖转码5秒 + 音箱请求URL延迟14秒 + 播放启动缓冲，避免MediaWatcher误判自己的播放
-OWN_PLAY_WINDOW_SEC = 60.0
+# "自己触发的播放"判定窗口（秒）— 30 秒
+# 覆盖转码5秒 + 音箱请求URL延迟14秒 + 播放启动缓冲10秒，避免MediaWatcher误判自己的播放
+OWN_PLAY_WINDOW_SEC = 30.0
 
 # 反查对话记录的窗口（秒）— 扩大到 30 秒，覆盖转码+播放启动的全流程
 RECENT_QUERY_WINDOW_SEC = 30.0
 
 # 连续失败多少次后暂停 watcher
 MAX_CONSECUTIVE_FAILURES = 20
+
+# 连续失败暂停后的冷却时间（秒）— 冷却结束后重置计数器重试
+FAILURE_COOLDOWN_SEC = 60.0
 
 # 拦截冷却时间（秒）— 防止短时间内重复触发
 INTERCEPT_COOLDOWN_SEC = 5.0
@@ -96,8 +99,11 @@ class MediaWatcher:
         # 连续失败计数（用于自动暂停）
         self._consecutive_failures: dict[str, int] = {}
 
-        # 首轮预热标志（首次读取只记录状态，不触发拦截）
-        self._first_poll = True
+        # 连续失败暂停时间戳（用于冷却后重试）
+        self._paused_at: dict[str, float] = {}
+
+        # 首轮预热标志（per-device：首次读取只记录状态，不触发拦截）
+        self._device_initialized: dict[str, bool] = {}
 
     @property
     def is_running(self) -> bool:
@@ -120,8 +126,6 @@ class MediaWatcher:
         if self._enabled:
             return
 
-        self._first_poll = True  # 首轮预热
-
         from app.config import config as app_config
         selections: dict = app_config.get("device_selections", {})
 
@@ -133,6 +137,8 @@ class MediaWatcher:
             self._last_status[did] = 0
             self._device_selected[did] = bool(selections.get(did, False))
             self._consecutive_failures[did] = 0
+            self._paused_at[did] = 0.0
+            self._device_initialized[did] = False
 
         enabled_count = sum(1 for v in self._device_selected.values() if v)
         if enabled_count == 0:
@@ -170,12 +176,15 @@ class MediaWatcher:
 
     async def _watch_loop(self) -> None:
         """主循环"""
+        backoff = self._poll_interval
         while self._enabled:
             try:
                 await self._watch_all_devices()
+                backoff = self._poll_interval
             except Exception as e:
                 logger.warning(f"[MediaWatcher] _watch_all_devices 异常: {e}", exc_info=True)
-            await asyncio.sleep(self._poll_interval)
+                backoff = min(backoff * 2, 5.0)
+            await asyncio.sleep(backoff)
 
     async def _watch_all_devices(self) -> None:
         """轮询所有勾选设备的状态"""
@@ -188,21 +197,29 @@ class MediaWatcher:
             *[self._watch_device(did) for did in selected_ids],
             return_exceptions=True
         )
-        # 首轮预热完成
-        if self._first_poll:
-            self._first_poll = False
 
     async def _watch_device(self, device_id: str) -> None:
         """监控单个设备的状态变化"""
         # 失败次数过多，暂停该设备监控一段时间
         if self._consecutive_failures.get(device_id, 0) >= MAX_CONSECUTIVE_FAILURES:
-            return
+            # 冷却结束后重置计数器重试
+            paused_at = self._paused_at.get(device_id, 0)
+            if paused_at > 0 and time.time() - paused_at >= FAILURE_COOLDOWN_SEC:
+                logger.info(
+                    "[MediaWatcher] 设备 %s 冷却完成，重置失败计数器重试",
+                    device_id[:12]
+                )
+                self._consecutive_failures[device_id] = 0
+                self._paused_at[device_id] = 0.0
+            else:
+                return
 
         try:
             raw = await self._client.get_player_status(device_id)
         except Exception as e:
             self._consecutive_failures[device_id] = self._consecutive_failures.get(device_id, 0) + 1
             if self._consecutive_failures[device_id] == MAX_CONSECUTIVE_FAILURES:
+                self._paused_at[device_id] = time.time()
                 logger.error(
                     "[MediaWatcher] 设备 %s 连续失败 %d 次，暂停监控",
                     device_id[:12], MAX_CONSECUTIVE_FAILURES
@@ -222,7 +239,8 @@ class MediaWatcher:
         self._last_status[device_id] = current_status
 
         # 首轮预热：只记录状态，不触发事件（避免对正在播放的设备触发误拦截）
-        if self._first_poll:
+        if not self._device_initialized.get(device_id, False):
+            self._device_initialized[device_id] = True
             return
 
         # 检测 status: 0→1 跳变
@@ -245,6 +263,7 @@ class MediaWatcher:
         if self._client.is_own_play_recent(device_id, OWN_PLAY_WINDOW_SEC):
             # 自己触发的播放，不干预
             self._device_states[device_id] = DevicePlayState.OWN_PLAYING
+            self._last_intercept_at[device_id] = now
             logger.debug(
                 "[MediaWatcher] 设备 %s 自己触发的播放，不干预",
                 device_id[:12]
@@ -273,7 +292,7 @@ class MediaWatcher:
             return
 
         # 2. 检查是否已被轨道1 处理过
-        if self._monitor.is_query_handled(device_id, recent_query):
+        if self._monitor.is_query_handled(device_id, recent_query, within_sec=RECENT_QUERY_WINDOW_SEC):
             logger.info(
                 "[MediaWatcher] 设备 %s 原生播放，但 query %r 已被轨道1处理，跳过",
                 device_id[:12], recent_query[:40]

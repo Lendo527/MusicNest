@@ -140,6 +140,8 @@ class PlaylistManager:
 
     async def stop(self) -> None:
         """停止播放."""
+        if self._state == PlayState.STOPPED:
+            return True
         self._stop_auto_next()
         self._clear_voice_suspend()
         self._state = PlayState.STOPPED
@@ -166,7 +168,7 @@ class PlaylistManager:
 
     async def resume(self) -> bool:
         """恢复播放 (使用 play 命令, 不重发 URL)."""
-        if self._state not in (PlayState.PLAYING, PlayState.PAUSED) or not self._songs:
+        if self._state != PlayState.PAUSED or not self._songs:
             return False
 
         self._stop_auto_next()
@@ -443,11 +445,12 @@ class PlaylistManager:
             await asyncio.sleep(delay_seconds)
             await self._on_song_finished()
         except asyncio.CancelledError:
+            self._auto_next_task = None
             pass  # 正常取消
         except Exception as e:
             logger.error(f"PlaylistManager: _auto_next_after error: {e}", exc_info=True)
-            # 不要让播放卡死，转 STOPPED 状态
-            self._state = PlayState.STOPPED
+            # 异常路径调用 stop 同步设备状态
+            await self.stop()
             self._auto_next_task = None
 
     async def _on_song_finished(self) -> None:
@@ -467,8 +470,7 @@ class PlaylistManager:
         ok = await self._play_current()
         if not ok:
             logger.error("PlaylistManager: Auto-next failed, stopping")
-            self._state = PlayState.STOPPED
-            self._play_start_time = 0.0
+            await self.stop()
 
     # ===== 内部方法: 索引计算 =====
 

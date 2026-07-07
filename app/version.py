@@ -7,6 +7,62 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.68 - 全代码库深度审阅修复(CRITICAL 7 + HIGH 15 + MEDIUM 30 + LOW 30):
+           main.py:
+             C1 play_state加asyncio.Lock防并发竞态(播放列表大BUG根因);
+             C2 压制循环孤儿stop任务用gather等待全部完成(先播小爱版根因);
+             C3 set_play_mode的argument.strip()对None崩溃(循环播放不切换根因);
+             C4 ffmpeg/ffprobe子进程异常时kill防孤儿;
+             C5 _play_on_device优先用song_index取歌;
+             C6 _create_background_task加强引用防GC;
+             C7 _pause_elapsed切歌后重置;
+             C8 _transcode_locks字典清理;
+             C9 mark_query_handled提前调用防重复拦截;
+             C10 artist_cover/album_cover路径遍历校验;
+             C11 _transcode_status跨await用get防KeyError;
+             C12 闹钟用局部变量不覆盖device_id;
+             M1-M6 SHUFFLE上一首/循环检测/日志/LRU/stem.replace/字段语义;
+           engine:
+             C1 OWN_PLAY_WINDOW_SEC从60降到30(只播放小爱版根因);
+             H1 is_query_handled窗口对齐30秒;
+             H2 _watch_loop异常退避防刷屏;
+             M1 连续失败60秒冷却后恢复;
+             M2 per-device预热标志;
+             player异常时await stop()同步设备;
+             voice create_alarm优先级+idx优先匹配;
+           miot:
+             C1 token_refresh并发刷新加Lock+入口占位(passToken风控根因);
+             C2 UBus code!=0添加warning日志;
+             C3 mark_own_play清理过期项+空device_id返回False;
+             C4 exchange_token清空cookie jar;
+             C5 auth添加set_device_id方法;
+             H1-H6 节流重试/异常日志/连接池/success_count/json解析;
+           search:
+             C1 kuwo N_MINFO字段名修复(搜索延迟根因);
+             C2 _parse_nminfo支持=分隔符+APE/192K映射;
+             C3 netease搜索去掉双重遍历(搜索卡17分钟根因);
+             C4 verify_cookie删除误判阶段2/3;
+             H1-H6 close_client锁/duration解析/封面URL抽取/search_all超时;
+           scanner+config:
+             C1 config deepcopy防DEFAULT_CONFIG污染;
+             H1 scan与remove竞态修复(已删除歌曲复活根因);
+             H2 set/update深拷贝入参;
+             M1-M4 返回deepcopy/路径校验/缓存一致性/tmp唯一文件名;
+             新增reload_cache()供worker刷新;
+           worker+tracker:
+             C1 下载原子写入+阈值按格式;
+             C2 stale reset周期调用+60分钟阈值;
+             H1 删除fallback到results[0](下载错歌根因);
+             H2 ID3标记文件防永久跳过;
+             H3 set_scanner_ref共享scanner实例(重复下载根因);
+             H4-H6 add_task回查/RLock/DB迁移;
+           前端:
+             H1 进度条拖动去抖(只在释放时seek);
+             H2 音量滑块去抖;
+             H3 播放列表签名含歌曲内容(等长替换不刷新根因);
+             H4 random模式图标映射;
+             M1-M7 转码超时/切歌停止轮询/scrollIntoView优化/duration=0/暂停不重置/双重渲染;
+             L1-L5 onclick转义/closeMenu清理/播放防抖/变量重命名;
   0.0.67 - 修复转码文件膨胀3倍(封面图) + MediaWatcher误判窗口 + 压制循环请求积压:
            问题1(白龙马先播小爱版): 压制循环每0.3秒发stop_all_media(6个UBus请求),
                  每秒20个请求+2秒响应延迟=请求积压,stop无法及时到达音箱;
@@ -456,4 +512,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.67"
+__version__ = "0.0.68"

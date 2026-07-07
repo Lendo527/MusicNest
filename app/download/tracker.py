@@ -1,5 +1,6 @@
 """SQLite 数据库操作 - 下载队列 + 歌单同步记录"""
 
+import atexit
 import logging
 import os
 import sqlite3
@@ -11,7 +12,8 @@ from dataclasses import dataclass, field
 
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/musicnest.db"))
 
-_lock = threading.Lock()
+# RLock 可重入；WAL 模式下读不阻塞写，因此读函数不再持锁，仅写函数持锁
+_lock = threading.RLock()
 
 # 线程局部连接：每个线程复用同一个 sqlite 连接，避免频繁 open/close
 _thread_local = threading.local()
@@ -28,6 +30,20 @@ def _get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA busy_timeout=5000")
         _thread_local.conn = conn
     return conn
+
+
+def _close_thread_local_conn() -> None:
+    """关闭当前线程的局部数据库连接（atexit 注册，进程退出时调用）"""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _thread_local.conn = None
+
+
+atexit.register(_close_thread_local_conn)
 
 
 def init_db():
@@ -86,6 +102,16 @@ def init_db():
                 )
             """)
 
+            # ==== 数据库迁移：基于 PRAGMA user_version 的递进式升级 ====
+            # 当前 schema 版本：1。未来新增列时递增并在此追加 ALTER TABLE。
+            current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current_version < 1:
+                # 版本 1：初始迁移点（表结构已由上方 CREATE TABLE IF NOT EXISTS 建立）
+                # 示例（未来加列时）：
+                #   if current_version < 2:
+                #       conn.execute("ALTER TABLE download_queue ADD COLUMN new_col TEXT DEFAULT ''")
+                conn.execute("PRAGMA user_version = 1")
+
             conn.commit()
         finally:
             pass  # 线程局部连接复用，不主动关闭
@@ -142,32 +168,18 @@ def add_task(
     with _lock:
         conn = _get_conn()
         try:
-            cursor = conn.execute(
+            conn.execute(
                 """INSERT INTO download_queue
                    (task_id, source, music_id, title, artist, album, cover_url, format_type, status, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)
                    ON CONFLICT(task_id) DO UPDATE SET
-                   status='waiting', error_msg=NULL, file_path='', updated_at=excluded.updated_at
+                   status='waiting', error_msg='', file_path='', updated_at=excluded.updated_at
                    WHERE download_queue.status IN ('error', 'loading')""",
                 (task_id, source, music_id, title, artist, album, cover_url, format_type, now, now),
             )
             conn.commit()
-            if cursor.rowcount > 0:
-                return DownloadTask(
-                    id=cursor.lastrowid,
-                    task_id=task_id,
-                    source=source,
-                    music_id=music_id,
-                    title=title,
-                    artist=artist,
-                    album=album,
-                    cover_url=cover_url,
-                    format_type=format_type,
-                    status="waiting",
-                    created_at=now,
-                    updated_at=now,
-                )
-            # 已存在，返回已有记录
+            # 统一通过回查构造返回值，避免 ON CONFLICT 触发 UPDATE 时
+            # lastrowid 不指向当前行导致的 id 不正确问题
             row = conn.execute(
                 "SELECT * FROM download_queue WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -180,16 +192,16 @@ def add_task(
 
 def get_waiting_tasks(limit: int = 2) -> List[DownloadTask]:
     """获取等待中的下载任务"""
-    with _lock:
-        conn = _get_conn()
-        try:
-            rows = conn.execute(
-                "SELECT * FROM download_queue WHERE status = 'waiting' ORDER BY created_at ASC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [DownloadTask(**dict(r)) for r in rows]
-        finally:
-            pass  # 线程局部连接复用，不主动关闭
+    # 读操作：WAL 模式下读不阻塞写，无需持锁
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM download_queue WHERE status = 'waiting' ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [DownloadTask(**dict(r)) for r in rows]
+    finally:
+        pass  # 线程局部连接复用，不主动关闭
 
 
 def update_task_status(task_id: str, status: str, error_msg: str = "", file_path: str = ""):
@@ -210,17 +222,17 @@ def update_task_status(task_id: str, status: str, error_msg: str = "", file_path
 
 def get_task_by_id(task_id: str) -> Optional[DownloadTask]:
     """根据 task_id 获取任务"""
-    with _lock:
-        conn = _get_conn()
-        try:
-            row = conn.execute(
-                "SELECT * FROM download_queue WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            if row:
-                return DownloadTask(**dict(row))
-            return None
-        finally:
-            pass  # 线程局部连接复用，不主动关闭
+    # 读操作：WAL 模式下读不阻塞写，无需持锁
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM download_queue WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row:
+            return DownloadTask(**dict(row))
+        return None
+    finally:
+        pass  # 线程局部连接复用，不主动关闭
 
 
 def get_tasks(
@@ -229,49 +241,49 @@ def get_tasks(
     offset: int = 0,
 ) -> List[DownloadTask]:
     """获取任务列表"""
-    with _lock:
-        conn = _get_conn()
-        try:
-            if status:
-                rows = conn.execute(
-                    "SELECT * FROM download_queue WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (status, limit, offset),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM download_queue ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                ).fetchall()
-            return [DownloadTask(**dict(r)) for r in rows]
-        finally:
-            pass  # 线程局部连接复用，不主动关闭
+    # 读操作：WAL 模式下读不阻塞写，无需持锁
+    conn = _get_conn()
+    try:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM download_queue WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM download_queue ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [DownloadTask(**dict(r)) for r in rows]
+    finally:
+        pass  # 线程局部连接复用，不主动关闭
 
 
 def get_download_stats() -> dict:
     """获取下载统计"""
-    with _lock:
-        conn = _get_conn()
-        try:
-            waiting = conn.execute(
-                "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'waiting'"
-            ).fetchone()["cnt"]
-            loading = conn.execute(
-                "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'loading'"
-            ).fetchone()["cnt"]
-            success = conn.execute(
-                "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'success'"
-            ).fetchone()["cnt"]
-            error = conn.execute(
-                "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'error'"
-            ).fetchone()["cnt"]
-            return {
-                "waiting": waiting,
-                "loading": loading,
-                "success": success,
-                "error": error,
-            }
-        finally:
-            pass  # 线程局部连接复用，不主动关闭
+    # 读操作：WAL 模式下读不阻塞写，无需持锁
+    conn = _get_conn()
+    try:
+        waiting = conn.execute(
+            "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'waiting'"
+        ).fetchone()["cnt"]
+        loading = conn.execute(
+            "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'loading'"
+        ).fetchone()["cnt"]
+        success = conn.execute(
+            "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'success'"
+        ).fetchone()["cnt"]
+        error = conn.execute(
+            "SELECT COUNT(*) as cnt FROM download_queue WHERE status = 'error'"
+        ).fetchone()["cnt"]
+        return {
+            "waiting": waiting,
+            "loading": loading,
+            "success": success,
+            "error": error,
+        }
+    finally:
+        pass  # 线程局部连接复用，不主动关闭
 
 
 def delete_task(task_id: str):
@@ -345,30 +357,30 @@ def record_sync(source: str, playlist_id: str, music_id: str):
 
 def is_synced(source: str, playlist_id: str, music_id: str) -> bool:
     """检查是否已同步"""
-    with _lock:
-        conn = _get_conn()
-        try:
-            row = conn.execute(
-                "SELECT 1 FROM sync_history WHERE source=? AND playlist_id=? AND music_id=?",
-                (source, playlist_id, music_id),
-            ).fetchone()
-            return row is not None
-        finally:
-            pass  # 线程局部连接复用，不主动关闭
+    # 读操作：WAL 模式下读不阻塞写，无需持锁
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sync_history WHERE source=? AND playlist_id=? AND music_id=?",
+            (source, playlist_id, music_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        pass  # 线程局部连接复用，不主动关闭
 
 
 def get_synced_ids(source: str, playlist_id: str) -> set:
     """获取已同步的 music_id 集合"""
-    with _lock:
-        conn = _get_conn()
-        try:
-            rows = conn.execute(
-                "SELECT music_id FROM sync_history WHERE source=? AND playlist_id=?",
-                (source, playlist_id),
-            ).fetchall()
-            return {r["music_id"] for r in rows}
-        finally:
-            pass  # 线程局部连接复用，不主动关闭
+    # 读操作：WAL 模式下读不阻塞写，无需持锁
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT music_id FROM sync_history WHERE source=? AND playlist_id=?",
+            (source, playlist_id),
+        ).fetchall()
+        return {r["music_id"] for r in rows}
+    finally:
+        pass  # 线程局部连接复用，不主动关闭
 
 
 def clear_sync_history(source: str = "", playlist_id: str = ""):
@@ -396,19 +408,19 @@ def get_playlist_sync_anchor(source: str, playlist_id: str) -> tuple[int, int]:
     Returns:
         (update_time, track_update_time)，均为毫秒时间戳；无记录返回 (0, 0)
     """
-    with _lock:
-        conn = _get_conn()
-        try:
-            row = conn.execute(
-                "SELECT update_time, track_update_time FROM playlist_sync_anchor "
-                "WHERE source=? AND playlist_id=?",
-                (source, playlist_id),
-            ).fetchone()
-            if row:
-                return int(row["update_time"]), int(row["track_update_time"])
-            return 0, 0
-        finally:
-            pass  # 线程局部连接复用，不主动关闭
+    # 读操作：WAL 模式下读不阻塞写，无需持锁
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT update_time, track_update_time FROM playlist_sync_anchor "
+            "WHERE source=? AND playlist_id=?",
+            (source, playlist_id),
+        ).fetchone()
+        if row:
+            return int(row["update_time"]), int(row["track_update_time"])
+        return 0, 0
+    finally:
+        pass  # 线程局部连接复用，不主动关闭
 
 
 def set_playlist_sync_anchor(source: str, playlist_id: str,

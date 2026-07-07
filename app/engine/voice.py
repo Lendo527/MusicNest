@@ -64,6 +64,7 @@ _COMMAND_PRIORITY: dict[str, int] = {
     "stop": 7,
     "download_current": 8,
     "download": 9,
+    "create_alarm": 10,
 }
 
 
@@ -229,14 +230,16 @@ class VoiceEngine:
     def handle_message(self, query: str) -> Optional[MatchResult]:
         """处理用户语音消息，返回匹配结果或 None
 
-        跨优先级最长关键词匹配策略：
+        开头优先 + 最长关键词匹配策略：
 
         1. 遍历所有已启用的语音指令
-        2. 对每条指令的所有关键词，在 query 中做包含匹配（str.index / str.find）
-        3. 在所有命中里，取关键词**字符数最长**者
-        4. 长度相同时，取**优先级高**（数字小）者
+        2. 对每条指令的所有关键词，在 query 中做包含匹配（str.find）
+        3. 在所有命中里，优先取 **idx 更小**者（query 开头的关键词优先，避免误判）
+        4. idx 相同时，取关键词**字符数最长**者
+        5. idx 和长度都相同时，取**优先级高**（数字小）者
 
-        防止短关键词（如"播放"）窃取更长关键词（如"播放歌单"）的匹配。
+        防止短关键词（如"播放"）窃取更长关键词（如"播放歌单"）的匹配，
+        同时避免 query 中间出现的关键词误命中。
 
         Args:
             query: 用户语音文本
@@ -267,6 +270,7 @@ class VoiceEngine:
         )
 
         best_match: Optional[MatchResult] = None
+        best_idx: int = len(query) + 1  # 不可能的高值，首次命中必胜
         best_kw_len: int = 0
         best_priority: int = 99
 
@@ -279,9 +283,11 @@ class VoiceEngine:
                         "[VoiceEngine] 命中: type=%s keyword=%r idx=%d kw_len=%d priority=%d",
                         cmd.type, keyword, idx, kw_len, priority
                     )
-                    if kw_len > best_kw_len or (
-                        kw_len == best_kw_len and priority < best_priority
-                    ):
+                    # 优先 idx 更小（开头匹配优先），其次关键词更长，最后优先级更高
+                    if (idx < best_idx
+                        or (idx == best_idx and kw_len > best_kw_len)
+                        or (idx == best_idx and kw_len == best_kw_len and priority < best_priority)):
+                        best_idx = idx
                         best_kw_len = kw_len
                         best_priority = priority
                         best_match = MatchResult(
@@ -303,8 +309,8 @@ class VoiceEngine:
                 best_match.argument,
             )
             logger.debug(
-                "[VoiceEngine] best_match详情: type=%s priority=%d kw_len=%d",
-                best_match.command.type, best_priority, best_kw_len
+                "[VoiceEngine] best_match详情: type=%s idx=%d priority=%d kw_len=%d",
+                best_match.command.type, best_idx, best_priority, best_kw_len
             )
         else:
             pass  # 未匹配到任何指令，不输出日志

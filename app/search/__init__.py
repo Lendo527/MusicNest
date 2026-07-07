@@ -8,8 +8,11 @@
 """
 
 from typing import Optional
+import logging
 
 from app.search.base import SearchProvider, SearchResult, MusicFormat
+
+logger = logging.getLogger("musicnest.search")
 
 _PROVIDERS: dict[str, SearchProvider] = {}
 
@@ -36,13 +39,13 @@ def _init_default_providers() -> None:
     try:
         from app.search.kuwo import KuwoProvider
         register_provider(KuwoProvider())
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Provider kuwo 注册失败: {e}")
     try:
         from app.search.netease import NeteaseProvider
         register_provider(NeteaseProvider())
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Provider netease 注册失败: {e}")
 
 
 # 首次访问时自动初始化
@@ -71,7 +74,14 @@ def search_all(keyword: str, limit: int = 20, search_type: str = "music",
                               skip_formats=skip_formats, cookie=cookie))
 
     async def _gather():
-        results = await asyncio.gather(*coros, return_exceptions=True)
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*coros, return_exceptions=True),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[search_all] 搜索超时（15s），返回已收集的部分结果")
+            results = []
         merged: list[SearchResult] = []
         for r in results:
             if isinstance(r, list):

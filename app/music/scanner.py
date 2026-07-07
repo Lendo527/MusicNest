@@ -1,6 +1,7 @@
 """NAS 音乐库扫描器 - 支持多层文件夹结构 + 歌词关联"""
 
 import asyncio
+import copy
 import logging
 import os
 import re
@@ -75,17 +76,25 @@ def _find_lyrics(audio_path: Path) -> Optional[str]:
     """查找同名的歌词文件"""
     stem = audio_path.stem
     parent = audio_path.parent
-    for ext in LYRICS_EXTENSIONS:
-        lrc_path = parent / f"{stem}{ext}"
-        if lrc_path.exists():
-            return str(lrc_path)
-    # 也尝试 cleaned title（去掉曲号后）
+    # 收集需要匹配的 stem（原名 + 去曲号后的清理名）
+    stems = [stem]
     clean_stem = _clean_title(stem)
     if clean_stem and clean_stem != stem:
-        for ext in LYRICS_EXTENSIONS:
-            lrc_path = parent / f"{clean_stem}{ext}"
-            if lrc_path.exists():
-                return str(lrc_path)
+        stems.append(clean_stem)
+    stem_lower_set = {s.lower() for s in stems}
+
+    # L3: 大小写不敏感匹配（遍历同目录文件，兼容 song.LRC / Song.lrc 等命名）
+    try:
+        siblings = list(parent.iterdir())
+    except (PermissionError, FileNotFoundError, OSError):
+        return None
+    for sibling in siblings:
+        if not sibling.is_file():
+            continue
+        if sibling.suffix.lower() not in LYRICS_EXTENSIONS:
+            continue
+        if sibling.stem.lower() in stem_lower_set:
+            return str(sibling)
     return None
 
 
@@ -110,6 +119,20 @@ class MusicScanner:
         """获取 asyncio.Lock"""
         return self._lock
 
+    def _is_path_safe(self, filepath: Path) -> bool:
+        """检查文件路径 resolve() 后是否仍在 music_path 下（防符号链接越界）。
+
+        L1: is_symlink() 仅检测最终路径组件，无法识别中间目录的符号链接，
+        因此统一用 resolve() + relative_to() 做归属校验（与 M2 共用）。
+        """
+        try:
+            resolved = filepath.resolve()
+            root_resolved = Path(self._music_path).resolve()
+            resolved.relative_to(root_resolved)
+            return True
+        except (ValueError, OSError):
+            return False
+
     def _load_cache(self) -> bool:
         """从缓存文件加载歌曲列表。成功返回 True"""
         cache_path = Path(self.CACHE_FILE)
@@ -128,7 +151,23 @@ class MusicScanner:
             self._songs = []
             return False
 
-        if not isinstance(data, list):
+        # L2: 支持 schema 版本号，兼容旧版纯列表格式
+        if isinstance(data, list):
+            # 旧版格式：纯列表（无版本号）
+            logger.info("[Scanner] 检测到旧版缓存格式（无版本号），将进行迁移")
+            songs_data = data
+        elif isinstance(data, dict):
+            version = data.get("version", 0)
+            if version != 1:
+                logger.warning(f"[Scanner] 缓存版本不匹配 (期望 1, 实际 {version})，将重新扫描")
+                self._songs = []
+                return False
+            songs_data = data.get("songs", [])
+            if not isinstance(songs_data, list):
+                logger.warning("[Scanner] 缓存 songs 字段格式异常，将重新扫描")
+                self._songs = []
+                return False
+        else:
             logger.warning("[Scanner] 缓存格式异常，将重新扫描")
             self._songs = []
             return False
@@ -136,28 +175,35 @@ class MusicScanner:
         # 逐项校验必需字段
         required_keys = {"title", "artist", "filepath"}
         valid_songs = []
-        for s in data:
+        for s in songs_data:
             if isinstance(s, dict) and required_keys.issubset(s.keys()):
                 valid_songs.append(s)
             else:
                 logger.debug(f"[Scanner] 丢弃无效缓存项: {s}")
+
+        # M3: 缓存与实际文件一致性校验，过滤掉文件不存在的项
+        before_count = len(valid_songs)
+        valid_songs = [s for s in valid_songs if Path(s.get("filepath", "")).exists()]
+        removed = before_count - len(valid_songs)
+        if removed > 0:
+            logger.info(f"[Scanner] 缓存校验: 移除 {removed} 首不存在的歌曲")
+
         self._songs = valid_songs
         self._scan_time = time.time()
         logger.info(f"[Scanner] 从缓存加载: {len(valid_songs)} 首歌曲")
         return True
 
-    def _save_cache(self) -> None:
-        """保存缓存到文件（原子写入）"""
-        with self._thread_lock:
-            snapshot = list(self._songs)
+    def _write_cache_with_snapshot(self, snapshot: list[dict]) -> None:
+        """将给定快照写入缓存文件（原子写入）。调用方负责固定 snapshot。"""
         import json
-        import os
         cache_path = Path(self.CACHE_FILE)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = cache_path.with_suffix(".tmp")
+        # M4: 使用唯一临时文件名，避免多实例并发写入时冲突
+        tmp_path = cache_path.parent / f"songs_cache.{os.getpid()}.{int(time.time()*1000)}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False, indent=1)
+                # L2: 缓存结构带 schema 版本号
+                json.dump({"version": 1, "songs": snapshot}, f, ensure_ascii=False, indent=1)
             os.replace(str(tmp_path), str(cache_path))  # 原子替换
             logger.info(f"[Scanner] 缓存已保存: {len(snapshot)} 首歌曲")
         except Exception as e:
@@ -167,6 +213,31 @@ class MusicScanner:
                     tmp_path.unlink()
                 except Exception:
                     pass
+        # M4: 清理可能残留的旧 tmp 文件（只清理超过 5 分钟的，避免影响并发写入）
+        try:
+            now = time.time()
+            for stale in cache_path.parent.glob("songs_cache.*.tmp"):
+                try:
+                    if stale.stat().st_mtime < now - 300:
+                        stale.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _save_cache(self) -> None:
+        """保存缓存到文件（原子写入）"""
+        with self._thread_lock:
+            snapshot = list(self._songs)
+        self._write_cache_with_snapshot(snapshot)
+
+    def reload_cache(self):
+        """重新从磁盘加载缓存，供其他模块（如 worker）刷新数据。
+
+        H3: 多实例共享同一缓存文件时，外部实例写入后调用此方法刷新本实例内存。
+        """
+        with self._thread_lock:
+            self._load_cache()
 
     async def scan(self) -> list[dict]:
         """扫描音乐目录，返回歌曲列表"""
@@ -185,6 +256,9 @@ class MusicScanner:
                 if filepath.is_symlink():
                     continue  # 跳过符号链接，防止越界
                 if not filepath.is_file():
+                    continue
+                # L1: resolve() 后必须仍在 music_path 下，防止中间目录符号链接越界
+                if not self._is_path_safe(filepath):
                     continue
                 ext = filepath.suffix.lower()
                 if ext in SUPPORTED_EXTENSIONS:
@@ -299,9 +373,14 @@ class MusicScanner:
             # 按 artist → album → title 排序
             songs.sort(key=lambda s: (s["artist"].lower(), s["album"].lower(), s["title"].lower()))
 
-            self._songs = songs
-            self._scan_time = time.time()
-            self._save_cache()
+            # H2: 赋值与取快照打包进同一 _thread_lock 临界区，
+            # 避免与 remove_* 之间的 TOCTOU 竞态（remove_* 可能在赋值与写缓存之间改写 self._songs）
+            with self._thread_lock:
+                self._songs = songs
+                self._scan_time = time.time()
+                snapshot = list(self._songs)
+            # 锁外写文件，snapshot 已固定
+            self._write_cache_with_snapshot(snapshot)
             return songs
 
     async def scan_new(self, filepaths: list[str]) -> int:
@@ -320,6 +399,9 @@ class MusicScanner:
                 if not p.exists() or not p.is_file():
                     continue
                 if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+                # M2/L1: 校验路径归属，resolve() 后必须仍在 music_path 下，防止越界
+                if not self._is_path_safe(p):
                     continue
                 if str(p) in existing_paths:
                     continue
@@ -400,7 +482,8 @@ class MusicScanner:
     def iter_songs(self) -> list:
         """返回 songs 的快照副本，供外部安全迭代"""
         with self._thread_lock:
-            return list(self._songs)
+            # M1: 深拷贝每首歌，避免外部修改污染内部缓存
+            return [copy.deepcopy(s) for s in self._songs]
 
     def remove_by_filepath(self, filepath: str) -> bool:
         """按文件路径删除歌曲（替代按位置 index 删除）"""
@@ -424,18 +507,19 @@ class MusicScanner:
 
     def remove_album(self, album_name: str, artist_name: str = "") -> int:
         """删除指定专辑（可指定歌手）的所有歌曲，返回删除数量"""
+        # M5: 不指定歌手时拒绝跨歌手删除同名专辑，避免误删
+        if not artist_name or not artist_name.strip():
+            logger.warning("[Scanner] remove_album 拒绝在未指定歌手时跨歌手删除同名专辑: %s", album_name)
+            return 0
         with self._thread_lock:
             before = len(self._songs)
-            if artist_name:
-                self._songs = [
-                    s for s in self._songs
-                    if not (
-                        (s.get("album") or "").strip() == album_name.strip()
-                        and (s.get("artist") or "").strip() == artist_name.strip()
-                    )
-                ]
-            else:
-                self._songs = [s for s in self._songs if (s.get("album") or "").strip() != album_name.strip()]
+            self._songs = [
+                s for s in self._songs
+                if not (
+                    (s.get("album") or "").strip() == album_name.strip()
+                    and (s.get("artist") or "").strip() == artist_name.strip()
+                )
+            ]
             removed = before - len(self._songs)
             if removed > 0:
                 self._save_cache()
@@ -452,9 +536,10 @@ class MusicScanner:
             artist = (s.get("artist") or "").strip()
             if artist:
                 artists.add(artist)
-            # 空 album 也计入，使用 '未知专辑' 保持与前端一致
-            album_name = s.get("album") or "未知专辑"
-            albums.add((album_name, s.get("artist", "")))
+            # L4: 统计专辑数时排除空专辑（原"未知专辑"），避免总数虚高
+            album_name = (s.get("album") or "").strip()
+            if album_name:
+                albums.add((album_name, s.get("artist", "")))
             total_size += s.get("size", 0)
 
         return {
@@ -470,7 +555,8 @@ class MusicScanner:
     def get_songs(self, limit: int = 500, offset: int = 0) -> list[dict]:
         """获取歌曲列表（分页）"""
         with self._thread_lock:
-            return list(self._songs[offset:offset + limit])
+            # M1: 深拷贝每首歌，避免外部修改污染内部缓存
+            return [copy.deepcopy(s) for s in self._songs[offset:offset + limit]]
 
     def search(self, keyword: str) -> list[dict]:
         """搜索本地歌曲"""
@@ -486,7 +572,8 @@ class MusicScanner:
                 or kw in (song.get("artist") or "").lower()
                 or kw in (song.get("album") or "").lower()
             ):
-                results.append(song)
+                # M1: 深拷贝每首歌，避免外部修改污染内部缓存
+                results.append(copy.deepcopy(song))
         return results
 
     # ===== 定时扫描 =====

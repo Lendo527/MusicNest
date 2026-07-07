@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -16,7 +17,6 @@ import httpx
 from app.download.tracker import (
     get_waiting_tasks,
     update_task_status,
-    get_task_by_id,
     add_task,
     reset_stale_loading_tasks,
 )
@@ -27,14 +27,19 @@ logger = logging.getLogger("musicnest.download")
 
 RUNNING = False
 
+# 并发下载上限（semaphore 真正限流，DB 查询 limit 放大以避免饿死后排任务）
+MAX_CONCURRENT = 2
+
 # 扫描器增量更新回调（由 main.py 注入，避免循环导入）
 _scan_new_callback = None
+
+# 外部 MusicScanner 引用（由 main.py 注入，避免 worker 内部另建实例导致缓存不同步）
+_external_scanner = None
 
 # 文件名/目录名非法字符（Windows + Linux 通用）
 # Windows: \ / : * ? " < > |
 # 额外去除前导/尾随空格和点（Windows 不允许）
 _INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
-_INVALID_DIRNAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
 
 def _sanitize_filename(name: str, max_len: int = 200) -> str:
@@ -67,8 +72,31 @@ def set_scan_callback(cb) -> None:
     _scan_new_callback = cb
 
 
+def set_scanner_ref(scanner) -> None:
+    """注入外部 MusicScanner 引用，避免 worker 内部另建实例导致缓存不同步"""
+    global _external_scanner
+    _external_scanner = scanner
+
+
+def _min_size_for_format(fmt: str) -> int:
+    """根据音频格式返回最小文件大小阈值（字节）
+
+    用于判断已存在文件是否为完整下载（过小的文件视为损坏/不完整）。
+    """
+    if fmt == "flac":
+        return 100 * 1024  # 100KB
+    if fmt == "mp3":
+        return 30 * 1024   # 30KB
+    return 10 * 1024       # 10KB
+
+
 async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float = 120.0) -> bool:
-    """下载文件到目标路径，含进度日志"""
+    """下载文件到目标路径，含进度日志
+
+    采用原子写入：先下载到 `.part` 临时文件，成功后 os.replace 原子重命名，
+    避免下载中断时残留半成品文件被误判为已下载。
+    """
+    dest_part = dest.with_suffix(dest.suffix + ".part")
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
@@ -82,7 +110,7 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                 downloaded = 0
                 last_log_pct = -1
                 loop = asyncio.get_running_loop()
-                with open(dest, "wb") as f:
+                with open(dest_part, "wb") as f:
                     async for chunk in resp.aiter_bytes():
                         await loop.run_in_executor(None, f.write, chunk)
                         downloaded += len(chunk)
@@ -91,13 +119,15 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                             if pct >= last_log_pct + 10:
                                 logger.info("[Download] 下载进度: %s - %d%% (%d/%d KB)", task_id[:8] if task_id else "?", pct, downloaded // 1024, total // 1024)
                                 last_log_pct = pct
+                # 下载完成，原子重命名到目标路径
+                os.replace(dest_part, dest)
                 return True
     except Exception as e:
         logger.warning(f"[Download] 下载文件失败: {url[:80]}... err={e}")
         # 清理 partial 文件，避免下次误判为成功
         try:
-            if dest.exists():
-                dest.unlink()
+            if dest_part.exists():
+                dest_part.unlink()
         except Exception:
             pass
         return False
@@ -114,7 +144,9 @@ async def _download_cover(cover_url: str, artist_dir: Path, album_dir: Path) -> 
         ok = await _download_file(cover_url, cover_path)
     # 同时下载一份到歌手目录作为歌手头像（如果还没有）
     if ok and not artist_img_path.exists():
-        await _download_file(cover_url, artist_img_path)
+        artist_ok = await _download_file(cover_url, artist_img_path)
+        if not artist_ok:
+            logger.warning(f"[Cover] 歌手头像下载失败: {cover_url[:80]}")
     return ok
 
 
@@ -153,8 +185,12 @@ async def _fetch_lyrics(source: str, music_id: str, title: str, artist: str) -> 
     return None
 
 
-async def _write_id3_tags(track_path: Path, title: str, artist: str, album: str, cover_path: Optional[Path] = None):
-    """用 ffmpeg 写入音频元数据（标题、歌手、专辑、嵌入封面图）"""
+async def _write_id3_tags(track_path: Path, title: str, artist: str, album: str, cover_path: Optional[Path] = None) -> bool:
+    """用 ffmpeg 写入音频元数据（标题、歌手、专辑、嵌入封面图）
+
+    Returns:
+        True 表示写入成功
+    """
     try:
         cmd = ["ffmpeg", "-y", "-i", str(track_path)]
         if cover_path and cover_path.exists():
@@ -170,31 +206,58 @@ async def _write_id3_tags(track_path: Path, title: str, artist: str, album: str,
         tmp_path = str(track_path) + ".tmp"
         cmd += [tmp_path]
 
+        # start_new_session=True 让子进程成为新进程组组长，便于 killpg 杀掉整个进程组
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            # 优先优雅终止整个进程组（ffmpeg 可能派生子进程）
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                # 2 秒后仍未退出，强杀整个进程组
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                except Exception:
+                    pass
+                await process.wait()
             logger.warning(f"[ID3] ffmpeg 超时: title={title}, artist={artist}")
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            return
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            return False
 
         if process.returncode == 0:
             os.replace(tmp_path, str(track_path))
             logger.info(f"[ID3] 标签写入成功: title={title}, artist={artist}, album={album}")
+            return True
         else:
             stderr_text = stderr.decode(errors="replace") if stderr else ""
             logger.warning(f"[ID3] ffmpeg 写入失败: {stderr_text[:200]}")
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            return False
     except Exception as e:
         logger.warning(f"[ID3] 标签写入异常: {e}")
+        return False
 
 
 async def _process_task(task) -> bool:
@@ -222,7 +285,6 @@ async def _process_task(task) -> bool:
 
         if source == "kuwo":
             from app.search.kuwo import query_song_by_id, _get_music_formats
-            import re
 
             # 优先用 music_id 精确查询，避免搜索匹配到错误歌曲
             matched = await query_song_by_id(f"kuwo_{music_id}")
@@ -241,33 +303,31 @@ async def _process_task(task) -> bool:
                         if re.sub(r'\s+', '', r.title) == norm_title:
                             matched = r
                             break
-                if not matched and results:
-                    matched = results[0]
+                # 不再 fallback 到 results[0]：避免下载到错误歌曲
 
             if not matched:
                 update_task_status(task_id, "error", error_msg="未找到匹配歌曲")
                 return False
 
-            if matched:
-                if not resolved_cover and matched.cover:
-                    resolved_cover = matched.cover
-                if not resolved_artist or resolved_artist == "未知歌手":
-                    resolved_artist = matched.artist
-                if not resolved_album or resolved_album == "未知专辑":
-                    resolved_album = matched.album
+            if not resolved_cover and matched.cover:
+                resolved_cover = matched.cover
+            if not resolved_artist or resolved_artist == "未知歌手":
+                resolved_artist = matched.artist
+            if not resolved_album or resolved_album == "未知专辑":
+                resolved_album = matched.album
 
-                # 获取格式 URL（nMinfo 不包含 URL，需单独拉）
-                fmt_list = await _get_music_formats(matched.id.replace("kuwo_", ""))
+            # 获取格式 URL（nMinfo 不包含 URL，需单独拉）
+            fmt_list = await _get_music_formats(matched.id.replace("kuwo_", ""))
+            for fmt in fmt_list:
+                if fmt.type == format_type and fmt.url:
+                    download_url = fmt.url
+                    break
+            # fallback: 任意可用格式
+            if not download_url:
                 for fmt in fmt_list:
-                    if fmt.type == format_type and fmt.url:
+                    if fmt.url:
                         download_url = fmt.url
                         break
-                # fallback: 任意可用格式
-                if not download_url:
-                    for fmt in fmt_list:
-                        if fmt.url:
-                            download_url = fmt.url
-                            break
 
         elif source == "netease":
             from app.search.netease import get_song_detail as netease_song_detail
@@ -314,8 +374,13 @@ async def _process_task(task) -> bool:
         track_filename = f"{safe_title}.{ext}"
         track_path = album_dir / track_filename
 
-        # 如果已存在同名文件且大小正常（>1KB），只补图片
-        if track_path.exists() and track_path.stat().st_size > 1024:
+        # 如果已存在同名文件、大小达标且 ID3 已写入，只补图片
+        min_size = _min_size_for_format(format_type)
+        id3done_path = track_path.with_suffix(track_path.suffix + ".id3done")
+        file_ready = track_path.exists() and track_path.stat().st_size >= min_size
+        id3_done = id3done_path.exists()
+
+        if file_ready and id3_done:
             logger.info(f"[Download] 文件已存在: {track_path}")
             if resolved_cover:
                 await _download_cover(resolved_cover, artist_dir, album_dir)
@@ -323,11 +388,15 @@ async def _process_task(task) -> bool:
             return True
 
         # ==== 第三步：下载音频 ====
-        logger.info(f"[Download] 下载音频: {download_url[:80]}...")
-        success = await _download_file(download_url, track_path, task_id=task_id)
-        if not success:
-            update_task_status(task_id, "error", "音频下载失败")
-            return False
+        if file_ready:
+            # 文件已存在但 ID3 未完成，跳过下载只补 ID3
+            logger.info(f"[Download] 音频已存在，跳过下载: {track_path}")
+        else:
+            logger.info(f"[Download] 下载音频: {download_url[:80]}...")
+            success = await _download_file(download_url, track_path, task_id=task_id)
+            if not success:
+                update_task_status(task_id, "error", "音频下载失败")
+                return False
 
         # ==== 第四步：下载封面 + 歌手图 ====
         if resolved_cover:
@@ -337,19 +406,33 @@ async def _process_task(task) -> bool:
         lyrics = await _fetch_lyrics(source, music_id, title, resolved_artist)
         if lyrics:
             lrc_path = album_dir / f"{safe_title}.lrc"
-            lrc_path.write_text(lyrics, encoding="utf-8")
+            await asyncio.to_thread(lrc_path.write_text, lyrics, encoding="utf-8")
 
         # ==== 第六步：写入 ID3 标签（用 ffmpeg 写标题/歌手/专辑 + 嵌入封面）====
         cover_img = album_dir / "cover.jpg"
         if cover_img.exists():
-            await _write_id3_tags(track_path, title, resolved_artist, resolved_album, cover_img)
+            id3_ok = await _write_id3_tags(track_path, title, resolved_artist, resolved_album, cover_img)
         else:
-            await _write_id3_tags(track_path, title, resolved_artist, resolved_album)
+            id3_ok = await _write_id3_tags(track_path, title, resolved_artist, resolved_album)
+
+        # ID3 写入成功后创建标记文件，避免重试时跳过 ID3
+        if id3_ok:
+            try:
+                id3done_path.touch()
+            except Exception as e:
+                logger.warning(f"[Download] 创建 ID3 标记文件失败: {e}")
 
         update_task_status(task_id, "success", file_path=str(track_path))
         logger.info(f"[Download] 完成: {task_id} -> {track_path}")
-        # 通知扫描器增量更新（通过回调，避免循环导入）
-        if _scan_new_callback:
+        # 通知扫描器增量更新（优先使用外部 scanner 引用，避免缓存不同步）
+        scanned = False
+        if _external_scanner is not None:
+            try:
+                await _external_scanner.scan_new([str(track_path)])
+                scanned = True
+            except Exception as e:
+                logger.debug(f"[Download] 外部扫描器增量更新失败: {e}")
+        if not scanned and _scan_new_callback:
             try:
                 await _scan_new_callback([str(track_path)])
             except Exception as e:
@@ -368,11 +451,14 @@ async def download_worker(poll_interval: float = 5.0):
     RUNNING = True
     logger.info("[Download] 下载 Worker 已启动")
 
-    # 启动时重置上次崩溃残留的 loading 任务，避免卡死
-    reset_stale_loading_tasks(timeout_minutes=30)
+    # 启动时重置上次崩溃残留的 loading 任务，避免卡死（阈值 60 分钟，避免误杀大文件任务）
+    reset_stale_loading_tasks(timeout_minutes=60)
 
-    # 并发限制
-    sem = asyncio.Semaphore(2)
+    # 并发限制：由 semaphore 真正限流，DB 查询 limit 放大以充分填充并发槽
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    # 周期性重置 stale loading 任务（每 5 分钟一次）
+    stale_reset_interval = 300
+    last_reset_time = time.time()
 
     async def process_with_semaphore(task):
         async with sem:
@@ -380,11 +466,17 @@ async def download_worker(poll_interval: float = 5.0):
 
     while RUNNING:
         try:
-            tasks = get_waiting_tasks(limit=2)
+            tasks = get_waiting_tasks(limit=10)
             if tasks:
                 logger.info(f"[Download] 处理 {len(tasks)} 个待下载任务")
                 coros = [process_with_semaphore(t) for t in tasks]
                 await asyncio.gather(*coros, return_exceptions=True)
+
+            # 周期性重置卡死的 loading 任务（每 5 分钟一次，阈值 60 分钟）
+            now = time.time()
+            if now - last_reset_time >= stale_reset_interval:
+                reset_stale_loading_tasks(timeout_minutes=60)
+                last_reset_time = now
         except Exception as e:
             logger.error(f"[Download] Worker 异常: {e}", exc_info=True)
 
@@ -420,8 +512,12 @@ async def playlist_sync_worker(sync_interval: int = 1800):
     from app.search.kuwo import search as kuwo_search
     from app.music.scanner import MusicScanner
 
-    # 扫描器在循环外创建，避免每次循环都重新初始化（search 内部会按需刷新缓存）
-    _scanner = MusicScanner(config.get("music_path", "/music"))
+    # 优先使用外部注入的 scanner（与主进程共享缓存，避免两个实例缓存不同步）；
+    # 外部未注入时才本地创建。
+    if _external_scanner is not None:
+        _scanner = _external_scanner
+    else:
+        _scanner = MusicScanner(config.get("music_path", "/music"))
 
     while RUNNING:
         await asyncio.sleep(sync_interval)
@@ -489,7 +585,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                         if already_local:
                             # 本地已有，直接标记为已同步，不重复下载
                             record_sync(source, pl_id, track.id)
-                            logger.info(f"[PlaylistSync] 跳过已存在本地的歌曲: {track.artist} - {track.title}")
+                            logger.info("[PlaylistSync] 跳过已存在本地的歌曲: %s - %s", track.artist, track.title)
                             continue
 
                         # 加入下载队列

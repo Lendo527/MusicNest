@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-import random
+import secrets
 import string
 import time
 from typing import Any, Optional
@@ -21,7 +21,7 @@ UBUS_PATH = "/remote/ubus"
 def _generate_request_id() -> str:
     """生成请求 ID，格式: app_ios_ + 30位随机字符"""
     chars = string.ascii_lowercase + string.digits
-    suffix = "".join(random.choice(chars) for _ in range(30))
+    suffix = "".join(secrets.choice(chars) for _ in range(30))
     return f"app_ios_{suffix}"
 
 
@@ -44,7 +44,10 @@ class MinaHTTPClient:
         self._device_id = device_id or _generate_device_id()
         self._ssecurity = ssecurity
         self._user_agent = _format_user_agent(self._device_id)
-        self._client = httpx.AsyncClient(timeout=15.0)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0),
+        )
         # 401 过期回调（由 token_refresh 模块注入）
         self._on_token_expired = None
         # 最近一次 musicnest 自己触发的播放时间戳（per-device，供轨道2区分"自己触发"vs"小爱原生播放"）
@@ -57,14 +60,16 @@ class MinaHTTPClient:
     def mark_own_play(self, device_id: str = "") -> None:
         """标记最近一次播放是 musicnest 自己触发的（供 media_watcher 判断）"""
         if device_id:
-            self._last_own_play_at[device_id] = time.time()
+            now = time.time()
+            # 清理过期项（超过 300 秒），避免 dict 无限增长
+            self._last_own_play_at = {k: v for k, v in self._last_own_play_at.items() if now - v < 300}
+            self._last_own_play_at[device_id] = now
 
     def is_own_play_recent(self, device_id: str = "", within_sec: float = 3.0) -> bool:
         """检查指定设备最近 within_sec 秒内是否自己触发过播放"""
         if not device_id:
-            # 没有指定设备时，检查所有设备（向后兼容）
-            now = time.time()
-            return any(now - ts < within_sec for ts in self._last_own_play_at.values())
+            # 强制要求 device_id 非空，避免空 device_id 误判
+            return False
         ts = self._last_own_play_at.get(device_id, 0.0)
         return (time.time() - ts) < within_sec
 
@@ -207,7 +212,7 @@ class MinaHTTPClient:
             ), timeout=3.0),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        success_count = sum(1 for r in results if not isinstance(r, Exception))
+        success_count = sum(1 for r in results if isinstance(r, dict) and r.get("code") == 0)
         if success_count == 0:
             logger.warning(f"[MIoT] stop_all_media 全部失败: device_id={device_id[:12]}...")
         else:
@@ -225,26 +230,16 @@ class MinaHTTPClient:
         优先使用 MiNA API 的 TTS 端点（/miv1/device/:id/text_to_speech），
         失败时回退到 UBus player_play_tts 方法。
         """
-        # 方式 1: MiNA API TTS 端点（POST JSON，大部分小爱音箱支持）
-        try:
-            url = f"{MINA_API_BASE}/miv1/device/{device_id}/text_to_speech"
-            headers = {
-                "User-Agent": self._user_agent,
-                "Content-Type": "application/json",
-                "Cookie": _build_cookies(self._user_id, self._service_token),
-            }
-            resp = await self._client.post(url, headers=headers, json={"text": text})
-            if resp.status_code == 401:
-                # 尝试刷新 token 后重试
-                if await self._try_refresh_token():
-                    headers["Cookie"] = _build_cookies(self._user_id, self._service_token)
-                    resp = await self._client.post(url, headers=headers, json={"text": text})
-            if resp.status_code == 200:
-                logger.info("[MIoT] TTS (MiNA) 成功: %s", text[:40])
-                return True
-            logger.warning("[MIoT] TTS (MiNA) 失败: status=%s body=%s", resp.status_code, resp.text[:200])
-        except Exception as e:
-            logger.warning("[MIoT] TTS (MiNA) 异常: %s", e)
+        # 方式 1: MiNA API TTS 端点（统一走 _do_post，自动处理 401 重试）
+        url = f"{MINA_API_BASE}/miv1/device/{device_id}/text_to_speech"
+        result = await self._do_post(url, {"text": text})
+        if result is not None and result.get("code", 0) == 0:
+            logger.info("[MIoT] TTS (MiNA) 成功: %s", text[:40])
+            return True
+        if result is not None:
+            logger.warning("[MIoT] TTS (MiNA) 失败: code=%s", result.get("code"))
+        else:
+            logger.warning("[MIoT] TTS (MiNA) 失败: 无响应")
 
         # 方式 2: UBus player_play_tts（部分设备支持）
         message = {"text": text}
@@ -385,7 +380,8 @@ class MinaHTTPClient:
                 except (json.JSONDecodeError, KeyError):
                     continue
             return messages
-        except Exception:
+        except Exception as e:
+            logger.debug("[MIoT] UBus nlp_result_get 解析失败: %s", e)
             return []
 
     # ===== 内部方法 =====
@@ -417,6 +413,9 @@ class MinaHTTPClient:
                 "[MIoT] _ubus_request 响应: method=%s code=%s",
                 method, result.get("code") if result else "None"
             )
+        # C2: UBus code != 0 时记录 warning（不返回 None，保留 result 让调用方判断）
+        if isinstance(result, dict) and result.get("code", 0) != 0:
+            logger.warning("[MIoT] UBus %s 返回错误 code=%s data=%s", method, result.get("code"), result.get("data"))
         return result
 
     async def _do_get(self, url: str) -> Optional[dict]:
@@ -435,10 +434,11 @@ class MinaHTTPClient:
                     if resp.status_code == 401:
                         logger.warning("[MIoT] 401 重试后仍失败")
                         return None
-                    return resp.json()
+                    return resp.json() if resp.text else None
                 return None
-            return resp.json()
-        except Exception:
+            return resp.json() if resp.text else None
+        except Exception as e:
+            logger.warning("[MIoT] %s 请求异常: %s", url, e, exc_info=True)
             return None
 
     async def _do_post(self, url: str, form_data: dict) -> Optional[dict]:
@@ -461,7 +461,8 @@ class MinaHTTPClient:
                     return resp.json() if resp.text else None
                 return None
             return resp.json() if resp.text else None
-        except Exception:
+        except Exception as e:
+            logger.warning("[MIoT] %s 请求异常: %s", url, e, exc_info=True)
             return None
 
     async def _try_refresh_token(self) -> bool:
@@ -475,6 +476,8 @@ class MinaHTTPClient:
             if config_token and config_token != self._service_token:
                 logger.info("[MIoT] 从 config 同步新 token")
                 self._service_token = config_token
+                # 节流期间 token 已被其他调用刷新，复用结果
+                return True
             if ok:
                 logger.info("[MIoT] token 已刷新，重试请求")
             return ok

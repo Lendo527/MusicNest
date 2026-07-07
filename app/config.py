@@ -66,7 +66,8 @@ class ConfigManager:
     def __init__(self, config_path: str = CONFIG_PATH):
         self._config_path = config_path
         self._lock = threading.Lock()
-        self._data: dict[str, Any] = dict(DEFAULT_CONFIG)
+        # C1: 深拷贝避免 DEFAULT_CONFIG 被永久污染
+        self._data: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
         try:
             self._load()
         except Exception as e:
@@ -136,13 +137,18 @@ class ConfigManager:
             return val
 
     def set(self, key: str, value: Any) -> None:
+        # M1: 先更新内存后持久化，_save 失败时内存已改但文件未持久化（接受此语义，避免回滚引入复杂性）
+        # H1: 深拷贝入参，避免外部对象与配置内部状态共享引用
         with self._lock:
-            self._data[key] = value
+            self._data[key] = copy.deepcopy(value)
         self._save()
 
     def update(self, updates: dict[str, Any]) -> None:
+        # M1: 先更新内存后持久化，_save 失败时内存已改但文件未持久化（接受此语义，避免回滚引入复杂性）
+        # H1: 深拷贝入参，避免外部对象与配置内部状态共享引用
         with self._lock:
-            self._data.update(updates)
+            for k, v in updates.items():
+                self._data[k] = copy.deepcopy(v)
         self._save()
 
     def get_all(self) -> dict[str, Any]:

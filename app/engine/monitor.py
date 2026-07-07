@@ -43,7 +43,7 @@ class ConversationMonitor:
         self._callbacks: list[tuple[str, MessageCallback]] = []
         self._last_timestamps: dict[str, int] = {}  # device_id -> last_timestamp_ms
         self._initialized: dict[str, bool] = {}  # device_id -> 是否已完成首次拉取
-        self._message_buffer: deque = deque(maxlen=200)  # 环形缓冲区
+        self._message_buffer: deque = deque(maxlen=500)  # 环形缓冲区
         self._device_info: dict[str, dict] = {}  # device_id -> {hardware, name}
 
     @property
@@ -87,7 +87,7 @@ class ConversationMonitor:
                 m["handled"] = True
                 break
 
-    def is_query_handled(self, device_id: str, query: str, within_sec: float = 5.0) -> bool:
+    def is_query_handled(self, device_id: str, query: str, within_sec: float = 30.0) -> bool:
         """检查某个 query 是否已被轨道1处理过"""
         cutoff_ms = int((time.time() - within_sec) * 1000)
         for m in reversed(self._message_buffer):

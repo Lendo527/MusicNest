@@ -15,25 +15,28 @@ logger = logging.getLogger("musicnest.kuwo")
 
 # 模块级共享 httpx 客户端，复用连接池
 _shared_client: Optional[httpx.AsyncClient] = None
+_client_lock = asyncio.Lock()
 
 
 async def _get_client(timeout: float = 10.0) -> httpx.AsyncClient:
     global _shared_client
-    if _shared_client is None or _shared_client.is_closed:
-        _shared_client = httpx.AsyncClient(
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
-                     "Referer": "http://www.kuwo.cn/"}
-        )
-    return _shared_client
+    async with _client_lock:
+        if _shared_client is None or _shared_client.is_closed:
+            _shared_client = httpx.AsyncClient(
+                timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+                         "Referer": "http://www.kuwo.cn/"}
+            )
+        return _shared_client
 
 
 async def close_client():
     """应用关闭时调用，关闭共享 httpx 客户端"""
     global _shared_client
-    if _shared_client and not _shared_client.is_closed:
-        await _shared_client.aclose()
-        _shared_client = None
+    async with _client_lock:
+        if _shared_client and not _shared_client.is_closed:
+            await _shared_client.aclose()
+            _shared_client = None
 
 
 KUWO_SEARCH_URL = "http://search.kuwo.cn/r.s"
@@ -57,6 +60,9 @@ FORMAT_DEFS = [
 
 def _python_to_json(raw_text: str) -> str:
     """将酷我返回的 Python 字面量转为 JSON"""
+    # 长度限制，避免解析超大文本导致性能问题
+    if len(raw_text) > 100000:
+        return None
     import ast
     s = raw_text.strip()
     # 移除 BOM
@@ -79,13 +85,23 @@ def _parse_nminfo(nminfo: str) -> list:
     try:
         for part in nminfo.split(";"):
             for kv in part.split(","):
-                kv_parts = kv.split(":")
+                # 先尝试 `=` 分隔，再尝试 `:` 分隔（不同接口返回格式不同）
+                if "=" in kv:
+                    kv_parts = kv.split("=", 1)
+                elif ":" in kv:
+                    kv_parts = kv.split(":", 1)
+                else:
+                    continue
                 if len(kv_parts) == 2 and kv_parts[0] == "bitrate":
                     br = kv_parts[1]
                     if br == "2000":
                         formats.append(MusicFormat(name="FLAC", bitrate=2000, type="flac"))
+                    elif br == "1000":
+                        formats.append(MusicFormat(name="APE", bitrate=1000, type="ape"))
                     elif br == "320":
                         formats.append(MusicFormat(name="320K", bitrate=320, type="mp3"))
+                    elif br == "192":
+                        formats.append(MusicFormat(name="192K", bitrate=192, type="mp3"))
                     elif br == "128":
                         formats.append(MusicFormat(name="128K", bitrate=128, type="mp3"))
     except Exception:
@@ -99,6 +115,13 @@ def _parse_nminfo(nminfo: str) -> list:
             seen.add(key)
             unique.append(f)
     return unique
+
+
+def _upgrade_cover_url(url: str) -> str:
+    """将封面 URL 中的 /120 升级为 /500（更高清）"""
+    if not url:
+        return ""
+    return re.sub(r'/120(?=/|$)', '/500', url)
 
 
 async def _get_music_formats(pure_id: str, timeout: float = 10.0) -> List[MusicFormat]:
@@ -297,14 +320,14 @@ async def search(
             cover_url = None
             album_pic = song.get("web_albumpic_short", "")
             if album_pic:
-                cover_url = re.sub(r'/120(?=/|$)', '/500', f"https://img3.kuwo.cn/star/albumcover/{album_pic}")
+                cover_url = _upgrade_cover_url(f"https://img3.kuwo.cn/star/albumcover/{album_pic}")
             if not cover_url:
                 artist_pic = song.get("web_artistpic_short", "")
                 if artist_pic:
-                    cover_url = re.sub(r'/120(?=/|$)', '/500', f"https://star.kuwo.cn/star/starheads/{artist_pic}")
+                    cover_url = _upgrade_cover_url(f"https://star.kuwo.cn/star/starheads/{artist_pic}")
 
             # 音质获取：优先用 nMinfo 字段（sqmusic 方式），无则调 API
-            nminfo = song.get("nMinfo", "") or song.get("NMINFO", "") or ""
+            nminfo = song.get("N_MINFO") or song.get("nMinfo") or song.get("NMINFO") or ""
             if nminfo:
                 formats = _parse_nminfo(nminfo)
             elif not skip_formats:
@@ -362,7 +385,10 @@ async def query_song_by_id(song_id: str, timeout: float = 10.0) -> Optional[Sear
             cover_url = ""
         artist_id = str(song_data.get("artistid", "") or "")
         album_id = str(song_data.get("albumid", "") or "")
-        duration = int(song_data.get("duration", 0) or 0)
+        try:
+            duration = int(song_data.get("duration", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0
         # 音质列表从 nMinfo 解析
         nminfo = song_data.get("nMinfo", "") or song_data.get("nminfo", "") or ""
         formats = _parse_nminfo(nminfo)
@@ -394,7 +420,7 @@ async def search_by_keyword(keyword: str, timeout: float = 10.0) -> dict:
         return {"code": 404, "msg": "未找到歌曲", "data": None}
 
     r = results[0]
-    # 优先选 MP3（在线播放兼容性最好）
+    # 在线播放策略：优先选 MP3（兼容性最好）；与下载流程的 FLAC 优先策略不同
     url = None
     for fmt in r.formats:
         if fmt.type == "mp3" and fmt.url:
@@ -511,11 +537,11 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
             cover_url = None
             album_pic_short = song.get("web_albumpic_short") or ""
             if album_pic_short:
-                cover_url = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + album_pic_short)
+                cover_url = _upgrade_cover_url("https://img3.kuwo.cn/star/albumcover/" + album_pic_short)
             if not cover_url:
                 artist_pic_short = song.get("web_artistpic_short") or ""
                 if artist_pic_short:
-                    cover_url = re.sub(r'/120(?=/|$)', '/500', "https://star.kuwo.cn/star/starheads/" + artist_pic_short)
+                    cover_url = _upgrade_cover_url("https://star.kuwo.cn/star/starheads/" + artist_pic_short)
 
             # 音质走 N_MINFO
             nminfo = song.get("N_MINFO") or song.get("nMinfo") or ""
@@ -576,7 +602,7 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
             alb_pic_short = alb.get("pic") or ""
             alb_pic = ""
             if alb_pic_short:
-                alb_pic = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + alb_pic_short)
+                alb_pic = _upgrade_cover_url("https://img3.kuwo.cn/star/albumcover/" + alb_pic_short)
             if not alb_pic:
                 alb_pic = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{alb_id}.jpg"
             alb_year = str(alb.get("pub") or "").strip()
@@ -652,7 +678,7 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
         # 封面：优先 img，其次 pic，最后按 albumid 兜底
         cover = (data.get("img") or data.get("pic") or "").strip()
         if cover and not cover.startswith("http"):
-            cover = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + cover)
+            cover = _upgrade_cover_url("https://img3.kuwo.cn/star/albumcover/" + cover)
         if not cover:
             cover = f"https://img3.kuwo.cn/star/albumcover/500/0/0/{album_id}.jpg"
         result["cover"] = cover
@@ -683,7 +709,7 @@ async def get_album_detail(album_id: str, timeout: float = 10.0) -> dict:
             track_cover = result["cover"]
             album_pic_short = song.get("web_albumpic_short") or ""
             if album_pic_short:
-                track_cover = re.sub(r'/120(?=/|$)', '/500', "https://img3.kuwo.cn/star/albumcover/" + album_pic_short)
+                track_cover = _upgrade_cover_url("https://img3.kuwo.cn/star/albumcover/" + album_pic_short)
 
             # 音质走 N_MINFO
             nminfo = song.get("N_MINFO") or song.get("nMinfo") or ""
@@ -735,8 +761,7 @@ class KuwoProvider(SearchProvider):
     async def search(self, keyword: str, limit: int = 10,
                      search_type: str = "music",
                      skip_formats: bool = False,
-                     cookie: str = "") -> list[SearchResult]:
-        # kuwo 不需要 cookie，忽略
+                     cookie: str = "") -> list[SearchResult]:  # kuwo 暂不需要cookie
         return await search(keyword, limit=limit, search_type=search_type,
                            skip_formats=skip_formats)
 

@@ -104,6 +104,11 @@ class MiAuth:
             await self._client.aclose()
             self._client = None
 
+    def set_device_id(self, device_id: str) -> None:
+        """设置设备 ID（app 重启后从持久化配置恢复 deviceId，避免使用空 deviceId 触发风控）"""
+        self._device_id = device_id
+        self._user_agent = _format_user_agent(device_id)
+
     # ===== QR 码登录流程 =====
 
     async def get_qr_code(self) -> Optional[dict]:
@@ -346,6 +351,8 @@ class MiAuth:
             失败返回 None
         """
         client = self._ensure_client()
+        # 清空 cookie jar，避免复用上一次登录流程的旧 cookie（防止 passToken 被风控）
+        client.cookies = httpx.Cookies()
 
         service_login_url = (
             f"{ACCOUNT_BASE_URL}/pass/serviceLogin"
@@ -522,15 +529,17 @@ class MiAuth:
     # ===== 内部方法 =====
 
     def _get_cookie_value(self, name: str) -> str:
-        """从 cookie jar 中提取指定名称的 cookie 值"""
+        """从 cookie jar 中提取指定名称的 cookie 值（返回最后写入的匹配 cookie）"""
         client = self._ensure_client()
         if not client.cookies or not client.cookies.jar:
             return ""
 
+        value = ""
         for cookie in client.cookies.jar:
             if cookie.name == name:
-                return cookie.value
-        return ""
+                # 保留最后写入的匹配 cookie（重定向过程中可能被多次 Set-Cookie 覆盖）
+                value = cookie.value
+        return value
 
     def _build_cookie_header(self, url: str) -> str:
         """构建 Cookie header 字符串"""
@@ -538,8 +547,11 @@ class MiAuth:
         if not client.cookies or not client.cookies.jar:
             return ""
 
-        # 提取 URL 的域名
-        url_host = url.split("/")[2].split(":")[0] if "://" in url else ""
+        # 提取 URL 的域名（使用 httpx.URL 解析，比字符串 split 更健壮）
+        try:
+            url_host = httpx.URL(url).host or ""
+        except Exception:
+            url_host = ""
 
         cookies = []
         for cookie in client.cookies.jar:

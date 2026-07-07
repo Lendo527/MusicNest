@@ -2113,6 +2113,7 @@ const PLAY_MODE_ICONS = {
     'list': 'bi-list',
     'list_loop': 'bi-arrow-repeat',
     'shuffle': 'bi-shuffle',
+    'random': 'bi-shuffle',
 };
 
 // 播放模式标题映射
@@ -2122,6 +2123,7 @@ const PLAY_MODE_TITLES = {
     'list': '列表播放',
     'list_loop': '列表循环',
     'shuffle': '随机播放',
+    'random': '随机播放',
 };
 
 let progressTimer = null;
@@ -2130,20 +2132,22 @@ let currentDuration = 0;
 let localPosition = 0;
 let localTimer = null;
 let apiStarted = false;  // API position 是否开始走了
-let currentPlayingIndex = null;  // 追踪当前播放歌曲在播放列表中的索引（用于检测歌曲切换）
-let currentPlayingIdx = null;    // 追踪当前播放歌曲在音乐库中的 _idx（用于高亮行匹配）
+let currentPlaylistIndex = null;  // 追踪当前播放歌曲在播放列表中的索引（用于检测歌曲切换）
+let currentLibraryIdx = null;    // 追踪当前播放歌曲在音乐库中的 _idx（用于高亮行匹配）
 let _lastPlaylistSignature = '';  // 追踪播放列表变化（长度+当前索引），用于自动刷新面板
 
 // 始终更新播放模式图标（即使没有歌曲在播）
 function updateModeIcon(state) {
     if (!state || !state.mode) return;
+    // 后端可能返回 random，归一化为 shuffle 显示
+    const mode = state.mode === 'random' ? 'shuffle' : state.mode;
     const modeIcon = document.getElementById('playerModeIcon');
     if (modeIcon) {
-        modeIcon.className = 'bi ' + (PLAY_MODE_ICONS[state.mode] || 'bi-music-note');
+        modeIcon.className = 'bi ' + (PLAY_MODE_ICONS[mode] || 'bi-music-note');
     }
     const modeBtn = document.getElementById('playerModeBtn');
     if (modeBtn) {
-        modeBtn.title = '播放模式: ' + (PLAY_MODE_TITLES[state.mode] || state.mode);
+        modeBtn.title = '播放模式: ' + (PLAY_MODE_TITLES[mode] || mode);
     }
 }
 
@@ -2171,10 +2175,11 @@ function renderPlaylistPanelFromState(state) {
         </li>
     `).join('');
 
-    // 自动滚动到当前播放歌曲（居中显示）
+    // 仅在当前歌曲索引变化时滚动到当前播放歌曲（避免每次刷新都触发滚动）
     const currentEl = document.querySelector('#playlistItems li.current');
-    if (currentEl) {
+    if (currentEl && currentIdx !== window._lastScrolledIdx) {
         currentEl.scrollIntoView({behavior: 'smooth', block: 'center'});
+        window._lastScrolledIdx = currentIdx;
     }
 }
 
@@ -2190,15 +2195,15 @@ function updatePlayerUI(state) {
 
     // 检测歌曲切换：仅在歌曲变化时重启进度轮询，避免每 5 秒重复重启
     const song = state.song;
-    const songChanged = hasSong && state.current_index !== currentPlayingIndex;
+    const songChanged = hasSong && state.current_index !== currentPlaylistIndex;
     if (hasSong) {
-        currentPlayingIndex = state.current_index;
+        currentPlaylistIndex = state.current_index;
         // 更新高亮用的 _idx：优先用 song._idx，否则用 filepath 匹配
         if (song && song._idx !== undefined && song._idx !== null) {
-            currentPlayingIdx = song._idx;
+            currentLibraryIdx = song._idx;
         } else if (song && song.filepath && songsCache.length > 0) {
             const matched = songsCache.find(s => s.filepath === song.filepath);
-            if (matched) currentPlayingIdx = matched._idx;
+            if (matched) currentLibraryIdx = matched._idx;
         }
     }
 
@@ -2241,12 +2246,9 @@ function updatePlayerUI(state) {
     if (state.duration > 0) {
         document.getElementById('playerTotalTime').textContent = formatDuration(state.duration);
     }
-    
-    // 播放模式图标
-    const modeIcon = document.getElementById('playerModeIcon');
-    modeIcon.className = 'bi ' + (PLAY_MODE_ICONS[state.mode] || 'bi-music-note');
-    document.getElementById('playerModeBtn').title = '播放模式: ' + (PLAY_MODE_TITLES[state.mode] || state.mode);
-    
+
+    // 播放模式图标由 updateModeIcon 在 fetchPlayerState 中无条件调用，此处不再重复设置
+
     // 音量
     if (state.volume !== undefined) {
         document.getElementById('playerVolume').value = state.volume;
@@ -2259,8 +2261,8 @@ function highlightCurrentSong() {
     document.querySelectorAll('#songTableBody tr').forEach(tr => {
         tr.classList.remove('table-active');
     });
-    if (currentPlayingIdx !== null && currentPlayingIdx !== undefined) {
-        const row = document.getElementById('songRow_' + currentPlayingIdx);
+    if (currentLibraryIdx !== null && currentLibraryIdx !== undefined) {
+        const row = document.getElementById('songRow_' + currentLibraryIdx);
         if (row) row.classList.add('table-active');
     }
 }
@@ -2283,17 +2285,18 @@ async function fetchPlayerState() {
         } else {
             // 没有正在播放的歌曲
             stopProgressPoll();
+            stopTranscodePolling();
             updateProgress(0, 0);
             document.getElementById('playerCover').style.display = 'none';
             // 重置高亮状态，避免残留高亮行
-            currentPlayingIdx = null;
-            currentPlayingIndex = null;
+            currentLibraryIdx = null;
+            currentPlaylistIndex = null;
             highlightCurrentSong();
         }
 
         // 检测播放列表变化：当 playlist 长度或 current_index 变化时，
         // 若播放列表面板已展开则自动刷新（语音指令改了播放列表/模式后自动同步）
-        const sig = (data.playlist || []).length + ':' + (data.current_index ?? '') + ':' + (data.mode || '');
+        const sig = (data.playlist || []).map(s => s.filepath || s.title).join(',') + ':' + (data.current_index ?? '') + ':' + (data.mode || '');
         if (sig !== _lastPlaylistSignature) {
             _lastPlaylistSignature = sig;
             const panel = document.getElementById('playlistPanel');
@@ -2326,8 +2329,9 @@ function stopProgressPoll() {
         clearInterval(localTimer);
         localTimer = null;
     }
-    localPosition = 0;
-    apiStarted = false;
+    // 暂停时不重置 localPosition/apiStarted，保留以便恢复时对比
+    // 切歌/停止播放时停止转码轮询
+    stopTranscodePolling();
 }
 
 async function pollProgressApi() {
@@ -2348,14 +2352,17 @@ async function pollProgressApi() {
             progressTimer = setInterval(pollProgressApi, 8000);  // 降频到 8s 纠偏
             localTimer = setInterval(() => {
                 if (isDragging) return;
-                localPosition += 0.2;
-                if (currentDuration > 0 && localPosition > currentDuration) {
-                    localPosition = currentDuration;
-                    // 到达末尾时立即拉一次 API，快速检测单曲循环（position 回到 0）
-                    pollProgressApi();
-                    return;
+                if (currentDuration > 0) {
+                    localPosition += 0.2;
+                    if (localPosition > currentDuration) {
+                        localPosition = currentDuration;
+                        // 到达末尾时立即拉一次 API，快速检测单曲循环（position 回到 0）
+                        pollProgressApi();
+                        return;
+                    }
+                    updateProgress(Math.floor(localPosition), currentDuration);
                 }
-                updateProgress(Math.floor(localPosition), currentDuration);
+                // duration=0时不累加localPosition，只显示--:--
             }, 200);
         }
         return;
@@ -2404,23 +2411,32 @@ function seekProgress(event) {
     seekTo(seconds);
 }
 
-async function seekTo(seconds) {
-    const r = await api('/api/player/seek', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({position: seconds})
-    });
-    if (r.code === 0) {
-        // 立即更新进度显示，重置本地计时
-        localPosition = seconds;
-        updateProgress(seconds, currentDuration);
-    }
+let _seekDebounceTimer = null;
+function seekTo(seconds) {
+    // 立即更新本地UI，让用户即时看到进度变化
+    localPosition = seconds;
+    updateProgress(seconds, currentDuration);
+    // 去抖300ms请求API，防止拖动/快速点击时疯狂请求
+    if (_seekDebounceTimer) clearTimeout(_seekDebounceTimer);
+    _seekDebounceTimer = setTimeout(async () => {
+        _seekDebounceTimer = null;
+        const r = await api('/api/player/seek', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({position: seconds})
+        });
+        if (r.code === 0) {
+            // 立即更新进度显示，重置本地计时
+            localPosition = seconds;
+            updateProgress(seconds, currentDuration);
+        }
+    }, 300);
 }
 
 function startSeekDrag(event) {
     event.preventDefault();
     isDragging = true;
-    // 立即跳转
+    // 立即跳转（更新UI + 去抖请求API）
     seekProgress(event);
 
     // 安全释放：鼠标移出窗口等情况下 mouseup 可能丢失
@@ -2431,28 +2447,48 @@ function startSeekDrag(event) {
     }, 5000);
 
     const onMove = (e) => {
-        seekProgress(e);
+        // 拖动时只更新本地UI，不调用seekTo（避免疯狂请求API）
+        const seconds = _getSeekPosition(e);
+        localPosition = seconds;
+        updateProgress(seconds, currentDuration);
     };
-    const onUp = () => {
+    const onUp = (e) => {
         isDragging = false;
         clearTimeout(safetyTimer);
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
+        // 释放时才发一次seekTo请求
+        seekTo(_getSeekPosition(e));
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
 }
 
 // ===== 音量控制 =====
-async function playerSetVolume(vol) {
-    const r = await api('/api/player/volume', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({volume: parseInt(vol)})
-    });
+let _volumeDebounceTimer = null;
+function playerSetVolume(vol) {
+    if (_volumeDebounceTimer) clearTimeout(_volumeDebounceTimer);
+    _volumeDebounceTimer = setTimeout(async () => {
+        _volumeDebounceTimer = null;
+        await api('/api/player/volume', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({volume: parseInt(vol)})
+        });
+    }, 200);
+}
+
+// 播放控制类按钮防抖（500ms内忽略重复点击，避免并发请求）
+let _playerActionLock = false;
+function _lockPlayerAction() {
+    if (_playerActionLock) return false;
+    _playerActionLock = true;
+    setTimeout(() => { _playerActionLock = false; }, 500);
+    return true;
 }
 
 async function playerToggle() {
+    if (!_lockPlayerAction()) return;
     const r = await api('/api/player/toggle_play', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2466,6 +2502,7 @@ async function playerToggle() {
 }
 
 async function playerNext() {
+    if (!_lockPlayerAction()) return;
     const r = await api('/api/player/next', { method: 'POST' });
     if (r.code === 0 && r.data) {
         updatePlayerUI(r.data);
@@ -2478,6 +2515,7 @@ async function playerNext() {
 }
 
 async function playerPrev() {
+    if (!_lockPlayerAction()) return;
     const r = await api('/api/player/prev', { method: 'POST' });
     if (r.code === 0 && r.data) {
         updatePlayerUI(r.data);
@@ -2487,6 +2525,7 @@ async function playerPrev() {
 }
 
 async function playerCycleMode() {
+    if (!_lockPlayerAction()) return;
     const r = await api('/api/player/mode', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2508,15 +2547,20 @@ function togglePlaylist() {
 }
 
 async function refreshPlaylistPanel() {
+    // 记录调用前的签名，用于判断 fetchPlayerState 是否已渲染
+    const prevSig = _lastPlaylistSignature;
     const state = await fetchPlayerState();
     if (!state) {
         document.getElementById('playlistItems').innerHTML =
             '<li class="text-muted px-3 py-2">暂无播放列表</li>';
         return;
     }
-    // fetchPlayerState 已在变化时自动调用 renderPlaylistPanelFromState，
-    // 这里再调一次确保面板刚展开时立即渲染
-    renderPlaylistPanelFromState(state);
+    // fetchPlayerState 已在签名变化时自动渲染；
+    // 仅在签名未变化（fetchPlayerState 未渲染）时补渲染一次，
+    // 确保面板刚展开时即使无变化也立即渲染内容
+    if (_lastPlaylistSignature === prevSig) {
+        renderPlaylistPanelFromState(state);
+    }
 }
 
 async function playlistPlaySong(index) {
@@ -2694,7 +2738,7 @@ function renderVcKwTags(key) {
     const container = document.getElementById('vcKwTags_' + key);
     if (!container) return;
     container.innerHTML = vcEditKw[key].map((k, j) =>
-        `<span class="badge me-1 mb-1" style="background:var(--accent);font-size:13px;cursor:default">${escHtml(k)}<button type="button" class="btn-close btn-close-white ms-1" style="font-size:0.6rem" onclick="removeVoiceKw('${key}',${j})"></button></span>`
+        `<span class="badge me-1 mb-1" style="background:var(--accent);font-size:13px;cursor:default">${escHtml(k)}<button type="button" class="btn-close btn-close-white ms-1" style="font-size:0.6rem" data-vc-key="${escAttr(key)}" data-vc-kw-idx="${j}" onclick="removeVoiceKw(this.dataset.vcKey, parseInt(this.dataset.vcKwIdx))"></button></span>`
     ).join('');
 }
 
@@ -3071,7 +3115,7 @@ async function loadAlarms() {
             <td><span class="badge bg-secondary">${a.days && a.days.length > 0 ? '自定义' : '每天'}</span></td>
             <td><small class="text-muted">${escHtml(a.song_hint || '默认歌单')}</small></td>
             <td>
-                <button class="btn btn-sm btn-outline-danger" onclick="deleteAlarm('${a.id}')" title="删除">
+                <button class="btn btn-sm btn-outline-danger" data-alarm-id="${escAttr(a.id)}" onclick="deleteAlarm(this.dataset.alarmId)" title="删除">
                     <i class="bi bi-trash"></i>
                 </button>
             </td>
@@ -3159,7 +3203,7 @@ async function loadPlaylists() {
 
         return `
         <div class="card-dark mb-3">
-            <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer" onclick="togglePlaylistBody('${pl.id}')">
+            <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer" data-playlist-id="${escAttr(pl.id)}" onclick="togglePlaylistBody(this.dataset.playlistId)">
                 <span>
                     <i class="bi bi-chevron-right me-1" id="plIcon_${pl.id}"></i>
                     <i class="bi bi-collection-play me-2"></i>
@@ -3281,13 +3325,19 @@ async function showAddToPlaylist(filepath, event) {
     menu.style.top = (rect.bottom + 4) + 'px';
     menu.style.display = '';
 
-    // 点击空白关闭
+    // 点击空白关闭（重开前先移除旧监听器，避免快速重开时累积）
+    if (window._addToPlaylistCloseMenu) {
+        document.removeEventListener('click', window._addToPlaylistCloseMenu);
+        window._addToPlaylistCloseMenu = null;
+    }
     const closeMenu = (e) => {
         if (!menu.contains(e.target)) {
             menu.style.display = 'none';
             document.removeEventListener('click', closeMenu);
+            window._addToPlaylistCloseMenu = null;
         }
     };
+    window._addToPlaylistCloseMenu = closeMenu;
     setTimeout(() => document.addEventListener('click', closeMenu), 50);
 }
 
@@ -3399,6 +3449,12 @@ function startTranscodePolling(realIndex) {
     if (txt) txt.textContent = '转码中...';
 
     const poll = async () => {
+        // 最大轮询时长5分钟，超时停止并提示
+        if (Date.now() - _transcodePollStart > 300000) {
+            if (txt) txt.textContent = '转码超时';
+            stopTranscodePolling();
+            return;
+        }
         try {
             const r = await api(`/api/music/transcode/status/${realIndex}`);
             if (!r || r.code !== 0) return;
@@ -3979,9 +4035,9 @@ async function refreshDownloadTasks() {
 
         const ops = [];
         if (t.status === 'error') {
-            ops.push('<button class="btn btn-sm btn-outline-warning me-1" onclick="retryDownload(\'' + t.task_id + '\')">重试</button>');
+            ops.push('<button class="btn btn-sm btn-outline-warning me-1" data-task-id="' + escAttr(t.task_id) + '" onclick="retryDownload(this.dataset.taskId)">重试</button>');
         }
-        ops.push('<button class="btn btn-sm btn-outline-danger" onclick="deleteDownloadTask(\'' + t.task_id + '\')"><i class="bi bi-trash"></i></button>');
+        ops.push('<button class="btn btn-sm btn-outline-danger" data-task-id="' + escAttr(t.task_id) + '" onclick="deleteDownloadTask(this.dataset.taskId)"><i class="bi bi-trash"></i></button>');
 
         return '<tr style="vertical-align:middle;">' +
             '<td class="small"><code>' + (t.task_id || '').substring(0, 12) + '</code></td>' +
