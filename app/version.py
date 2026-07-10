@@ -7,6 +7,34 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.69 - 第二轮深度代码审阅修复:
+           main.py:
+             H1 _on_voice_message的play_song/next/previous/stop/play_playlist/set_play_mode
+                分支修改play_state时加_play_lock，与API端点一致防竞态;
+             H4 _alarm_loop修改play_state加_play_lock;
+             H5 _smart_resume_playback修改play_state加_play_lock;
+             H3 _transcode_status/_transcode_locks新增上限500条目清理
+                (_cleanup_transcode_status_index)，防大曲库内存泄漏;
+             H2 tracker函数全部改为await调用(16处);
+             M1 新增共享_proxy_client连接池(api_music_proxy复用);
+             M6 scanner.search全部改asyncio.to_thread(5处，防阻塞事件循环);
+             M7 新增封面缓存清理(_cleanup_cover_cache，上限200MB);
+             M5 删除未使用的Counter导入和playlist_sync_worker死代码;
+             M10 删除_parse_cn_number中200-900的死分支;
+             L2 提取_delete_song_by_filepath函数，移除_FakeReq hack;
+             L3 os.rename统一为os.replace;
+             L4 _parse_alarm_from_query合并重复正则为_apply_period+_try_pattern;
+             L5 api_playlist_create删除冗余的第二次config.get;
+           config.py:
+             M2 set()改防抖保存(_schedule_save 500ms)+flush_save+atexit注册;
+           tracker.py:
+             H2 新增_async_wrap装饰器，16个公开函数全部async化;
+           worker.py:
+             H2 tracker调用全部加await(16处);
+             M3 _download_file移除逐chunk线程池写入(直接同步write);
+             M8 删除netease_download_url函数内重复导入;
+           monitor.py:
+             M4 mark_query_handled移除break，标记所有匹配项防重复处理;
   0.0.68 - 全代码库深度审阅修复(CRITICAL 7 + HIGH 15 + MEDIUM 30 + LOW 30):
            main.py:
              C1 play_state加asyncio.Lock防并发竞态(播放列表大BUG根因);
@@ -512,4 +540,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.68"
+__version__ = "0.0.69"

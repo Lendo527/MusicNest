@@ -1,5 +1,6 @@
 """配置管理 - 持久化到 /data/config.yaml"""
 
+import atexit
 import copy
 import logging
 import os
@@ -58,6 +59,9 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/data/config.yaml")
+
+_config_save_timer: threading.Timer | None = None
+_config_save_lock = threading.Lock()
 
 
 class ConfigManager:
@@ -129,6 +133,25 @@ class ConfigManager:
                 except Exception:
                     pass
 
+    def _schedule_save(self) -> None:
+        """防抖保存：延迟 500ms 合并多次写入，避免高频调用时频繁写文件"""
+        global _config_save_timer
+        with _config_save_lock:
+            if _config_save_timer is not None:
+                _config_save_timer.cancel()
+            _config_save_timer = threading.Timer(0.5, self._save)
+            _config_save_timer.daemon = True
+            _config_save_timer.start()
+
+    def flush_save(self) -> None:
+        """立即刷新待保存的配置（用于进程退出前调用）"""
+        global _config_save_timer
+        with _config_save_lock:
+            if _config_save_timer is not None:
+                _config_save_timer.cancel()
+                _config_save_timer = None
+        self._save()
+
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
             val = self._data.get(key, default)
@@ -141,7 +164,7 @@ class ConfigManager:
         # H1: 深拷贝入参，避免外部对象与配置内部状态共享引用
         with self._lock:
             self._data[key] = copy.deepcopy(value)
-        self._save()
+        self._schedule_save()
 
     def update(self, updates: dict[str, Any]) -> None:
         # M1: 先更新内存后持久化，_save 失败时内存已改但文件未持久化（接受此语义，避免回滚引入复杂性）
@@ -178,3 +201,5 @@ class ConfigManager:
 
 # 全局单例
 config = ConfigManager()
+
+atexit.register(config.flush_save)

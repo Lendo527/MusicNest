@@ -77,15 +77,13 @@ class ConversationMonitor:
         return None
 
     def mark_query_handled(self, device_id: str, query: str) -> None:
-        """标记某个 query 已被处理（供轨道2避免重复触发）"""
-        # 简单实现：写入一个标记字段，下次 get_last_query 跳过它
-        # 这里通过在 _message_buffer 中加 handled 标记实现
+        """标记某设备的某条 query 已被处理，防止跨轨道重复处理"""
         for m in reversed(self._message_buffer):
             if (m.get("device_id") == device_id
                 and m.get("query", "") == query
                 and not m.get("handled", False)):
                 m["handled"] = True
-                break
+                # 不 break：标记所有匹配项，防止短时间内重复语音指令被多次处理
 
     def is_query_handled(self, device_id: str, query: str, within_sec: float = 30.0) -> bool:
         """检查某个 query 是否已被轨道1处理过"""

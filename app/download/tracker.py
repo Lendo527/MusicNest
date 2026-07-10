@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Optional, List
 from dataclasses import dataclass, field
+import asyncio
+import functools
 
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/musicnest.db"))
 
@@ -19,6 +21,14 @@ _lock = threading.RLock()
 _thread_local = threading.local()
 
 logger = logging.getLogger("musicnest.tracker")
+
+
+def _async_wrap(func):
+    """将同步函数包装为异步函数，通过 asyncio.to_thread 避免阻塞事件循环"""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
+    return wrapper
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -46,6 +56,7 @@ def _close_thread_local_conn() -> None:
 atexit.register(_close_thread_local_conn)
 
 
+@_async_wrap
 def init_db():
     """初始化数据库表"""
     with _lock:
@@ -153,6 +164,7 @@ class DownloadTask:
         }
 
 
+@_async_wrap
 def add_task(
     task_id: str,
     source: str,
@@ -190,6 +202,7 @@ def add_task(
             pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def get_waiting_tasks(limit: int = 2) -> List[DownloadTask]:
     """获取等待中的下载任务"""
     # 读操作：WAL 模式下读不阻塞写，无需持锁
@@ -204,6 +217,7 @@ def get_waiting_tasks(limit: int = 2) -> List[DownloadTask]:
         pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def update_task_status(task_id: str, status: str, error_msg: str = "", file_path: str = ""):
     """更新任务状态"""
     now = time.time()
@@ -220,6 +234,7 @@ def update_task_status(task_id: str, status: str, error_msg: str = "", file_path
             pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def get_task_by_id(task_id: str) -> Optional[DownloadTask]:
     """根据 task_id 获取任务"""
     # 读操作：WAL 模式下读不阻塞写，无需持锁
@@ -235,6 +250,7 @@ def get_task_by_id(task_id: str) -> Optional[DownloadTask]:
         pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def get_tasks(
     status: str = "",
     limit: int = 50,
@@ -259,6 +275,7 @@ def get_tasks(
         pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def get_download_stats() -> dict:
     """获取下载统计"""
     # 读操作：WAL 模式下读不阻塞写，无需持锁
@@ -286,6 +303,7 @@ def get_download_stats() -> dict:
         pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def delete_task(task_id: str):
     """删除下载任务"""
     with _lock:
@@ -297,6 +315,7 @@ def delete_task(task_id: str):
             pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def clear_finished_tasks():
     """清空已完成的任务"""
     with _lock:
@@ -308,6 +327,7 @@ def clear_finished_tasks():
             pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def reset_stale_loading_tasks(timeout_minutes: int = 30) -> int:
     """重置卡在 loading 状态超过指定时长的任务为 waiting
 
@@ -338,6 +358,7 @@ def reset_stale_loading_tasks(timeout_minutes: int = 30) -> int:
 
 # ===== 同步历史 =====
 
+@_async_wrap
 def record_sync(source: str, playlist_id: str, music_id: str):
     """记录同步"""
     now = time.time()
@@ -355,6 +376,7 @@ def record_sync(source: str, playlist_id: str, music_id: str):
             pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def is_synced(source: str, playlist_id: str, music_id: str) -> bool:
     """检查是否已同步"""
     # 读操作：WAL 模式下读不阻塞写，无需持锁
@@ -369,6 +391,7 @@ def is_synced(source: str, playlist_id: str, music_id: str) -> bool:
         pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def get_synced_ids(source: str, playlist_id: str) -> set:
     """获取已同步的 music_id 集合"""
     # 读操作：WAL 模式下读不阻塞写，无需持锁
@@ -383,6 +406,7 @@ def get_synced_ids(source: str, playlist_id: str) -> set:
         pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def clear_sync_history(source: str = "", playlist_id: str = ""):
     """清除同步记录"""
     with _lock:
@@ -402,6 +426,7 @@ def clear_sync_history(source: str = "", playlist_id: str = ""):
             pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def get_playlist_sync_anchor(source: str, playlist_id: str) -> tuple[int, int]:
     """获取歌单同步锚点
 
@@ -423,6 +448,7 @@ def get_playlist_sync_anchor(source: str, playlist_id: str) -> tuple[int, int]:
         pass  # 线程局部连接复用，不主动关闭
 
 
+@_async_wrap
 def set_playlist_sync_anchor(source: str, playlist_id: str,
                               update_time: int, track_update_time: int) -> None:
     """更新歌单同步锚点"""

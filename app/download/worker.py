@@ -109,10 +109,9 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                 total = int(resp.headers.get("content-length", 0))
                 downloaded = 0
                 last_log_pct = -1
-                loop = asyncio.get_running_loop()
                 with open(dest_part, "wb") as f:
                     async for chunk in resp.aiter_bytes():
-                        await loop.run_in_executor(None, f.write, chunk)
+                        f.write(chunk)
                         downloaded += len(chunk)
                         if total > 0:
                             pct = int(downloaded * 100 / total)
@@ -274,7 +273,7 @@ async def _process_task(task) -> bool:
     logger.info(f"[Download] 开始处理: {task_id} {title} - {artist} [{source}]")
 
     # 标记为 loading
-    update_task_status(task_id, "loading")
+    await update_task_status(task_id, "loading")
 
     try:
         # ==== 第一步：获取歌曲详情（含封面、专辑ID、歌手ID）====
@@ -306,7 +305,7 @@ async def _process_task(task) -> bool:
                 # 不再 fallback 到 results[0]：避免下载到错误歌曲
 
             if not matched:
-                update_task_status(task_id, "error", error_msg="未找到匹配歌曲")
+                await update_task_status(task_id, "error", error_msg="未找到匹配歌曲")
                 return False
 
             if not resolved_cover and matched.cover:
@@ -331,7 +330,6 @@ async def _process_task(task) -> bool:
 
         elif source == "netease":
             from app.search.netease import get_song_detail as netease_song_detail
-            from app.search.netease import get_download_url as netease_download_url
             from app.config import config
 
             # 网易云需要 cookie 才能获取 FLAC/Hi-Res 下载链接
@@ -355,7 +353,7 @@ async def _process_task(task) -> bool:
                 download_url = await netease_download_url(music_id, br=320000, cookie=netease_cookie)
 
         if not download_url:
-            update_task_status(task_id, "error", "无法获取下载链接")
+            await update_task_status(task_id, "error", "无法获取下载链接")
             return False
 
         # ==== 第二步：构建目录 ====
@@ -384,7 +382,7 @@ async def _process_task(task) -> bool:
             logger.info(f"[Download] 文件已存在: {track_path}")
             if resolved_cover:
                 await _download_cover(resolved_cover, artist_dir, album_dir)
-            update_task_status(task_id, "success", file_path=str(track_path))
+            await update_task_status(task_id, "success", file_path=str(track_path))
             return True
 
         # ==== 第三步：下载音频 ====
@@ -395,7 +393,7 @@ async def _process_task(task) -> bool:
             logger.info(f"[Download] 下载音频: {download_url[:80]}...")
             success = await _download_file(download_url, track_path, task_id=task_id)
             if not success:
-                update_task_status(task_id, "error", "音频下载失败")
+                await update_task_status(task_id, "error", "音频下载失败")
                 return False
 
         # ==== 第四步：下载封面 + 歌手图 ====
@@ -422,7 +420,7 @@ async def _process_task(task) -> bool:
             except Exception as e:
                 logger.warning(f"[Download] 创建 ID3 标记文件失败: {e}")
 
-        update_task_status(task_id, "success", file_path=str(track_path))
+        await update_task_status(task_id, "success", file_path=str(track_path))
         logger.info(f"[Download] 完成: {task_id} -> {track_path}")
         # 通知扫描器增量更新（优先使用外部 scanner 引用，避免缓存不同步）
         scanned = False
@@ -441,7 +439,7 @@ async def _process_task(task) -> bool:
 
     except Exception as e:
         logger.error(f"[Download] 下载异常: {task_id} err={e}", exc_info=True)
-        update_task_status(task_id, "error", str(e))
+        await update_task_status(task_id, "error", str(e))
         return False
 
 
@@ -452,7 +450,7 @@ async def download_worker(poll_interval: float = 5.0):
     logger.info("[Download] 下载 Worker 已启动")
 
     # 启动时重置上次崩溃残留的 loading 任务，避免卡死（阈值 60 分钟，避免误杀大文件任务）
-    reset_stale_loading_tasks(timeout_minutes=60)
+    await reset_stale_loading_tasks(timeout_minutes=60)
 
     # 并发限制：由 semaphore 真正限流，DB 查询 limit 放大以充分填充并发槽
     sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -466,7 +464,7 @@ async def download_worker(poll_interval: float = 5.0):
 
     while RUNNING:
         try:
-            tasks = get_waiting_tasks(limit=10)
+            tasks = await get_waiting_tasks(limit=10)
             if tasks:
                 logger.info(f"[Download] 处理 {len(tasks)} 个待下载任务")
                 coros = [process_with_semaphore(t) for t in tasks]
@@ -475,7 +473,7 @@ async def download_worker(poll_interval: float = 5.0):
             # 周期性重置卡死的 loading 任务（每 5 分钟一次，阈值 60 分钟）
             now = time.time()
             if now - last_reset_time >= stale_reset_interval:
-                reset_stale_loading_tasks(timeout_minutes=60)
+                await reset_stale_loading_tasks(timeout_minutes=60)
                 last_reset_time = now
         except Exception as e:
             logger.error(f"[Download] Worker 异常: {e}", exc_info=True)
@@ -546,7 +544,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                     remote_track_update = detail.get("track_update_time", 0)
 
                     # 对比本地锚点
-                    local_update, local_track_update = get_playlist_sync_anchor(source, pl_id)
+                    local_update, local_track_update = await get_playlist_sync_anchor(source, pl_id)
                     if remote_update and remote_update == local_update \
                             and remote_track_update == local_track_update:
                         logger.debug(f"[PlaylistSync] 歌单 [{pl_name}] 锚点未变化，跳过")
@@ -563,7 +561,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                     continue
 
                 # 已同步 ID
-                synced = get_synced_ids(source, pl_id)
+                synced = await get_synced_ids(source, pl_id)
 
                 new_count = 0
                 for track in tracks:
@@ -584,7 +582,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
 
                         if already_local:
                             # 本地已有，直接标记为已同步，不重复下载
-                            record_sync(source, pl_id, track.id)
+                            await record_sync(source, pl_id, track.id)
                             logger.info("[PlaylistSync] 跳过已存在本地的歌曲: %s - %s", track.artist, track.title)
                             continue
 
@@ -593,7 +591,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                         flac_priority = config.get("download", {}).get("flac_priority", True)
                         fmt = "flac" if flac_priority else "mp3"
 
-                        added = add_task(
+                        added = await add_task(
                             task_id=task_id,
                             source=source,
                             music_id=track.id.replace(f"{source}_", ""),
@@ -604,7 +602,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                             format_type=fmt,
                         )
                         # add_task 的 ON CONFLICT 已自动将 error/loading 状态重置为 waiting
-                        record_sync(source, pl_id, track.id)
+                        await record_sync(source, pl_id, track.id)
                         new_count += 1
                     except Exception as e:
                         logger.error(f"[PlaylistSync] 处理单曲失败: {track.artist} - {track.title} err={e}", exc_info=True)
@@ -612,7 +610,7 @@ async def playlist_sync_worker(sync_interval: int = 1800):
 
                 # 无论是否有新曲目，都更新锚点（避免下次重复拉取）
                 if remote_update or remote_track_update:
-                    set_playlist_sync_anchor(source, pl_id, remote_update, remote_track_update)
+                    await set_playlist_sync_anchor(source, pl_id, remote_update, remote_track_update)
 
                 if new_count > 0:
                     logger.info(f"[PlaylistSync] 歌单 [{pl_name}] 新增 {new_count} 首待下载")

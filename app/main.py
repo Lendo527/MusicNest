@@ -301,6 +301,28 @@ KUWO_HEADERS = {
     "Referer": "http://www.kuwo.cn/",
 }
 
+# 共享 httpx 客户端（复用连接池，避免每次代理请求都新建 TCP 连接）
+_proxy_client: Optional[httpx.AsyncClient] = None
+
+
+async def _get_proxy_client() -> httpx.AsyncClient:
+    """获取共享的代理 httpx 客户端，复用连接池提升性能"""
+    global _proxy_client
+    if _proxy_client is None or _proxy_client.is_closed:
+        _proxy_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=15.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _proxy_client
+
+
+async def _close_proxy_client() -> None:
+    """关闭共享代理客户端（lifespan 关闭时调用）"""
+    global _proxy_client
+    if _proxy_client is not None:
+        await _proxy_client.aclose()
+        _proxy_client = None
+
 
 # ===== 睡眠定时 =====
 
@@ -450,26 +472,28 @@ async def _alarm_loop(alarm_id: str, hour: int, minute: int, days: list[int], so
                     if song_index < 0 or song_index >= len(play_state.playlist):
                         logger.warning(f"[Alarm] 闹钟 id={alarm_id} song_index={song_index} 越界(playlist={len(play_state.playlist)})，改用第一首")
                         song_index = 0
-                    # 必须设置 current_index，否则 _play_on_device 内部 current_song() 用旧索引
-                    play_state.current_index = song_index
-                    ok = await _play_on_device(alarm_device_id, song_index)
-                    play_state.is_playing = ok
-                    if ok:
-                        play_state.device_id = alarm_device_id  # 播放成功后才写回
-                        logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放歌曲 index={song_index}")
-                    else:
-                        logger.warning(f"[Alarm] 闹钟 id={alarm_id} 播放失败")
+                    async with _play_lock:
+                        # 必须设置 current_index，否则 _play_on_device 内部 current_song() 用旧索引
+                        play_state.current_index = song_index
+                        ok = await _play_on_device(alarm_device_id, song_index)
+                        play_state.is_playing = ok
+                        if ok:
+                            play_state.device_id = alarm_device_id  # 播放成功后才写回
+                            logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放歌曲 index={song_index}")
+                        else:
+                            logger.warning(f"[Alarm] 闹钟 id={alarm_id} 播放失败")
                 else:
                     # 播放第一首可用歌曲
                     songs = scanner.get_songs(limit=1)
                     if songs:
-                        play_state.playlist = scanner.get_songs(limit=500)
-                        play_state.current_index = 0
-                        ok = await _play_on_device(alarm_device_id, 0)
-                        play_state.is_playing = ok
-                        if ok:
-                            play_state.device_id = alarm_device_id  # 播放成功后才写回
-                        logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放默认歌单")
+                        async with _play_lock:
+                            play_state.playlist = scanner.get_songs(limit=500)
+                            play_state.current_index = 0
+                            ok = await _play_on_device(alarm_device_id, 0)
+                            play_state.is_playing = ok
+                            if ok:
+                                play_state.device_id = alarm_device_id  # 播放成功后才写回
+                            logger.info(f"[Alarm] 闹钟触发: id={alarm_id} 播放默认歌单")
                     else:
                         logger.warning(f"[Alarm] 闹钟 id={alarm_id} 曲库为空，无法播放")
             except Exception as e:
@@ -581,22 +605,6 @@ def _parse_cn_number(text: str) -> Optional[int]:
     # 中文数字解析
     if text == '一百':
         return 100
-    if text == '两百':
-        return 200
-    if text == '三百':
-        return 300
-    if text == '四百':
-        return 400
-    if text == '五百':
-        return 500
-    if text == '六百':
-        return 600
-    if text == '七百':
-        return 700
-    if text == '八百':
-        return 800
-    if text == '九百':
-        return 900
     if text == '半':
         return 50
     result = 0
@@ -665,7 +673,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         # 尝试匹配歌曲
         song_index = None
         if song_hint:
-            results = scanner.search(song_hint)
+            results = await asyncio.to_thread(scanner.search, song_hint)
             if results:
                 # 在完整歌单中查找匹配的索引
                 all_songs = scanner.get_songs(limit=500)
@@ -713,9 +721,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             song_name = result.argument or query
             # online_only_voice 开关：语音指令只走在线播放（避免NAS转码耗时），web页面点播不受影响
             online_only_voice = config.get("online_only_voice", False)
-            local_results = [] if online_only_voice else scanner.search(song_name)
             if online_only_voice:
+                local_results = []
                 logger.info(f"[VoiceCmd] online_only_voice 已开启，跳过本地搜索直接走在线: {song_name}")
+            else:
+                local_results = await asyncio.to_thread(scanner.search, song_name)
 
             if local_results:
                 # 本地命中：等 stop_all_media 完成，确保 stop 命令在 play 之前到达音箱
@@ -735,30 +745,31 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 real_index = next(
                     (i for i, s in enumerate(all_songs) if s.get("filepath") == target_path), None
                 )
-                if real_index is None:
-                    real_index = 0
-                    play_state.playlist = list(local_results)
-                else:
-                    play_state.playlist = list(all_songs)
-                play_state.current_index = real_index
-                play_state.device_id = device_id
+                async with _play_lock:
+                    if real_index is None:
+                        real_index = 0
+                        play_state.playlist = list(local_results)
+                    else:
+                        play_state.playlist = list(all_songs)
+                    play_state.current_index = real_index
+                    play_state.device_id = device_id
 
-                # 元数据查询改 fire-and-forget（不阻塞播放）
-                _create_background_task(_enrich_playlist_metadata(song_name, real_index, all_songs), "enrich_metadata")
+                    # 元数据查询改 fire-and-forget（不阻塞播放）
+                    _create_background_task(_enrich_playlist_metadata(song_name, real_index, all_songs), "enrich_metadata")
 
-                # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 _play_on_device
-                # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
-                # is_own_play_recent 检查最近10秒，覆盖 _play_on_device 的执行时间。
-                if miot_client:
-                    miot_client.mark_own_play(device_id)
+                    # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 _play_on_device
+                    # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
+                    # is_own_play_recent 检查最近10秒，覆盖 _play_on_device 的执行时间。
+                    if miot_client:
+                        miot_client.mark_own_play(device_id)
 
-                # 提前 mark_query_handled：避免 _play_on_device 执行期间 MediaWatcher 反查到未处理 query 重复触发
-                if monitor:
-                    monitor.mark_query_handled(device_id, query)
-                ok = await _play_on_device(device_id, real_index)
-                if ok:
-                    play_state.is_playing = True
-                    logger.info(f"[VoiceCmd] 本地播放: {target.get('title', song_name)}")
+                    # 提前 mark_query_handled：避免 _play_on_device 执行期间 MediaWatcher 反查到未处理 query 重复触发
+                    if monitor:
+                        monitor.mark_query_handled(device_id, query)
+                    ok = await _play_on_device(device_id, real_index)
+                    if ok:
+                        play_state.is_playing = True
+                        logger.info(f"[VoiceCmd] 本地播放: {target.get('title', song_name)}")
                 return
             else:
                 # 本地未命中：在线搜索
@@ -806,15 +817,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
 
                         # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 play_music_url
                         # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
-                        if miot_client:
-                            miot_client.mark_own_play(device_id)
-
-                        # 立即 play：不再使用压制循环
-                        # 原因：每次 await stop_all_media() 阻塞约1-2秒（6个UBus请求并发但要等最慢的），
-                        # 5次迭代实际耗时5.1秒（非设计的1.5秒），这5秒期间没有play命令，
-                        # 小爱版网易云试听版趁机播放。
-                        # 现在策略：stop 完成后立即 play_music_url(REPLACE_ALL)，
-                        # 让 REPLACE_ALL 尽早抢占通道，小爱版最多播放1-2秒（play生效时间）。
+                        miot_client.mark_own_play(device_id)
 
                         # 提前 mark_query_handled：避免 play 执行期间 MediaWatcher 反查到未处理 query 重复触发
                         if monitor:
@@ -825,12 +828,13 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             ok = await miot_client.play_music_url(device_id, proxied_url)
                         else:
                             ok = await miot_client.play_url(device_id, proxied_url)
-                        if ok:
-                            play_state.is_playing = True
-                            play_state._play_start_time = time.monotonic()
-                            logger.info(f"[VoiceCmd] 在线播放: {song['artist']} - {song['title']}")
-                        else:
-                            logger.warning(f"[VoiceCmd] 在线播放失败: {song['title']}")
+                        async with _play_lock:
+                            if ok:
+                                play_state.is_playing = True
+                                play_state._play_start_time = time.monotonic()
+                                logger.info(f"[VoiceCmd] 在线播放: {song['artist']} - {song['title']}")
+                            else:
+                                logger.warning(f"[VoiceCmd] 在线播放失败: {song['title']}")
                     else:
                         logger.warning("[VoiceCmd] 未登录小米账号，无法播放")
                 else:
@@ -849,72 +853,76 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 nxt = (play_state.current_index or 0) + 1
                 if nxt < len(play_state.playlist):
                     next_idx = nxt
-            if next_idx is not None and play_state.device_id:
-                play_state.current_index = next_idx
-                ok = await _play_on_device(play_state.device_id, next_idx)
-                if ok:
-                    play_state.is_playing = True
-                    song = play_state.current_song()
-                    song_title = song.get("title", "") if song else ""
-                    result_text = f"已切换到《{song_title}》"
+            async with _play_lock:
+                if next_idx is not None and play_state.device_id:
+                    play_state.current_index = next_idx
+                    ok = await _play_on_device(play_state.device_id, next_idx)
+                    if ok:
+                        play_state.is_playing = True
+                        song = play_state.current_song()
+                        song_title = song.get("title", "") if song else ""
+                        result_text = f"已切换到《{song_title}》"
+                    else:
+                        result_text = "切换失败"
+                elif play_state.playlist:
+                    # 已 stop_all_media 但无下一曲，同步停止状态
+                    play_state.stop_playing()
+                    result_text = "没有下一首了"
                 else:
-                    result_text = "切换失败"
-            elif play_state.playlist:
-                # 已 stop_all_media 但无下一曲，同步停止状态
-                play_state.stop_playing()
-                result_text = "没有下一首了"
-            else:
-                result_text = "播放列表为空"
+                    result_text = "播放列表为空"
 
         elif result.command.type == "previous":
             if miot_client and device_id:
                 await miot_client.stop_all_media(device_id)
             prev_idx = play_state._get_prev_index()
-            if prev_idx is not None and play_state.device_id:
-                play_state.current_index = prev_idx
-                ok = await _play_on_device(play_state.device_id, prev_idx)
-                if ok:
-                    play_state.is_playing = True
-                    song = play_state.current_song()
-                    song_title = song.get("title", "") if song else ""
-                    result_text = f"已切换到《{song_title}》"
+            async with _play_lock:
+                if prev_idx is not None and play_state.device_id:
+                    play_state.current_index = prev_idx
+                    ok = await _play_on_device(play_state.device_id, prev_idx)
+                    if ok:
+                        play_state.is_playing = True
+                        song = play_state.current_song()
+                        song_title = song.get("title", "") if song else ""
+                        result_text = f"已切换到《{song_title}》"
+                    else:
+                        result_text = "切换失败"
+                elif play_state.current_index is not None and play_state.device_id:
+                    # 已是第一首，重播当前
+                    ok = await _play_on_device(play_state.device_id, play_state.current_index)
+                    if ok:
+                        play_state.is_playing = True
+                        result_text = "已是第一首，重新播放"
+                    else:
+                        result_text = "重播失败"
                 else:
-                    result_text = "切换失败"
-            elif play_state.current_index is not None and play_state.device_id:
-                # 已是第一首，重播当前
-                ok = await _play_on_device(play_state.device_id, play_state.current_index)
-                if ok:
-                    play_state.is_playing = True
-                    result_text = "已是第一首，重新播放"
-                else:
-                    result_text = "重播失败"
-            else:
-                # 已 stop_all_media 但无当前歌曲，同步停止状态
-                play_state.stop_playing()
-                result_text = "没有正在播放的歌曲"
+                    # 已 stop_all_media 但无当前歌曲，同步停止状态
+                    play_state.stop_playing()
+                    result_text = "没有正在播放的歌曲"
 
         elif result.command.type == "stop":
             if miot_client:
                 await miot_client.stop_all_media(device_id)
-            play_state.stop_playing()
+            async with _play_lock:
+                play_state.stop_playing()
             result_text = "已停止播放"
 
         elif result.command.type == "play_playlist":
             if miot_client and device_id:
                 await miot_client.stop_all_media(device_id)
             songs = scanner.get_songs(limit=500)
-            if songs:
-                play_state.playlist = songs
-                play_state.current_index = 0
-                play_state.device_id = device_id
-                ok = await _play_on_device(device_id, 0)
-                if ok:
-                    play_state.is_playing = True
-                    result_text = "正在播放歌单"
+            async with _play_lock:
+                if songs:
+                    play_state.playlist = songs
+                    play_state.current_index = 0
+                    play_state.device_id = device_id
+                    ok = await _play_on_device(device_id, 0)
+                    if ok:
+                        play_state.is_playing = True
+                        result_text = "正在播放歌单"
+                    else:
+                        result_text = "播放失败"
                 else:
-                    result_text = "播放失败"
-            else:
-                result_text = "歌单为空，请先扫描音乐库"
+                    result_text = "歌单为空，请先扫描音乐库"
 
         elif result.command.type == "set_play_mode":
             param = result.command.param
@@ -934,7 +942,8 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 logger.info(f"[VoiceCmd] 带歌曲名的'循环播放'识别为单曲循环: {arg}")
 
             if param in mode_map:
-                play_state.mode = mode_map[param]
+                async with _play_lock:
+                    play_state.mode = mode_map[param]
                 logger.info(f"[VoiceCmd] 播放模式切换为: {play_state.mode.value}")
                 result_text = f"已切换到{mode_names.get(param, param)}模式"
             else:
@@ -948,7 +957,10 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 if miot_client and device_id:
                     stop_task2 = _create_background_task(miot_client.stop_all_media(device_id), "stop_all_media")
                 # 复用 play_song 的处理逻辑
-                local_results = [] if config.get("online_only_voice", False) else scanner.search(arg)
+                if config.get("online_only_voice", False):
+                    local_results = []
+                else:
+                    local_results = await asyncio.to_thread(scanner.search, arg)
                 if local_results:
                     if stop_task2:
                         try:
@@ -961,21 +973,22 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     real_index = next(
                         (i for i, s in enumerate(all_songs) if s.get("filepath") == target_path), None
                     )
-                    if real_index is None:
-                        real_index = 0
-                        play_state.playlist = list(local_results)
-                    else:
-                        play_state.playlist = list(all_songs)
-                    play_state.current_index = real_index
-                    play_state.device_id = device_id
-                    # 提前 mark_own_play：避免 MediaWatcher 误拦截
-                    if miot_client:
-                        miot_client.mark_own_play(device_id)
-                    ok = await _play_on_device(device_id, real_index)
-                    if ok:
-                        play_state.is_playing = True
-                        logger.info(f"[VoiceCmd] 模式+本地播放: {target.get('title', arg)}")
-                        result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {target.get('title', arg)}"
+                    async with _play_lock:
+                        if real_index is None:
+                            real_index = 0
+                            play_state.playlist = list(local_results)
+                        else:
+                            play_state.playlist = list(all_songs)
+                        play_state.current_index = real_index
+                        play_state.device_id = device_id
+                        # 提前 mark_own_play：避免 MediaWatcher 误拦截
+                        if miot_client:
+                            miot_client.mark_own_play(device_id)
+                        ok = await _play_on_device(device_id, real_index)
+                        if ok:
+                            play_state.is_playing = True
+                            logger.info(f"[VoiceCmd] 模式+本地播放: {target.get('title', arg)}")
+                            result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {target.get('title', arg)}"
                 else:
                     # 在线搜索（搜索期间持续压制小爱版异步启动）
                     kw_result = await _suppress_native_during_search(
@@ -996,11 +1009,6 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                                     "cover_url": song.get("cover_url", ""),
                                     "duration": song.get("duration", 0),
                                 }
-                                play_state.playlist = [song_dict]
-                                play_state.current_index = 0
-                                play_state.device_id = device_id
-                                play_state.duration = int(song.get("duration", 0) or 0)
-
                                 url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
                                 _online_urls[url_hash] = play_url_raw
                                 _online_urls.move_to_end(url_hash)
@@ -1014,18 +1022,22 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                                     except Exception as e:
                                         logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
                                 # 提前 mark_own_play：避免 MediaWatcher 误拦截
-                                if miot_client:
-                                    miot_client.mark_own_play(device_id)
+                                miot_client.mark_own_play(device_id)
                                 hardware = await _get_device_hardware(device_id)
                                 if needs_music_api(hardware):
                                     ok = await miot_client.play_music_url(device_id, proxied_url)
                                 else:
                                     ok = await miot_client.play_url(device_id, proxied_url)
-                                if ok:
-                                    play_state.is_playing = True
-                                    play_state._play_start_time = time.monotonic()
-                                    logger.info(f"[VoiceCmd] 模式+在线播放: {song.get('artist')} - {song.get('title')}")
-                                    result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {song.get('title', arg)}"
+                                async with _play_lock:
+                                    play_state.playlist = [song_dict]
+                                    play_state.current_index = 0
+                                    play_state.device_id = device_id
+                                    play_state.duration = int(song.get("duration", 0) or 0)
+                                    if ok:
+                                        play_state.is_playing = True
+                                        play_state._play_start_time = time.monotonic()
+                                        logger.info(f"[VoiceCmd] 模式+在线播放: {song.get('artist')} - {song.get('title')}")
+                                        result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {song.get('title', arg)}"
                             else:
                                 logger.warning(f"[VoiceCmd] 在线歌曲无URL: {arg}")
                         else:
@@ -1067,7 +1079,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 days = []
                 song_index = None
                 if song_hint:
-                    results = scanner.search(song_hint)
+                    results = await asyncio.to_thread(scanner.search, song_hint)
                     if results:
                         all_songs = scanner.get_songs(limit=500)
                         for i, s in enumerate(all_songs):
@@ -1197,7 +1209,7 @@ async def _download_via_kuwo(keyword: str) -> str:
     flac_priority = config.get("download", {}).get("flac_priority", True)
     fmt = "flac" if flac_priority else "mp3"
     try:
-        add_task(
+        await add_task(
             task_id=task_id,
             source="kuwo",
             music_id=pure_id,
@@ -1285,11 +1297,12 @@ async def _smart_resume_playback(device_id: str, timeout: int = 30) -> None:
     if not song:
         return
     logger.info(f"[SmartResume] 检测到设备空闲，恢复播放: {song.get('title', '')}")
-    ok = await _play_on_device(device_id, play_state.current_index)
-    if ok:
-        play_state._play_start_time = time.monotonic()
-        play_state.is_playing = True
-        logger.info("[SmartResume] 播放已恢复")
+    async with _play_lock:
+        ok = await _play_on_device(device_id, play_state.current_index)
+        if ok:
+            play_state._play_start_time = time.monotonic()
+            play_state.is_playing = True
+            logger.info("[SmartResume] 播放已恢复")
 
 
 def _parse_timer_minutes(query: str) -> Optional[int]:
@@ -1316,37 +1329,35 @@ def _parse_alarm_from_query(query: str) -> Optional[tuple[int, int, Optional[str
     period_match = re.search(r'(早上|上午|中午|下午|晚上|傍晚|清晨)', query)
     period = period_match.group(1) if period_match else ""
 
-    # 模式: 每天早上X点Y分播放 或 X点Y分播放XXX
-    m = re.search(r'每[天日](?:早上|上午|中午|下午|晚上|傍晚|清晨)?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*(?:播放|放)(?:歌曲?\s*)?(.+)?', query)
-    if m:
+    def _apply_period(hour: int) -> int:
+        """根据时段修饰词转换小时数（12小时制 → 24小时制）"""
+        if period in ("下午", "晚上", "傍晚") and 1 <= hour <= 11:
+            return hour + 12
+        if period == "中午" and hour == 12:
+            return 12  # 中午12点 = 12:00
+        if period == "中午" and 1 <= hour <= 11:
+            return hour + 12  # 中午1点 = 13:00
+        return hour
+
+    def _try_pattern(pattern: str) -> Optional[tuple[int, int, Optional[str]]]:
+        m = re.search(pattern, query)
+        if not m:
+            return None
         hour = int(m.group(1))
         minute = int(m.group(2)) if m.group(2) else 0
         song = m.group(3).strip() if m.group(3) else None
-        # 时段转换
-        if period in ("下午", "晚上", "傍晚") and 1 <= hour <= 11:
-            hour += 12
-        elif period == "中午" and hour == 12:
-            hour = 12  # 中午12点 = 12:00
-        elif period == "中午" and 1 <= hour <= 11:
-            hour += 12  # 中午1点 = 13:00
+        hour = _apply_period(hour)
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return (hour, minute, song)
-    # 简单模式: X点播放（也捕获歌曲名，支持"早上8点播放周杰伦"无"每天"前缀）
-    m = re.search(r'(?:每[天日])?\s*(?:早上|上午|中午|下午|晚上|傍晚|清晨)?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*(?:播放|放)(?:歌曲?\s*)?(.+)?', query)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2)) if m.group(2) else 0
-        song = m.group(3).strip() if m.group(3) else None
-        # 时段转换
-        if period in ("下午", "晚上", "傍晚") and 1 <= hour <= 11:
-            hour += 12
-        elif period == "中午" and hour == 12:
-            hour = 12
-        elif period == "中午" and 1 <= hour <= 11:
-            hour += 12
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return (hour, minute, song)
-    return None
+        return None
+
+    # 模式1: 每天早上X点Y分播放 或 X点Y分播放XXX
+    result = _try_pattern(r'每[天日](?:早上|上午|中午|下午|晚上|傍晚|清晨)?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*(?:播放|放)(?:歌曲?\s*)?(.+)?')
+    if result:
+        return result
+    # 模式2: X点播放（也捕获歌曲名，支持"早上8点播放周杰伦"无"每天"前缀）
+    result = _try_pattern(r'(?:每[天日])?\s*(?:早上|上午|中午|下午|晚上|傍晚|清晨)?\s*(\d{1,2})\s*点\s*(?:\s*(\d{1,2})\s*分)?\s*(?:播放|放)(?:歌曲?\s*)?(.+)?')
+    return result
 
 
 # ===== 生命周期 =====
@@ -1372,7 +1383,7 @@ async def lifespan(app: FastAPI):
 
     # 初始化下载数据库
     try:
-        init_db()
+        await init_db()
         logger.info("下载数据库已初始化")
     except Exception as e:
         logger.error(f"下载数据库初始化失败: {e}")
@@ -1451,6 +1462,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # 关闭
+    # 关闭共享代理客户端
+    await _close_proxy_client()
     # 停止 token 自动刷新
     from app.miot.token_refresh import stop_refresh_loop
     stop_refresh_loop()
@@ -1822,7 +1835,7 @@ async def api_search(body: dict) -> dict:
     if not keyword:
         return {"code": 400, "msg": "缺少keyword", "data": None}
 
-    local_results = scanner.search(keyword)
+    local_results = await asyncio.to_thread(scanner.search, keyword)
     if local_results:
         return {
             "code": 0,
@@ -1865,6 +1878,8 @@ TRANSCODE_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1GB
 _transcode_locks: dict[str, asyncio.Lock] = {}  # per-file 转码锁，防止并发转码同一文件
 # 转码状态追踪: file_hash -> {"status": "transcoding"|"done"|"failed", "started_at": float, "completed_at": float, "filepath": str}
 _transcode_status: dict[str, dict] = {}
+# _transcode_status 的最大条目数，防止大曲库场景下无限增长（内存泄漏）
+_TRANSCODE_STATUS_MAX = 500
 
 
 async def _cleanup_transcode_cache() -> None:
@@ -1877,6 +1892,7 @@ async def _cleanup_transcode_cache() -> None:
         files = [(p, p.stat()) for p in TRANSCODE_CACHE_DIR.glob("*.mp3") if p.is_file()]
         total = sum(st.st_size for _, st in files)
         if total <= TRANSCODE_CACHE_MAX_BYTES:
+            _cleanup_transcode_status_index()
             return
         # 按 mtime 升序（最久未访问的在前）
         files.sort(key=lambda x: x[1].st_mtime)
@@ -1898,8 +1914,26 @@ async def _cleanup_transcode_cache() -> None:
             _transcode_locks.pop(file_hash, None)
         if removed:
             logger.info(f"[Transcode] 缓存清理: 删除 {removed} 个文件, 释放 {freed // 1024 // 1024}MB, 当前 {total // 1024 // 1024}MB")
+        _cleanup_transcode_status_index()
     except Exception as e:
         logger.warning(f"[Transcode] 缓存清理失败: {e}")
+
+
+def _cleanup_transcode_status_index() -> None:
+    """清理 _transcode_status 中已完成/失败的旧条目，防止字典无限增长。
+
+    仅保留最近 _TRANSCODE_STATUS_MAX 条已完成记录，正在转码中的条目不清理。
+    """
+    if len(_transcode_status) <= _TRANSCODE_STATUS_MAX:
+        return
+    # 分离正在转码的和已完成的
+    done_items = [(k, v) for k, v in _transcode_status.items() if v.get("status") != "transcoding"]
+    # 已完成条目按 completed_at 升序，删除最老的
+    done_items.sort(key=lambda x: x[1].get("completed_at", 0))
+    remove_count = len(_transcode_status) - _TRANSCODE_STATUS_MAX
+    for k, _ in done_items[:remove_count]:
+        _transcode_status.pop(k, None)
+        _transcode_locks.pop(k, None)
 
 
 async def _ensure_transcode_cached(filepath: str) -> None:
@@ -1990,7 +2024,7 @@ async def _ensure_transcode_cached(filepath: str) -> None:
             _transcode_status[file_hash] = {"status": "failed", "filepath": filepath, "started_at": prev.get("started_at", 0), "completed_at": time.time()}
             return
         # 原子 rename：.part → .mp3（rename 后 xxx.mp3 才存在，保证读到的是完整文件）
-        os.rename(tmp_part, tmp_path)
+        os.replace(tmp_part, tmp_path)
         actual_size = os.path.getsize(tmp_path)
         actual_br = int(actual_size * 8 / src_duration) if src_duration > 0 else 0
         logger.info(f"[Transcode] 预转码完成: {tmp_path} size={actual_size} duration={src_duration:.1f}s bitrate={actual_br}bps")
@@ -2085,13 +2119,13 @@ async def api_music_proxy(url_hash: str) -> Response:
     # 更新访问时间，避免 LRU 驱逐正在播放的 URL
     _online_urls.move_to_end(url_hash)
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0))
+    # 使用共享客户端复用连接池（不在请求结束时关闭）
+    client = await _get_proxy_client()
     try:
         req = client.build_request("GET", kuwo_url, headers=KUWO_HEADERS)
         resp = await client.send(req, follow_redirects=True)
         if resp.status_code != 200:
             await resp.aclose()
-            await client.aclose()
             return JSONResponse({"code": 1, "msg": f"KUWO返回{resp.status_code}"}, status_code=502)
 
         media_type = resp.headers.get("content-type", "audio/mpeg")
@@ -2102,7 +2136,6 @@ async def api_music_proxy(url_hash: str) -> Response:
                     yield chunk
             finally:
                 await resp.aclose()
-                await client.aclose()
 
         return StreamingResponse(_stream_and_close(), media_type=media_type)
     except Exception as e:
@@ -2112,8 +2145,30 @@ async def api_music_proxy(url_hash: str) -> Response:
                 await resp.aclose()
             except Exception:
                 pass
-        await client.aclose()
         return JSONResponse({"code": 1, "msg": str(e)}, status_code=502)
+
+
+# 封面缓存大小上限（200MB），超过时按 mtime 升序清理最老的文件
+_COVER_CACHE_MAX_BYTES = 200 * 1024 * 1024
+
+
+def _cleanup_cover_cache(cache_dir: Path) -> None:
+    """清理封面缓存目录：总大小超过上限时，按 mtime 升序删除最老的文件"""
+    try:
+        files = [(p, p.stat()) for p in cache_dir.glob("*.jpg") if p.is_file()]
+        total = sum(st.st_size for _, st in files)
+        if total <= _COVER_CACHE_MAX_BYTES:
+            return
+        files.sort(key=lambda x: x[1].st_mtime)
+        for p, st in files:
+            if total <= _COVER_CACHE_MAX_BYTES:
+                break
+            size = st.st_size
+            with contextlib.suppress(FileNotFoundError):
+                p.unlink()
+            total -= size
+    except Exception:
+        pass
 
 
 @app.get("/api/music/cover/{song_index}")
@@ -2128,6 +2183,8 @@ async def api_music_cover(song_index: int) -> Response:
 
     cache_dir = Path("/tmp/musicnest_cover")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # 缓存大小控制：超过上限时清理最老的封面（避免大曲库场景下无限增长）
+    _cleanup_cover_cache(cache_dir)
     cache_key = hashlib.md5(filepath.encode()).hexdigest()
     cache_path = cache_dir / f"{cache_key}.jpg"
 
@@ -2241,7 +2298,6 @@ def _serve_cover_from_dir(directory: Path) -> Response:
 @app.get("/api/music/artists")
 async def api_music_artists() -> dict:
     """获取歌手列表（名、歌曲数、封面路径）"""
-    from collections import Counter
     artists: dict[str, dict] = {}
     for s in scanner.iter_songs():
         name = s.get("artist", "未知歌手") or "未知歌手"
@@ -2263,7 +2319,6 @@ async def api_music_artists() -> dict:
 @app.get("/api/music/albums")
 async def api_music_albums() -> dict:
     """获取专辑列表（名、歌手、歌曲数、封面路径）"""
-    from collections import Counter
     albums: dict[str, dict] = {}
     for s in scanner.iter_songs():
         album_name = s.get("album", "未知专辑") or "未知专辑"
@@ -2335,17 +2390,8 @@ def _has_audio_files(dirpath: str) -> bool:
     return False
 
 
-@app.delete("/api/music/song")
-async def api_music_song_delete(request: Request) -> dict:
-    """删除单首歌曲（按 filepath 定位，删文件+歌词），如果歌手目录无音频则删歌手目录"""
-    body = await request.json()
-    filepath = body.get("filepath", "")
-    # 兼容旧接口：如果没传 filepath 但传了 index，按 index 查找 filepath
-    if not filepath and "index" in body:
-        songs = scanner.get_songs(limit=5000)
-        idx_legacy = body["index"]
-        if 0 <= idx_legacy < len(songs):
-            filepath = songs[idx_legacy].get("filepath", "")
+def _delete_song_by_filepath(filepath: str) -> dict:
+    """按 filepath 删除单首歌曲（删文件+歌词），如果歌手目录无音频则删歌手目录"""
     if not filepath:
         return JSONResponse({"code": 1, "msg": "缺少 filepath"}, status_code=400)
     # 安全校验：filepath 必须在音乐库目录下（防止路径遍历攻击）
@@ -2387,6 +2433,20 @@ async def api_music_song_delete(request: Request) -> dict:
         return JSONResponse({"code": 1, "msg": f"删除失败: {e}"}, status_code=500)
 
 
+@app.delete("/api/music/song")
+async def api_music_song_delete(request: Request) -> dict:
+    """删除单首歌曲（按 filepath 定位，删文件+歌词），如果歌手目录无音频则删歌手目录"""
+    body = await request.json()
+    filepath = body.get("filepath", "")
+    # 兼容旧接口：如果没传 filepath 但传了 index，按 index 查找 filepath
+    if not filepath and "index" in body:
+        songs = scanner.get_songs(limit=5000)
+        idx_legacy = body["index"]
+        if 0 <= idx_legacy < len(songs):
+            filepath = songs[idx_legacy].get("filepath", "")
+    return _delete_song_by_filepath(filepath)
+
+
 @app.post("/api/music/song/{index}/delete")
 async def api_music_song_delete_by_index(index: int) -> dict:
     """[旧接口] 按 index 删除，内部转调 filepath 删除逻辑"""
@@ -2396,11 +2456,7 @@ async def api_music_song_delete_by_index(index: int) -> dict:
     filepath = songs[index].get("filepath", "")
     if not filepath:
         return {"code": 1, "msg": "歌曲不存在"}
-
-    class _FakeReq:
-        async def json(self):
-            return {"filepath": filepath}
-    return await api_music_song_delete(_FakeReq())
+    return _delete_song_by_filepath(filepath)
 
 @app.post("/api/music/artist/{artist_name}/delete")
 async def api_music_artist_delete(artist_name: str) -> dict:
@@ -2730,7 +2786,7 @@ async def api_player_state() -> dict:
         matched_song = None
         matched_index = None
         if song_name and scanner.iter_songs():
-            results = scanner.search(song_name)
+            results = await asyncio.to_thread(scanner.search, song_name)
             if results:
                 matched_song = results[0]
                 # 找到匹配歌曲在 _songs 中的索引
@@ -3138,7 +3194,6 @@ async def api_playlist_create(body: dict) -> dict:
         "songs": [],
         "created_at": datetime.now().isoformat(),
     }
-    playlists = config.get("playlists", [])
     playlists.append(playlist)
     config.set("playlists", playlists)
     logger.info(f"[Playlist] 创建歌单: id={playlist_id} name={name}")
@@ -3442,7 +3497,7 @@ async def api_download_song(body: dict) -> dict:
         format_type = "flac"
 
     task_id = f"dl_{uuid.uuid4().hex[:12]}"
-    task = add_task(
+    task = await add_task(
         task_id=task_id,
         source=source,
         music_id=music_id,
@@ -3453,7 +3508,7 @@ async def api_download_song(body: dict) -> dict:
         format_type=format_type,
     )
 
-    stats = get_download_stats()
+    stats = await get_download_stats()
     position = stats.get("waiting", 0) + stats.get("loading", 0)
 
     logger.info(f"[Download] 添加到队列: {task_id} {title} - {artist} [{source}]")
@@ -3494,7 +3549,7 @@ async def api_download_album(body: dict) -> dict:
     count = 0
     for track in tracks:
         task_id = f"dl_{uuid.uuid4().hex[:12]}"
-        add_task(
+        await add_task(
             task_id=task_id,
             source=source,
             music_id=track.id.replace(f"{source}_", ""),
@@ -3516,8 +3571,8 @@ async def api_download_album(body: dict) -> dict:
 @app.get("/api/download/tasks")
 async def api_download_tasks(status: str = "", limit: int = 50, offset: int = 0) -> dict:
     """获取下载任务列表"""
-    tasks = get_tasks(status=status, limit=limit, offset=offset)
-    stats = get_download_stats()
+    tasks = await get_tasks(status=status, limit=limit, offset=offset)
+    stats = await get_download_stats()
     return {
         "code": 0,
         "data": {
@@ -3530,18 +3585,18 @@ async def api_download_tasks(status: str = "", limit: int = 50, offset: int = 0)
 @app.get("/api/download/stats")
 async def api_download_stats() -> dict:
     """获取下载统计"""
-    return {"code": 0, "data": get_download_stats()}
+    return {"code": 0, "data": await get_download_stats()}
 
 
 @app.post("/api/download/tasks/{task_id}/retry")
 async def api_download_retry(task_id: str) -> dict:
     """重试失败的下载任务"""
-    task = get_task_by_id(task_id)
+    task = await get_task_by_id(task_id)
     if not task:
         return {"code": 1, "msg": "任务不存在"}
     if task.status != "error":
         return {"code": 1, "msg": "只能重试失败的任务"}
-    update_task_status(task_id, "waiting", error_msg="", file_path="")
+    await update_task_status(task_id, "waiting", error_msg="", file_path="")
     logger.info(f"[Download] 重试任务: {task_id}")
     return {"code": 0, "msg": "已重新加入队列"}
 
@@ -3549,14 +3604,14 @@ async def api_download_retry(task_id: str) -> dict:
 @app.delete("/api/download/tasks/{task_id}")
 async def api_download_delete_task(task_id: str) -> dict:
     """删除下载任务"""
-    delete_task(task_id)
+    await delete_task(task_id)
     return {"code": 0, "msg": "已删除"}
 
 
 @app.post("/api/download/tasks/clear")
 async def api_download_clear_tasks() -> dict:
     """清空已完成的任务"""
-    clear_finished_tasks()
+    await clear_finished_tasks()
     return {"code": 0, "msg": "已清空"}
 
 
@@ -3571,7 +3626,7 @@ async def api_playlist_sync_list() -> dict:
     for pl in playlists:
         source = pl.get("source", "")
         pl_id = pl.get("id", "")
-        synced = len(get_synced_ids(source, pl_id))
+        synced = len(await get_synced_ids(source, pl_id))
         pl_copy = dict(pl)
         pl_copy["synced_count"] = synced
         result.append(pl_copy)
@@ -3633,13 +3688,6 @@ async def api_playlist_sync_add(body: dict) -> dict:
         playlists.append(playlist_info)
         config.set("playlist_sync", playlists)
 
-        # 立即同步一次
-        try:
-            from app.download.worker import playlist_sync_worker as _psw
-        except Exception as e:
-            logger.warning(f"[Startup] playlist_sync_worker 导入失败: {e}")
-            pass
-
         logger.info(f"[PlaylistSync] 添加歌单: {pl_name} ({source}/{pl_id})")
         return {"code": 0, "data": playlist_info}
     except Exception as e:
@@ -3677,7 +3725,7 @@ async def api_playlist_sync_refresh(pl_index: int) -> dict:
     else:
         return {"code": 1, "msg": "暂不支持该音源"}
 
-    synced = get_synced_ids(source, pl_id)
+    synced = await get_synced_ids(source, pl_id)
     new_tracks = [t for t in tracks if t.id not in synced]
 
     count = 0
@@ -3686,7 +3734,7 @@ async def api_playlist_sync_refresh(pl_index: int) -> dict:
 
     for track in new_tracks:
         task_id = f"{source}_sync_{pl_id}_{track.id}"
-        add_task(
+        await add_task(
             task_id=task_id,
             source=source,
             music_id=track.id.replace(f"{source}_", ""),
@@ -3696,7 +3744,7 @@ async def api_playlist_sync_refresh(pl_index: int) -> dict:
             cover_url=track.cover or "",
             format_type=fmt,
         )
-        record_sync(source, pl_id, track.id)
+        await record_sync(source, pl_id, track.id)
         count += 1
 
     logger.info(f"[PlaylistSync] 手动同步歌单 [{pl_name}]: 新增 {count} 首待下载")
