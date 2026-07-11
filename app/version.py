@@ -7,6 +7,17 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.75 - 修复本地播放路径play_music_url往返期间小爱版启动(LET IT GO案例):
+           问题: v0.0.74只修复了在线路径,但LET IT GO走的是本地播放路径;
+                 日志证据: 14:31:20用户说话(answer="请欣赏试听版")
+                 -> 14:31:22 stop_all_media完成 -> 14:31:22 play_music_url发出
+                 -> 14:31:24 play_music_url响应(2秒空窗!)
+                 这2秒内REPLACE_ALL还没生效,小爱版试听版启动;
+           根因: 本地播放路径的注释"不需要压制循环"是错误假设,
+                 play_music_url的UBus往返同样需要1-2秒,期间没有压制;
+           修复: 本地播放路径也用_suppress_native上下文管理器包裹,
+                 覆盖"等待stop_all_media + play_music_url往返"整个流程,
+                 压制循环持续到play_music_url响应后才停止;
   0.0.74 - 修复play_music_url UBus往返期间小爱版启动(真正的空窗期根因):
            问题: v0.0.73后用户反馈问题依旧,日志分析13:47:29童年老家:
                  13:47:30 play_music_url发出(压制停止) -> 13:47:32 play_music_url响应(2秒!)
@@ -603,4 +614,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.74"
+__version__ = "0.0.75"

@@ -738,48 +738,49 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 local_results = await asyncio.to_thread(scanner.search, song_name)
 
             if local_results:
-                # 本地命中：等 stop_all_media 完成，确保 stop 命令在 play 之前到达音箱
-                if stop_task:
-                    try:
-                        await asyncio.wait_for(stop_task, timeout=3.5)
-                    except Exception as e:
-                        logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+                # 本地命中：压制循环覆盖"等待stop_all_media + play_music_url往返"整个流程
+                # play_music_url 的 UBus 往返需1-2秒，期间 REPLACE_ALL 还没生效，
+                # 小爱版试听版会异步启动。压制循环持续到 play_music_url 响应后才停止。
+                async with _suppress_native(device_id):
+                    # 等 stop_all_media 完成，确保 stop 命令在 play 之前到达音箱
+                    if stop_task:
+                        try:
+                            await asyncio.wait_for(stop_task, timeout=3.5)
+                        except Exception as e:
+                            logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
 
-                # 本地播放不需要压制循环：本地URL响应快(局域网)，play响应后音箱同秒请求URL，
-                # REPLACE_ALL 立即生效，小爱版来不及启动就被替换。
+                    # 本地命中：直接 play_url
+                    all_songs = scanner.get_songs(limit=5000)
+                    target = local_results[0]
+                    target_path = target.get("filepath", "")
+                    real_index = next(
+                        (i for i, s in enumerate(all_songs) if s.get("filepath") == target_path), None
+                    )
+                    async with _play_lock:
+                        if real_index is None:
+                            real_index = 0
+                            play_state.playlist = list(local_results)
+                        else:
+                            play_state.playlist = list(all_songs)
+                        play_state.current_index = real_index
+                        play_state.device_id = device_id
 
-                # 本地命中：直接 play_url
-                all_songs = scanner.get_songs(limit=5000)
-                target = local_results[0]
-                target_path = target.get("filepath", "")
-                real_index = next(
-                    (i for i, s in enumerate(all_songs) if s.get("filepath") == target_path), None
-                )
-                async with _play_lock:
-                    if real_index is None:
-                        real_index = 0
-                        play_state.playlist = list(local_results)
-                    else:
-                        play_state.playlist = list(all_songs)
-                    play_state.current_index = real_index
-                    play_state.device_id = device_id
+                        # 元数据查询改 fire-and-forget（不阻塞播放）
+                        _create_background_task(_enrich_playlist_metadata(song_name, real_index, all_songs), "enrich_metadata")
 
-                    # 元数据查询改 fire-and-forget（不阻塞播放）
-                    _create_background_task(_enrich_playlist_metadata(song_name, real_index, all_songs), "enrich_metadata")
+                        # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 _play_on_device
+                        # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
+                        if miot_client:
+                            miot_client.mark_own_play(device_id)
 
-                    # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 _play_on_device
-                    # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
-                    # is_own_play_recent 检查最近10秒，覆盖 _play_on_device 的执行时间。
-                    if miot_client:
-                        miot_client.mark_own_play(device_id)
-
-                    # 提前 mark_query_handled：避免 _play_on_device 执行期间 MediaWatcher 反查到未处理 query 重复触发
-                    if monitor:
-                        monitor.mark_query_handled(device_id, query)
-                    ok = await _play_on_device(device_id, real_index)
-                    if ok:
-                        play_state.is_playing = True
-                        logger.info(f"[VoiceCmd] 本地播放: {target.get('title', song_name)}")
+                        # 提前 mark_query_handled：避免 _play_on_device 执行期间 MediaWatcher 反查到未处理 query 重复触发
+                        if monitor:
+                            monitor.mark_query_handled(device_id, query)
+                        # play_music_url 在压制循环内执行，持续压制小爱版直到响应
+                        ok = await _play_on_device(device_id, real_index)
+                        if ok:
+                            play_state.is_playing = True
+                            logger.info(f"[VoiceCmd] 本地播放: {target.get('title', song_name)}")
                 return
             else:
                 # 本地未命中：在线搜索
