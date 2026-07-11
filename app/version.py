@@ -7,6 +7,19 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.74 - 修复play_music_url UBus往返期间小爱版启动(真正的空窗期根因):
+           问题: v0.0.73后用户反馈问题依旧,日志分析13:47:29童年老家:
+                 13:47:30 play_music_url发出(压制停止) -> 13:47:32 play_music_url响应(2秒!)
+                 -> 13:47:33 设备请求proxy URL;
+                 这2-3秒内压制已停止,REPLACE_ALL还没生效,小爱版在此期间启动;
+           根因: v0.0.73把play_music_url放在with块外(退出后)执行,
+                 压制循环在play_music_url发出前就停止了,
+                 但play_music_url的UBus请求需1-2秒往返,期间没有压制;
+           修复: 把play_music_url移进with块内执行,
+                 压制循环持续到play_music_url响应后才停止;
+                 stop的UBus响应(0.3-0.5s)比play_music_url(1-2s)快,
+                 所以stop会在REPLACE_ALL之前到达音箱,不会停掉我们的播放;
+           play_song和set_play_mode两处在线路径都重构为此模式;
   0.0.73 - 修复在线播放2秒延迟(_get_device_hardware缓存过期+finally gather等timeout):
            问题: v0.0.72后用户反馈问题依旧,日志分析发现13:25:51 stop_all_media完成
                  到13:25:53 play_music_url发出之间有2秒空窗期;
@@ -590,4 +603,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.73"
+__version__ = "0.0.74"
