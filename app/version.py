@@ -7,6 +7,18 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.72 - 修复favicon未使用设计logo + 在线播放空窗期小爱版先行:
+           问题1(浏览器标签页图标): index.html无<link rel="icon">标签,
+                 浏览器使用默认图标而非设计的musicnest-logo;
+           修复1: index.html添加SVG+PNG favicon link,
+                 main.py新增/favicon.ico路由返回musicnest-logo.png;
+           问题2(放很多NAS没有的歌先放小爱版): _suppress_native_during_search
+                 的压制循环在搜索完成时就停止,但之后还有3-5秒空窗期
+                 (URL处理+等待stop_task+获取hardware),小爱版在此期间异步启动;
+           修复2: 将_suppress_native_during_search重构为@asynccontextmanager
+                 _suppress_native上下文管理器,压制循环覆盖"搜索+URL处理+
+                 等待stop+获取hardware"整个流程,退出with块后才发送play_music_url;
+                 play_song和set_play_mode两处在线路径都重构为此模式;
   0.0.71 - 修复语音指令在线播放竞态+状态污染,netease共享连接池:
            main.py:
              H1 play_song在线路径play_state修改(playlist/current_index/device_id/duration)
@@ -564,4 +576,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.71"
+__version__ = "0.0.72"

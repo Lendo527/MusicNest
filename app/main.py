@@ -378,23 +378,30 @@ async def _safe_cancel(task):
             pass
 
 
-async def _suppress_native_during_search(device_id: str, search_coro):
-    """在在线搜索期间持续压制小爱版异步启动。
+@contextlib.asynccontextmanager
+async def _suppress_native(device_id: str):
+    """持续压制小爱版异步启动的上下文管理器。
 
     问题：小爱收到"播放XX"后，stop_all_media 停掉 TTS，但网易云试听版会异步启动，
     单次 stop 停不掉这个异步启动。搜索期间（1-2秒）小爱版会播放。
+    更严重的是：搜索完成后到 play_music_url 发送之间还有 3-5 秒空窗期
+    （URL处理、等待stop_task、获取hardware），小爱版会在此期间异步启动。
 
-    方案：搜索期间每0.3秒 fire-and-forget 一次轻量 stop（只发1个UBus请求，
-    不是 stop_all_media 的6个），持续压制小爱版。
-    搜索完成后，await 最后一个 stop 完成（确保 stop 在 play 之前到达音箱），
-    然后 return 搜索结果，调用方立即 play。
+    方案：压制循环覆盖"搜索 + URL处理 + 等待stop + 获取hardware"整个流程，
+    每0.3秒 fire-and-forget 一次轻量 stop。调用方在 with 块内完成搜索和处理，
+    退出 with 块后再发送 play_music_url（此时所有 stop 已完成，不会取消 play）。
 
-    Returns:
-        search_coro 的结果
+    用法:
+        async with _suppress_native(device_id):
+            result = await search(...)
+            # URL处理、等待stop_task、获取hardware...
+        # 退出 with 块后压制停止、所有 stop 已完成，现在发送 play_music_url
+        await miot_client.play_music_url(device_id, proxied_url)
     """
     client = await _check_miot()
     if not client:
-        return await search_coro
+        yield
+        return
 
     # 轻量 stop：只发1个 stop UBus 请求（不是 stop_all_media 的6个），
     # 避免每0.3秒×6个请求=每秒20个UBus请求导致请求积压
@@ -420,13 +427,12 @@ async def _suppress_native_during_search(device_id: str, search_coro):
 
     suppress_task = asyncio.create_task(_suppress_loop())
     try:
-        result = await search_coro
+        yield
     finally:
         # 停止压制循环
         await _safe_cancel(suppress_task)
         # 等待所有 stop 完成（确保 stop 在 play 之前到达音箱，避免孤儿 stop 停掉 play）
         await asyncio.gather(*all_stop_tasks, return_exceptions=True)
-    return result
 
 
 async def _alarm_loop(alarm_id: str, hour: int, minute: int, days: list[int], song_index: Optional[int] = None):
@@ -773,73 +779,75 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 return
             else:
                 # 本地未命中：在线搜索
-                # 搜索期间持续压制小爱版异步启动（每0.5秒 stop 一次）
-                kw_result = await _suppress_native_during_search(
-                    device_id, search_by_keyword(song_name)
-                )
-                if kw_result.get("code") == 0 and kw_result.get("data"):
-                    song_data = kw_result["data"]
-                    play_url_raw = song_data.get("url", "")
-                    # 先校验 URL 可用性，确认可用后再修改 play_state（避免 URL 为空时污染状态）
-                    if not miot_client:
-                        logger.warning("[VoiceCmd] 未登录小米账号，无法播放")
-                    elif not play_url_raw or not play_url_raw.startswith("http"):
-                        logger.info(f"[VoiceCmd] 在线歌曲无可用 URL: {song_name}")
-                        if monitor:
-                            monitor.mark_query_handled(device_id, query)
-                        return
-                    else:
-                        song = {
-                            "title": song_data.get("title", song_name),
-                            "artist": song_data.get("artist", ""),
-                            "filepath": play_url_raw,
-                            "album": song_data.get("album", ""),
-                            "cover_url": song_data.get("cover_url", ""),
-                            "duration": song_data.get("duration", 0),
-                        }
-                        server_host = config.get("server_host", "http://localhost:58092")
-                        url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
-                        _online_urls[url_hash] = play_url_raw
-                        _online_urls.move_to_end(url_hash)
-                        if len(_online_urls) > 5000:
-                            _online_urls.popitem(last=False)
-                        proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
-                        logger.info(f"[VoiceCmd] 在线歌曲代理: {play_url_raw[:60]}... -> /api/music/proxy/{url_hash}")
-
-                        # 确保 stop_all_media 在 play 之前完成
-                        if stop_task:
-                            try:
-                                await asyncio.wait_for(stop_task, timeout=3.5)
-                            except Exception as e:
-                                logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
-
-                        # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 play_music_url
-                        # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
-                        miot_client.mark_own_play(device_id)
-
-                        # 提前 mark_query_handled：避免 play 执行期间 MediaWatcher 反查到未处理 query 重复触发
-                        if monitor:
-                            monitor.mark_query_handled(device_id, query)
-
-                        hardware = await _get_device_hardware(device_id)
-                        if needs_music_api(hardware):
-                            ok = await miot_client.play_music_url(device_id, proxied_url)
+                # 压制循环覆盖"搜索 + URL处理 + 等待stop + 获取hardware"整个流程，
+                # 退出 with 块后再发送 play_music_url（确保 stop 在 play 之前完成）
+                _pending_online_play = None  # (proxied_url, use_music_api, song, song_data)
+                async with _suppress_native(device_id):
+                    kw_result = await search_by_keyword(song_name)
+                    if kw_result.get("code") == 0 and kw_result.get("data"):
+                        song_data = kw_result["data"]
+                        play_url_raw = song_data.get("url", "")
+                        # 先校验 URL 可用性，确认可用后再修改 play_state（避免 URL 为空时污染状态）
+                        if not miot_client:
+                            logger.warning("[VoiceCmd] 未登录小米账号，无法播放")
+                        elif not play_url_raw or not play_url_raw.startswith("http"):
+                            logger.info(f"[VoiceCmd] 在线歌曲无可用 URL: {song_name}")
                         else:
-                            ok = await miot_client.play_url(device_id, proxied_url)
-                        # play_state 修改全部在锁内，与 set_play_mode / 本地播放路径一致防竞态
-                        async with _play_lock:
-                            if ok:
-                                play_state.playlist = [song]
-                                play_state.current_index = 0
-                                play_state.device_id = device_id
-                                play_state.duration = int(song_data.get("duration", 0))
-                                play_state.is_playing = True
-                                play_state._play_start_time = time.monotonic()
-                                logger.info(f"[VoiceCmd] 在线播放: {song['artist']} - {song['title']}")
-                            else:
-                                logger.warning(f"[VoiceCmd] 在线播放失败: {song['title']}")
-                else:
-                    logger.info(f"[VoiceCmd] 未找到歌曲: {song_name}")
+                            song = {
+                                "title": song_data.get("title", song_name),
+                                "artist": song_data.get("artist", ""),
+                                "filepath": play_url_raw,
+                                "album": song_data.get("album", ""),
+                                "cover_url": song_data.get("cover_url", ""),
+                                "duration": song_data.get("duration", 0),
+                            }
+                            server_host = config.get("server_host", "http://localhost:58092")
+                            url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
+                            _online_urls[url_hash] = play_url_raw
+                            _online_urls.move_to_end(url_hash)
+                            if len(_online_urls) > 5000:
+                                _online_urls.popitem(last=False)
+                            proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
+                            logger.info(f"[VoiceCmd] 在线歌曲代理: {play_url_raw[:60]}... -> /api/music/proxy/{url_hash}")
+
+                            # 确保 stop_all_media 在 play 之前完成
+                            if stop_task:
+                                try:
+                                    await asyncio.wait_for(stop_task, timeout=3.5)
+                                except Exception as e:
+                                    logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+
+                            hardware = await _get_device_hardware(device_id)
+                            _pending_online_play = (proxied_url, needs_music_api(hardware), song, song_data)
+                    else:
+                        logger.info(f"[VoiceCmd] 未找到歌曲: {song_name}")
+
+                # 退出 with 块：压制循环已停止，所有 stop 已完成
+                # 现在发送 play_music_url（stop 不会取消 play）
+                if _pending_online_play:
+                    proxied_url, use_music_api, song, song_data = _pending_online_play
+                    # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 play_music_url
+                    # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
+                    miot_client.mark_own_play(device_id)
+                    # 提前 mark_query_handled：避免 play 执行期间 MediaWatcher 反查到未处理 query 重复触发
+                    if monitor:
+                        monitor.mark_query_handled(device_id, query)
+                    if use_music_api:
+                        ok = await miot_client.play_music_url(device_id, proxied_url)
+                    else:
+                        ok = await miot_client.play_url(device_id, proxied_url)
+                    # play_state 修改全部在锁内，与 set_play_mode / 本地播放路径一致防竞态
+                    async with _play_lock:
+                        if ok:
+                            play_state.playlist = [song]
+                            play_state.current_index = 0
+                            play_state.device_id = device_id
+                            play_state.duration = int(song_data.get("duration", 0))
+                            play_state.is_playing = True
+                            play_state._play_start_time = time.monotonic()
+                            logger.info(f"[VoiceCmd] 在线播放: {song['artist']} - {song['title']}")
+                        else:
+                            logger.warning(f"[VoiceCmd] 在线播放失败: {song['title']}")
 
                 if monitor:
                     monitor.mark_query_handled(device_id, query)
@@ -991,60 +999,65 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             logger.info(f"[VoiceCmd] 模式+本地播放: {target.get('title', arg)}")
                             result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {target.get('title', arg)}"
                 else:
-                    # 在线搜索（搜索期间持续压制小爱版异步启动）
-                    kw_result = await _suppress_native_during_search(
-                        device_id, search_by_keyword(arg)
-                    )
-                    if kw_result.get("code") == 0 and kw_result.get("data"):
-                        online_data = kw_result["data"]
-                        if isinstance(online_data, list) and len(online_data) > 0:
-                            song = online_data[0]
-                            play_url_raw = song.get("url", "")
-                            if play_url_raw and miot_client:
-                                # 构造 song dict 并更新 play_state（之前缺失，导致 web 界面不同步）
-                                song_dict = {
-                                    "title": song.get("title", arg),
-                                    "artist": song.get("artist", ""),
-                                    "filepath": song.get("url", ""),
-                                    "album": song.get("album", ""),
-                                    "cover_url": song.get("cover_url", ""),
-                                    "duration": song.get("duration", 0),
-                                }
-                                url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
-                                _online_urls[url_hash] = play_url_raw
-                                _online_urls.move_to_end(url_hash)
-                                if len(_online_urls) > 5000:
-                                    _online_urls.popitem(last=False)
-                                server_host = config.get("server_host", "")
-                                proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
-                                if stop_task2:
-                                    try:
-                                        await asyncio.wait_for(stop_task2, timeout=3.5)
-                                    except Exception as e:
-                                        logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
-                                # 提前 mark_own_play：避免 MediaWatcher 误拦截
-                                miot_client.mark_own_play(device_id)
-                                hardware = await _get_device_hardware(device_id)
-                                if needs_music_api(hardware):
-                                    ok = await miot_client.play_music_url(device_id, proxied_url)
+                    # 在线搜索（压制循环覆盖搜索+处理，退出后再 play）
+                    _pending_mode_play = None  # (proxied_url, use_music_api, song_dict, song)
+                    async with _suppress_native(device_id):
+                        kw_result = await search_by_keyword(arg)
+                        if kw_result.get("code") == 0 and kw_result.get("data"):
+                            online_data = kw_result["data"]
+                            if isinstance(online_data, list) and len(online_data) > 0:
+                                song = online_data[0]
+                                play_url_raw = song.get("url", "")
+                                if play_url_raw and miot_client:
+                                    # 构造 song dict 并更新 play_state（之前缺失，导致 web 界面不同步）
+                                    song_dict = {
+                                        "title": song.get("title", arg),
+                                        "artist": song.get("artist", ""),
+                                        "filepath": song.get("url", ""),
+                                        "album": song.get("album", ""),
+                                        "cover_url": song.get("cover_url", ""),
+                                        "duration": song.get("duration", 0),
+                                    }
+                                    url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
+                                    _online_urls[url_hash] = play_url_raw
+                                    _online_urls.move_to_end(url_hash)
+                                    if len(_online_urls) > 5000:
+                                        _online_urls.popitem(last=False)
+                                    server_host = config.get("server_host", "")
+                                    proxied_url = f"{server_host}/api/music/proxy/{url_hash}"
+                                    if stop_task2:
+                                        try:
+                                            await asyncio.wait_for(stop_task2, timeout=3.5)
+                                        except Exception as e:
+                                            logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
+                                    hardware = await _get_device_hardware(device_id)
+                                    _pending_mode_play = (proxied_url, needs_music_api(hardware), song_dict, song)
                                 else:
-                                    ok = await miot_client.play_url(device_id, proxied_url)
-                                async with _play_lock:
-                                    play_state.playlist = [song_dict]
-                                    play_state.current_index = 0
-                                    play_state.device_id = device_id
-                                    play_state.duration = int(song.get("duration", 0) or 0)
-                                    if ok:
-                                        play_state.is_playing = True
-                                        play_state._play_start_time = time.monotonic()
-                                        logger.info(f"[VoiceCmd] 模式+在线播放: {song.get('artist')} - {song.get('title')}")
-                                        result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {song.get('title', arg)}"
+                                    logger.warning(f"[VoiceCmd] 在线歌曲无URL: {arg}")
                             else:
-                                logger.warning(f"[VoiceCmd] 在线歌曲无URL: {arg}")
+                                logger.info(f"[VoiceCmd] 在线搜索无结果: {arg}")
                         else:
-                            logger.info(f"[VoiceCmd] 在线搜索无结果: {arg}")
-                    else:
-                        logger.info(f"[VoiceCmd] 未找到歌曲: {arg}")
+                            logger.info(f"[VoiceCmd] 未找到歌曲: {arg}")
+
+                    # 退出 with 块：压制循环已停止，所有 stop 已完成
+                    if _pending_mode_play:
+                        proxied_url, use_music_api, song_dict, song = _pending_mode_play
+                        # 提前 mark_own_play：避免 MediaWatcher 误拦截
+                        miot_client.mark_own_play(device_id)
+                        if use_music_api:
+                            ok = await miot_client.play_music_url(device_id, proxied_url)
+                        else:
+                            ok = await miot_client.play_url(device_id, proxied_url)
+                        async with _play_lock:
+                            play_state.playlist = [song_dict]
+                            play_state.current_index = 0
+                            play_state.device_id = device_id
+                            play_state.duration = int(song.get("duration", 0) or 0)
+                            if ok:
+                                play_state.is_playing = True
+                                play_state._play_start_time = time.monotonic()
+                                logger.info(f"[VoiceCmd] 模式+在线播放: {song.get('artist')} - {song.get('title')}")
+                                result_text = f"已切换到{mode_names.get(param, param)}模式，播放 {song.get('title', arg)}"
 
         elif result.command.type == "set_volume":
             param = result.command.param
@@ -1653,6 +1666,15 @@ async def index(request: Request) -> HTMLResponse:
 async def logo_preview(request: Request) -> HTMLResponse:
     """Logo 预览页"""
     return _render_template("logo-preview.html", request)
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    """浏览器标签页图标，使用设计的 logo"""
+    logo_path = os.path.join(_static_dir, "musicnest-logo.png")
+    if os.path.isfile(logo_path):
+        return FileResponse(logo_path, media_type="image/png")
+    return Response(status_code=404)
 
 
 # ===== API 路由 =====
