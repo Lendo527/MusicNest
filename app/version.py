@@ -7,6 +7,20 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.73 - 修复在线播放2秒延迟(_get_device_hardware缓存过期+finally gather等timeout):
+           问题: v0.0.72后用户反馈问题依旧,日志分析发现13:25:51 stop_all_media完成
+                 到13:25:53 play_music_url发出之间有2秒空窗期;
+           根因1: _get_device_hardware调用_get_device_list(60s TTL缓存),
+                 服务启动2分钟后缓存过期,需HTTP请求小米服务器获取设备列表(约2秒),
+                 这2秒在with块内执行但压制循环的stop响应已回来,实际压制已停止;
+           根因2: finally中await asyncio.gather(*all_stop_tasks)等待所有stop任务完成,
+                 某些stop任务可能2秒timeout才完成,延迟play_music_url发出;
+           修复1: _get_device_hardware添加永久缓存(_hardware_cache),
+                 设备型号不会变,首次查询后永久缓存,避免重复HTTP请求;
+           修复2: 在线路径并行获取hardware(hardware_task与search_by_keyword同时启动),
+                 搜索完成后await hardware_task获取结果,不额外增加时间;
+           修复3: finally的gather改为asyncio.wait(timeout=0.1)+取消未完成任务,
+                 不等2秒timeout,play_music_url可提前2秒发出;
   0.0.72 - 修复favicon未使用设计logo + 在线播放空窗期小爱版先行:
            问题1(浏览器标签页图标): index.html无<link rel="icon">标签,
                  浏览器使用默认图标而非设计的musicnest-logo;
@@ -576,4 +590,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.72"
+__version__ = "0.0.73"

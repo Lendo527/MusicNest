@@ -431,8 +431,12 @@ async def _suppress_native(device_id: str):
     finally:
         # 停止压制循环
         await _safe_cancel(suppress_task)
-        # 等待所有 stop 完成（确保 stop 在 play 之前到达音箱，避免孤儿 stop 停掉 play）
-        await asyncio.gather(*all_stop_tasks, return_exceptions=True)
+        # 快速清理 stop 任务：等待已完成的，取消未完成的
+        # 不等2秒timeout，避免延迟 play_music_url
+        if all_stop_tasks:
+            done, pending = await asyncio.wait(all_stop_tasks, timeout=0.1)
+            for t in pending:
+                await _safe_cancel(t)
 
 
 async def _alarm_loop(alarm_id: str, hour: int, minute: int, days: list[int], song_index: Optional[int] = None):
@@ -779,10 +783,12 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 return
             else:
                 # 本地未命中：在线搜索
-                # 压制循环覆盖"搜索 + URL处理 + 等待stop + 获取hardware"整个流程，
+                # 压制循环覆盖"搜索 + URL处理 + 等待stop"整个流程，
                 # 退出 with 块后再发送 play_music_url（确保 stop 在 play 之前完成）
                 _pending_online_play = None  # (proxied_url, use_music_api, song, song_data)
                 async with _suppress_native(device_id):
+                    # 并行获取 hardware，与搜索同时进行（避免串行等待2秒）
+                    hardware_task = asyncio.create_task(_get_device_hardware(device_id))
                     kw_result = await search_by_keyword(song_name)
                     if kw_result.get("code") == 0 and kw_result.get("data"):
                         song_data = kw_result["data"]
@@ -817,7 +823,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                                 except Exception as e:
                                     logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
 
-                            hardware = await _get_device_hardware(device_id)
+                            hardware = await hardware_task
                             _pending_online_play = (proxied_url, needs_music_api(hardware), song, song_data)
                     else:
                         logger.info(f"[VoiceCmd] 未找到歌曲: {song_name}")
@@ -1002,6 +1008,8 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     # 在线搜索（压制循环覆盖搜索+处理，退出后再 play）
                     _pending_mode_play = None  # (proxied_url, use_music_api, song_dict, song)
                     async with _suppress_native(device_id):
+                        # 并行获取 hardware，与搜索同时进行
+                        hardware_task = asyncio.create_task(_get_device_hardware(device_id))
                         kw_result = await search_by_keyword(arg)
                         if kw_result.get("code") == 0 and kw_result.get("data"):
                             online_data = kw_result["data"]
@@ -1030,7 +1038,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                                             await asyncio.wait_for(stop_task2, timeout=3.5)
                                         except Exception as e:
                                             logger.warning(f"[VoiceCmd] stop_all_media 等待失败: {e}")
-                                    hardware = await _get_device_hardware(device_id)
+                                    hardware = await hardware_task
                                     _pending_mode_play = (proxied_url, needs_music_api(hardware), song_dict, song)
                                 else:
                                     logger.warning(f"[VoiceCmd] 在线歌曲无URL: {arg}")
@@ -1616,6 +1624,9 @@ async def _check_miot() -> MinaHTTPClient:
 _device_list_cache: list[dict] = []
 _device_list_cache_at: float = 0.0
 _DEVICE_LIST_CACHE_TTL = 60.0  # 秒
+
+# 设备 hardware 型号永久缓存（设备型号不会变）
+_hardware_cache: dict[str, str] = {}
 
 
 async def _get_device_list(use_cache: bool = True) -> list[dict]:
@@ -2665,12 +2676,17 @@ async def _get_target_device() -> Optional[str]:
 
 
 async def _get_device_hardware(device_id: str) -> str:
-    """根据 device_id 查询设备的 hardware 型号"""
+    """根据 device_id 查询设备的 hardware 型号（带永久缓存，设备型号不会变）"""
+    # 设备型号不会变，永久缓存
+    if device_id in _hardware_cache:
+        return _hardware_cache[device_id]
     try:
         devices = await _get_device_list()
         for d in devices:
             if d.get("deviceID", "") == device_id:
-                return d.get("hardware", "")
+                hw = d.get("hardware", "")
+                _hardware_cache[device_id] = hw
+                return hw
         return ""
     except Exception:
         return ""
