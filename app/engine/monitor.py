@@ -164,7 +164,17 @@ class ConversationMonitor:
 
     async def _poll_loop(self) -> None:
         """轮询循环（异常不静默）"""
+        from app.miot.token_refresh import is_token_invalid
+        _token_invalid_logged = False
         while self._enabled:
+            # token 失效时暂停轮询，避免疯狂 401（每30秒检查一次是否已重新登录）
+            if is_token_invalid():
+                if not _token_invalid_logged:
+                    logger.warning("[Monitor] token 已失效，暂停轮询等待重新登录")
+                    _token_invalid_logged = True
+                await asyncio.sleep(30)
+                continue
+            _token_invalid_logged = False
             try:
                 await self._poll_all()
             except Exception as e:

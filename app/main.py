@@ -1731,8 +1731,9 @@ async def api_devices_auth(body: dict) -> dict:
                 })
                 await _init_miot_client(user_id, service_token)
                 # 记录 token 创建时间，供刷新循环估算有效期
-                from app.miot.token_refresh import record_token_created, start_refresh_loop
+                from app.miot.token_refresh import record_token_created, start_refresh_loop, reset_token_invalid
                 record_token_created()
+                reset_token_invalid()  # 重置 token 失效标志，恢复 monitor/media_watcher 轮询
                 start_refresh_loop(miauth)
                 # 启动对话监控和媒体状态轮询
                 if config.get("conversation_monitor_enabled", True):
@@ -1781,8 +1782,9 @@ async def api_devices_auth(body: dict) -> dict:
 
                 await _init_miot_client(user_id, service_token)
                 # 记录 token 创建时间，供刷新循环估算有效期
-                from app.miot.token_refresh import record_token_created, start_refresh_loop
+                from app.miot.token_refresh import record_token_created, start_refresh_loop, reset_token_invalid
                 record_token_created()
+                reset_token_invalid()  # 重置 token 失效标志，恢复 monitor/media_watcher 轮询
                 start_refresh_loop(miauth)
                 # 启动对话监控和媒体状态轮询
                 if config.get("conversation_monitor_enabled", True):

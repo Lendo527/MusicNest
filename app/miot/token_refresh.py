@@ -24,11 +24,26 @@ RELOGIN_THROTTLE_SEC = 60
 
 _last_relogin_at: float = 0.0
 
+# token 是否已确认失效（passToken 过期等无法自动刷新的情况）
+# 置位后 monitor/media_watcher 暂停轮询，避免疯狂 401
+_token_invalid: bool = False
+
 # 并发刷新串行化锁：确保同一时间只有一个刷新在进行，后续 401 复用结果
 _refresh_lock: asyncio.Lock = asyncio.Lock()
 
 # client 更新回调列表（token 刷新成功后通知 client 实例同步）
 _client_callbacks: list = []
+
+
+def is_token_invalid() -> bool:
+    """检查 token 是否已确认失效（需用户重新登录）"""
+    return _token_invalid
+
+
+def reset_token_invalid() -> None:
+    """重置 token 失效状态（用户重新登录后调用）"""
+    global _token_invalid
+    _token_invalid = False
 
 
 def register_client_callback(cb) -> None:
@@ -69,7 +84,7 @@ async def _do_refresh(miauth: MiAuth) -> bool:
     Returns:
         True 表示刷新成功，False 表示无法刷新（需用户重新登录）
     """
-    global _last_relogin_at
+    global _last_relogin_at, _token_invalid
 
     pass_token = config.get("miot_pass_token", "")
     user_id = config.get("miot_user_id", "")
@@ -79,6 +94,7 @@ async def _do_refresh(miauth: MiAuth) -> bool:
         logger.warning("[TokenRefresh] 无 passToken，无法自动刷新（请重新扫码登录）")
         # 失败路径：设为 now - 50，让 60 秒节流变成 10 秒后可重试
         _last_relogin_at = time.time() - 50.0
+        _token_invalid = True
         return False
 
     try:
@@ -87,6 +103,7 @@ async def _do_refresh(miauth: MiAuth) -> bool:
             logger.warning("[TokenRefresh] passToken 刷新返回空结果（passToken 可能已过期，请重新登录）")
             # 失败路径：设为 now - 50，让 60 秒节流变成 10 秒后可重试
             _last_relogin_at = time.time() - 50.0
+            _token_invalid = True
             return False
 
         service_token = result["serviceToken"]
@@ -103,12 +120,14 @@ async def _do_refresh(miauth: MiAuth) -> bool:
                 logger.warning("[TokenRefresh] client 回调失败: %s", e)
         logger.info("[TokenRefresh] passToken 刷新成功，token 已更新并持久化")
         _last_relogin_at = time.time()
+        _token_invalid = False
         return True
 
     except Exception as e:
         logger.warning("[TokenRefresh] passToken 刷新异常: %s", e)
         # 失败路径：设为 now - 50，让 60 秒节流变成 10 秒后可重试
         _last_relogin_at = time.time() - 50.0
+        _token_invalid = True
         return False
 
 

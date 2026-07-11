@@ -7,6 +7,14 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.70 - 修复设备端超时日志爆炸和token失效后疯狂401:
+           client.py: UBus code=100(设备端读取超时)日志降级为DEBUG，
+                      其他错误截断data至200字符避免Java堆栈污染日志;
+           token_refresh.py: 新增_token_invalid标志，passToken刷新失败时置位，
+                             is_token_invalid()/reset_token_invalid()供外部查询/重置;
+           monitor.py: _poll_loop检查token失效标志，失效时暂停轮询每30秒检查重登录;
+           media_watcher.py: _watch_loop同样检查token失效标志暂停轮询;
+           main.py: 两处登录成功路径调用reset_token_invalid()恢复轮询;
   0.0.69 - 第二轮深度代码审阅修复:
            main.py:
              H1 _on_voice_message的play_song/next/previous/stop/play_playlist/set_play_mode
@@ -540,4 +548,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.69"
+__version__ = "0.0.70"

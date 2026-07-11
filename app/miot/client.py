@@ -413,9 +413,18 @@ class MinaHTTPClient:
                 "[MIoT] _ubus_request 响应: method=%s code=%s",
                 method, result.get("code") if result else "None"
             )
-        # C2: UBus code != 0 时记录 warning（不返回 None，保留 result 让调用方判断）
+        # C2: UBus code != 0 时记录日志（不返回 None，保留 result 让调用方判断）
         if isinstance(result, dict) and result.get("code", 0) != 0:
-            logger.warning("[MIoT] UBus %s 返回错误 code=%s data=%s", method, result.get("code"), result.get("data"))
+            code = result.get("code", 0)
+            data = result.get("data", "")
+            # code=100 是设备端读取超时(ReadTimeoutException)，属间歇性设备端问题，
+            # MediaWatcher 每0.2s轮询一次，降级为 DEBUG 避免日志爆炸
+            if code == 100:
+                logger.debug("[MIoT] UBus %s 设备端超时 code=100（可忽略）", method)
+            else:
+                # 截断 data 避免超长 Java 堆栈污染日志
+                data_str = str(data)[:200] if data else ""
+                logger.warning("[MIoT] UBus %s 返回错误 code=%s data=%s", method, code, data_str)
         return result
 
     async def _do_get(self, url: str) -> Optional[dict]:

@@ -176,8 +176,18 @@ class MediaWatcher:
 
     async def _watch_loop(self) -> None:
         """主循环"""
+        from app.miot.token_refresh import is_token_invalid
+        _token_invalid_logged = False
         backoff = self._poll_interval
         while self._enabled:
+            # token 失效时暂停轮询，避免疯狂 401（每30秒检查一次是否已重新登录）
+            if is_token_invalid():
+                if not _token_invalid_logged:
+                    logger.warning("[MediaWatcher] token 已失效，暂停轮询等待重新登录")
+                    _token_invalid_logged = True
+                await asyncio.sleep(30)
+                continue
+            _token_invalid_logged = False
             try:
                 await self._watch_all_devices()
                 backoff = self._poll_interval
