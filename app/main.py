@@ -779,26 +779,24 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                 )
                 if kw_result.get("code") == 0 and kw_result.get("data"):
                     song_data = kw_result["data"]
-                    song = {
-                        "title": song_data.get("title", song_name),
-                        "artist": song_data.get("artist", ""),
-                        "filepath": song_data.get("url", ""),
-                        "album": song_data.get("album", ""),
-                        "cover_url": song_data.get("cover_url", ""),
-                        "duration": song_data.get("duration", 0),
-                    }
-                    play_state.playlist = [song]
-                    play_state.current_index = 0
-                    play_state.device_id = device_id
-                    play_state.duration = int(song_data.get("duration", 0))
-                    if miot_client:
-                        play_url_raw = song["filepath"]
-                        if not play_url_raw or not play_url_raw.startswith("http"):
-                            logger.info(f"[VoiceCmd] 在线歌曲无可用 URL: {song_name}")
-                            if monitor:
-                                monitor.mark_query_handled(device_id, query)
-                            return
-
+                    play_url_raw = song_data.get("url", "")
+                    # 先校验 URL 可用性，确认可用后再修改 play_state（避免 URL 为空时污染状态）
+                    if not miot_client:
+                        logger.warning("[VoiceCmd] 未登录小米账号，无法播放")
+                    elif not play_url_raw or not play_url_raw.startswith("http"):
+                        logger.info(f"[VoiceCmd] 在线歌曲无可用 URL: {song_name}")
+                        if monitor:
+                            monitor.mark_query_handled(device_id, query)
+                        return
+                    else:
+                        song = {
+                            "title": song_data.get("title", song_name),
+                            "artist": song_data.get("artist", ""),
+                            "filepath": play_url_raw,
+                            "album": song_data.get("album", ""),
+                            "cover_url": song_data.get("cover_url", ""),
+                            "duration": song_data.get("duration", 0),
+                        }
                         server_host = config.get("server_host", "http://localhost:58092")
                         url_hash = hashlib.md5(play_url_raw.encode()).hexdigest()[:16]
                         _online_urls[url_hash] = play_url_raw
@@ -828,15 +826,18 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             ok = await miot_client.play_music_url(device_id, proxied_url)
                         else:
                             ok = await miot_client.play_url(device_id, proxied_url)
+                        # play_state 修改全部在锁内，与 set_play_mode / 本地播放路径一致防竞态
                         async with _play_lock:
                             if ok:
+                                play_state.playlist = [song]
+                                play_state.current_index = 0
+                                play_state.device_id = device_id
+                                play_state.duration = int(song_data.get("duration", 0))
                                 play_state.is_playing = True
                                 play_state._play_start_time = time.monotonic()
                                 logger.info(f"[VoiceCmd] 在线播放: {song['artist']} - {song['title']}")
                             else:
                                 logger.warning(f"[VoiceCmd] 在线播放失败: {song['title']}")
-                    else:
-                        logger.warning("[VoiceCmd] 未登录小米账号，无法播放")
                 else:
                     logger.info(f"[VoiceCmd] 未找到歌曲: {song_name}")
 
@@ -1505,6 +1506,12 @@ async def lifespan(app: FastAPI):
     try:
         from app.search.kuwo import close_client as kuwo_close
         await kuwo_close()
+    except Exception:
+        pass
+    # 关闭 netease 共享 httpx 客户端
+    try:
+        from app.search.netease import close_client as netease_close
+        await netease_close()
     except Exception:
         pass
     logger.info("musicnest 已停止")
@@ -2818,20 +2825,20 @@ async def api_player_play(body: dict) -> dict:
     songs = body.get("songs", None)
     device_id = body.get("device_id", None)
 
-    # 更新歌单
-    if songs and isinstance(songs, list) and len(songs) > 0:
-        play_state.playlist = songs
-    elif not play_state.playlist:
-        # 自动加载全部歌曲
-        play_state.playlist = scanner.get_songs(limit=500)
-
-    if not play_state.playlist:
-        return {"code": 1, "msg": "播放列表为空"}
-
-    if not isinstance(song_index, int) or song_index < 0 or song_index >= len(play_state.playlist):
-        return {"code": 1, "msg": f"歌曲索引越界: {song_index}"}
-
+    # 更新歌单（playlist 赋值在锁内，防与语音指令并发修改竞态）
     async with _play_lock:
+        if songs and isinstance(songs, list) and len(songs) > 0:
+            play_state.playlist = songs
+        elif not play_state.playlist:
+            # 自动加载全部歌曲
+            play_state.playlist = scanner.get_songs(limit=500)
+
+        if not play_state.playlist:
+            return {"code": 1, "msg": "播放列表为空"}
+
+        if not isinstance(song_index, int) or song_index < 0 or song_index >= len(play_state.playlist):
+            return {"code": 1, "msg": f"歌曲索引越界: {song_index}"}
+
         play_state.current_index = song_index
 
         # 确定播放设备

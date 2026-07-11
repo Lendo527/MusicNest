@@ -7,6 +7,22 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.71 - 修复语音指令在线播放竞态+状态污染,netease共享连接池:
+           main.py:
+             H1 play_song在线路径play_state修改(playlist/current_index/device_id/duration)
+                全部移入_play_lock,与set_play_mode/本地播放路径一致防竞态;
+                之前仅is_playing在锁内,playlist等4字段在锁外,API并发读取会读到部分更新状态;
+             H2 play_song在线路径URL为空时不再污染play_state:
+                之前先修改play_state再校验URL,URL为空时playlist已被替换为[无URL歌曲],
+                导致/api/player/state返回错误列表(用户感知为"播放列表乱掉");
+                修复:先校验URL可用性,确认可用后才修改play_state;
+             H3 api_player_play的playlist赋值移入_play_lock:
+                之前playlist=songs在锁外,与语音指令并发修改时产生竞态;
+           netease.py:
+             M1 新增共享httpx客户端(_get_client/close_client),
+                _netease_request和verify_cookie复用连接池,
+                歌单同步千首歌时避免TCP连接堆积(参照kuwo.py模式);
+             main.py lifespan关闭时调用netease.close_client();
   0.0.70 - 修复设备端超时日志爆炸和token失效后疯狂401:
            client.py: UBus code=100(设备端读取超时)日志降级为DEBUG，
                       其他错误截断data至200字符避免Java堆栈污染日志;
@@ -548,4 +564,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.70"
+__version__ = "0.0.71"

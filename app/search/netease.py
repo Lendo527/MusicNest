@@ -1,5 +1,6 @@
 """网易云音乐搜索 - 通过第三方网关 POST JSON 模式（sqmusic 风格）"""
 
+import asyncio
 import logging
 import re
 import time
@@ -10,6 +11,29 @@ import httpx
 from app.search.base import SearchResult, MusicFormat, SearchProvider
 
 logger = logging.getLogger("musicnest.netease")
+
+# 模块级共享 httpx 客户端，复用连接池（歌单同步千首歌时避免 TCP 连接堆积）
+_shared_client: Optional[httpx.AsyncClient] = None
+_client_lock = asyncio.Lock()
+
+
+async def _get_client(timeout: float = 10.0) -> httpx.AsyncClient:
+    """获取共享 httpx 客户端，复用连接池"""
+    global _shared_client
+    async with _client_lock:
+        if _shared_client is None or _shared_client.is_closed:
+            _shared_client = httpx.AsyncClient(timeout=timeout)
+        return _shared_client
+
+
+async def close_client():
+    """应用关闭时调用，关闭共享 httpx 客户端"""
+    global _shared_client
+    async with _client_lock:
+        if _shared_client and not _shared_client.is_closed:
+            await _shared_client.aclose()
+            _shared_client = None
+
 
 # 第三方网关列表（抄 sqmusic application-netease.yml + 本地 fallback）
 NETEASE_API_BASE_URLS = [
@@ -51,26 +75,26 @@ async def _netease_request(
     urls_to_try = [base_url_override] if base_url_override else NETEASE_API_BASE_URLS
 
     last_error = None
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for base_url in urls_to_try:
-            url = f"{base_url}{endpoint}"
-            # 加时间戳到 URL 防网关缓存（Post JSON body 不会影响缓存 key）
-            url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(time.time() * 1000))
-            try:
-                resp = await client.post(url, json=params, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                # 成功返回
-                return data
-            except httpx.TimeoutException as e:
-                last_error = f"timeout: {e}"
-                logger.warning(f"[Netease] {url} 超时，尝试下一个网关")
-            except httpx.RequestError as e:
-                last_error = f"request: {e}"
-                logger.warning(f"[Netease] {url} 请求失败: {e}，尝试下一个网关")
-            except Exception as e:
-                last_error = f"exception: {e}"
-                logger.warning(f"[Netease] {url} 异常: {e}，尝试下一个网关")
+    client = await _get_client(timeout=timeout)
+    for base_url in urls_to_try:
+        url = f"{base_url}{endpoint}"
+        # 加时间戳到 URL 防网关缓存（Post JSON body 不会影响缓存 key）
+        url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(time.time() * 1000))
+        try:
+            resp = await client.post(url, json=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            # 成功返回
+            return data
+        except httpx.TimeoutException as e:
+            last_error = f"timeout: {e}"
+            logger.warning(f"[Netease] {url} 超时，尝试下一个网关")
+        except httpx.RequestError as e:
+            last_error = f"request: {e}"
+            logger.warning(f"[Netease] {url} 请求失败: {e}，尝试下一个网关")
+        except Exception as e:
+            last_error = f"exception: {e}"
+            logger.warning(f"[Netease] {url} 异常: {e}，尝试下一个网关")
 
     logger.error(f"[Netease] 所有网关均失败: {last_error}")
     return {"code": -1, "msg": f"所有网关失败: {last_error}"}
@@ -570,31 +594,31 @@ async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
     ]
 
     # 阶段 1：逐端点 + 逐网关验证
+    client = await _get_client(timeout=timeout)
     for endpoint, key_path in verify_endpoints:
         for base_url in NETEASE_API_BASE_URLS:
             # 搜索需要传 params，其他端点不需要
             params = {"uid": 1} if endpoint == "/user/detail" else {}
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    url = f"{base_url}{endpoint}"
-                    headers = {"Content-Type": "application/json; charset=utf-8", "Cookie": cookie}
-                    resp = await client.post(url, json=params, headers=headers)
-                    data = resp.json()
-                    if data.get("code") == 200:
-                        # 检查关键字段
-                        account = data.get("account") or data.get("data", {}).get("account")
-                        profile = data.get("profile") or data.get("data", {}).get("profile")
-                        if account or profile:
-                            nickname = (profile or {}).get("nickname") or (account or {}).get("userName", "未知")
-                            logger.info("[Netease] Cookie 有效 (via %s %s), 用户: %s",
-                                        base_url, endpoint, nickname)
-                            return True
-                        # 有结果但字段名不同，打印提示
-                        logger.debug("[Netease] %s %s 返回 200 但无 account/profile: keys=%s",
-                                     base_url, endpoint, list(data.keys()))
-                    else:
-                        logger.debug("[Netease] %s %s 返回 code=%s",
-                                     base_url, endpoint, data.get("code"))
+                url = f"{base_url}{endpoint}"
+                headers = {"Content-Type": "application/json; charset=utf-8", "Cookie": cookie}
+                resp = await client.post(url, json=params, headers=headers)
+                data = resp.json()
+                if data.get("code") == 200:
+                    # 检查关键字段
+                    account = data.get("account") or data.get("data", {}).get("account")
+                    profile = data.get("profile") or data.get("data", {}).get("profile")
+                    if account or profile:
+                        nickname = (profile or {}).get("nickname") or (account or {}).get("userName", "未知")
+                        logger.info("[Netease] Cookie 有效 (via %s %s), 用户: %s",
+                                    base_url, endpoint, nickname)
+                        return True
+                    # 有结果但字段名不同，打印提示
+                    logger.debug("[Netease] %s %s 返回 200 但无 account/profile: keys=%s",
+                                 base_url, endpoint, list(data.keys()))
+                else:
+                    logger.debug("[Netease] %s %s 返回 code=%s",
+                                 base_url, endpoint, data.get("code"))
             except Exception as e:
                 logger.debug("[Netease] %s %s 失败: %s", base_url, endpoint, e)
 

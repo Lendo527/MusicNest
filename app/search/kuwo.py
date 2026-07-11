@@ -433,6 +433,31 @@ async def search_by_keyword(keyword: str, timeout: float = 10.0) -> dict:
                 url = fmt.url
                 break
 
+    # 补救：N_Minfo 字段解析出的 formats 仅含音质元数据，不含播放 URL。
+    # 批量 search() 不会主动调 _get_music_formats（避免每首歌 5 个并发请求拖慢搜索），
+    # 导致语音指令在线播放路径拿到的 url 恒为 None → "在线歌曲无可用 URL" → 静默不播。
+    # 这里是语音专用接口（只取首条结果），补调一次 mobi API 获取真实播放地址。
+    if not url:
+        pure_id = r.id.replace("kuwo_", "")
+        try:
+            real_formats = await _get_music_formats(pure_id, timeout=timeout)
+        except Exception as e:
+            logger.warning("[Kuwo] search_by_keyword 补调 _get_music_formats 失败: %s", e)
+            real_formats = []
+        if real_formats:
+            r.formats = real_formats
+            for fmt in r.formats:
+                if fmt.type == "mp3" and fmt.url:
+                    url = fmt.url
+                    break
+            if not url:
+                for fmt in r.formats:
+                    if fmt.url:
+                        url = fmt.url
+                        break
+            logger.debug("[Kuwo] search_by_keyword 补调成功: pure_id=%s url=%s",
+                         pure_id, url[:80] if url else "None")
+
     return {
         "code": 0,
         "msg": "success",
