@@ -198,18 +198,29 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
 
 
 async def _download_cover(cover_url: str, artist_dir: Path, album_dir: Path) -> bool:
-    """下载封面图片到专辑目录，同时存一份到歌手目录作为歌手图"""
+    """下载封面图片到专辑目录，同时存一份到歌手目录作为歌手图
+
+    两处下载相互独立，用 asyncio.gather 并行执行以减少等待时间。
+    """
     if not cover_url:
         return False
     cover_path = album_dir / "cover.jpg"
     artist_img_path = artist_dir / "artist.jpg"
-    ok = True
+    # 构造并行下载任务列表（仅下载尚不存在的文件）
+    tasks = []
     if not cover_path.exists():
-        ok = await _download_file(cover_url, cover_path)
-    # 同时下载一份到歌手目录作为歌手头像（如果还没有）
-    if ok and not artist_img_path.exists():
-        artist_ok = await _download_file(cover_url, artist_img_path)
-        if not artist_ok:
+        tasks.append(_download_file(cover_url, cover_path))
+    if not artist_img_path.exists():
+        tasks.append(_download_file(cover_url, artist_img_path))
+    if not tasks:
+        return True
+    results = await asyncio.gather(*tasks)
+    ok = all(results)
+    if not ok:
+        # 区分失败位置便于排查
+        if not cover_path.exists():
+            logger.warning(f"[Cover] 专辑封面下载失败: {cover_url[:80]}")
+        if not artist_img_path.exists() and tasks:
             logger.warning(f"[Cover] 歌手头像下载失败: {cover_url[:80]}")
     return ok
 

@@ -7,6 +7,52 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.86 - 全代码库审阅修复(P0崩溃+P1竞态/死代码+P2重复代码/并行化+P3清理):
+           问题1(auth.py P0崩溃): _cookie_lock = asyncio.Lock() 使用了 asyncio，
+                 但文件未 import asyncio，main.py 模块级实例化 MiAuth() 时必抛 NameError，
+                 扫码登录功能完全不可用;
+           修复1: auth.py 导入区添加 import asyncio;
+           问题2(main.py P1 volume竞态): 语音指令 set_volume 分支 play_state.volume = vol
+                 在 _play_lock 外修改，与 API 端点(锁内修改)并发时存在竞态;
+           修复2: play_state.volume = vol 移入 async with _play_lock;
+           问题3(hardware.py P1死代码): needs_music_api/needs_mp3 恒返回 True，
+                 auto_music_api 配置项的 if auto_api: if needs_music_api() 嵌套冗余;
+           修复3: hardware.py 保留函数作扩展点但更新注释说明当前恒 True;
+                 main.py 两处 if auto_api: if needs_music_api() 简化为
+                 if auto_api and needs_music_api() 单行条件;
+           问题4(main.py P1误导日志): lifespan 中 start_refresh_loop(miauth) 是 no-op
+                 (v0.0.47 改纯被动401模式)，但日志输出"token 自动刷新任务已启动"误导用户;
+           修复4: 移除 lifespan 和两处登录成功路径中的 start_refresh_loop/record_token_created
+                 no-op 调用及误导日志，保留 reset_token_invalid 实际有效调用;
+           问题5(main.py P2代码重复): _on_voice_message 中 play_song 和 set_play_mode
+                 两个分支的在线播放逻辑(搜索+URL处理+代理+stop等待+play_music_url)
+                 约90行代码几乎完全重复;
+           修复5: 提取 _play_online_song 共享函数，统一两种返回结构(单dict/list)处理，
+                 两处调用简化为 3 行调用 + 锁内状态更新;
+           问题6(worker.py P2串行下载): _download_cover 顺序下载专辑封面和歌手头像
+                 (同一 URL 下载到两个路径)，串行执行浪费时间;
+           修复6: 用 asyncio.gather 并行下载两个目标，失败时区分位置记录日志;
+           问题7(main.py P2 config.set连续调用): get_qr 和登录成功路径连续两次
+                 config.set() 不断重置防抖定时器;
+           修复7: 改为 config.update({}) 单次调用，与 set() 行为一致(防抖合并);
+           问题8(main.py P2 iter_songs双遍扫描): 外部播放检测中
+                 bool(scanner.iter_songs()) + enumerate(scanner.iter_songs())
+                 两次深拷贝整个歌曲列表;
+           修复8: 合并为单次 songs_snapshot = scanner.iter_songs() 复用;
+           问题9(client.py P3重复函数): _generate_device_id() 与 auth.py 中的版本重复;
+           修复9: 删除 client.py 底部 _generate_device_id，顶部添加 import uuid，
+                 调用点内联 str(uuid.uuid4()).replace("-", "");
+           问题10(index.py P3死代码): music/index.py 的 SongIndex/SongEntry/ScoredSong/
+                 fuzzy_score/levenshtein_distance 从未被任何文件导入使用;
+           修复10: 删除整个 index.py 文件;
+           问题11(main.py P3 O(n)深拷贝): _fix_play_state_after_delete 批量删除分支
+                 构建 {s.get("filepath") for s in scanner.iter_songs()} 完整集合
+                 做存在性检查，O(n) 深拷贝整个列表;
+           修复11: 改用 scanner.get_index_by_filepath(filepath) is None，
+                 内部直接遍历 self._songs(不深拷贝)，找到即返回;
+           问题12(main.py P3 alarm sleep过长): _alarm_loop 的 asyncio.sleep(wait_seconds)
+                 可能长达 24 小时，任务取消信号响应延迟;
+           修复12: wait_seconds = min(wait_seconds, 3600)，每小时醒来检查取消信号;
   0.0.85 - P2/P3深度审阅修复voice/config/scanner模块(配置缺失/防抖/缓存路径/路径解析一致性):
            问题1(config.py create_alarm在DEFAULT_CONFIG中缺失): voice.py定义了create_alarm
                  指令(关键词"设置闹钟"等), 但config.py的DEFAULT_CONFIG["voice_commands"]
@@ -801,4 +847,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.85"
+__version__ = "0.0.86"

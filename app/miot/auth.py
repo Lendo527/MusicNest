@@ -7,6 +7,7 @@
 4. 用 passToken 交换目标服务 (micoapi) 的 serviceToken
 """
 
+import asyncio
 import base64
 import hashlib
 import json as _json

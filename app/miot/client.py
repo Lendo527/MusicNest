@@ -6,6 +6,7 @@ import logging
 import secrets
 import string
 import time
+import uuid
 from typing import Any, Optional
 
 import httpx
@@ -41,7 +42,7 @@ class MinaHTTPClient:
     def __init__(self, user_id: str, service_token: str, device_id: str = "", ssecurity: str = ""):
         self._user_id = user_id
         self._service_token = service_token
-        self._device_id = device_id or _generate_device_id()
+        self._device_id = device_id or str(uuid.uuid4()).replace("-", "")
         self._ssecurity = ssecurity
         self._user_agent = _format_user_agent(self._device_id)
         self._client = httpx.AsyncClient(
@@ -501,7 +502,3 @@ class MinaHTTPClient:
             return False
 
 
-def _generate_device_id() -> str:
-    """生成设备 ID"""
-    import uuid
-    return str(uuid.uuid4()).replace("-", "")
