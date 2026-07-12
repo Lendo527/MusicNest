@@ -17,6 +17,10 @@ logger = logging.getLogger("musicnest.kuwo")
 _shared_client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
 
+# 并发 HTTP 请求上限：search下载路径 limit×5 格式检查可产生50并发请求,
+# 限制为10避免被酷我限流/封IP
+_format_semaphore = asyncio.Semaphore(10)
+
 
 async def _get_client(timeout: float = 10.0) -> httpx.AsyncClient:
     global _shared_client
@@ -61,8 +65,9 @@ FORMAT_DEFS = [
 def _python_to_json(raw_text: str) -> str:
     """将酷我返回的 Python 字面量转为 JSON"""
     # 长度限制，避免解析超大文本导致性能问题
+    # 返回空字符串而非 None，确保调用方 json.loads 抛 JSONDecodeError 而非 TypeError
     if len(raw_text) > 100000:
-        return None
+        return ""
     import ast
     s = raw_text.strip()
     # 移除 BOM
@@ -127,30 +132,31 @@ def _upgrade_cover_url(url: str) -> str:
 async def _get_music_formats(pure_id: str, timeout: float = 10.0) -> List[MusicFormat]:
     """获取歌曲的可用音质列表（通过 mobi.kuwo.cn API）"""
     async def _check_format(name: str, br_value: str, bitrate: int, ftype: str) -> Optional[MusicFormat]:
-        url = (
-            f"{KUWO_MOBI_URL}?f=web&user=0"
-            f"&source=kwplayer_ar_5.0.0.0_B_jiakong_vh.apk"
-            f"&type=convert_url_with_sign&rid={pure_id}&br={br_value}"
-        )
-        logger.debug("[Kuwo] _check_format: name=%s br=%s url=%s", name, br_value, url[:120])
-        try:
-            client = await _get_client(timeout=timeout)
-            resp = await client.get(url, timeout=httpx.Timeout(timeout))
-            logger.debug("[Kuwo] format响应: name=%s status=%d", name, resp.status_code)
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            if data.get("code") != 200:
-                logger.debug("[Kuwo] format不可用: name=%s code=%s", name, data.get("code"))
-                return None
-            play_url = data.get("data", {}).get("url", "")
-            if play_url and play_url.startswith("http"):
-                logger.debug("[Kuwo] format可用: name=%s url=%s", name, play_url[:80])
-                return MusicFormat(name=name, bitrate=bitrate, type=ftype, url=play_url)
-            logger.debug("[Kuwo] format无URL: name=%s", name)
-        except Exception as e:
-            logger.debug("[Kuwo] format检查异常: name=%s error=%s", name, e)
-        return None
+        async with _format_semaphore:
+            url = (
+                f"{KUWO_MOBI_URL}?f=web&user=0"
+                f"&source=kwplayer_ar_5.0.0.0_B_jiakong_vh.apk"
+                f"&type=convert_url_with_sign&rid={pure_id}&br={br_value}"
+            )
+            logger.debug("[Kuwo] _check_format: name=%s br=%s url=%s", name, br_value, url[:120])
+            try:
+                client = await _get_client(timeout=timeout)
+                resp = await client.get(url, timeout=httpx.Timeout(timeout))
+                logger.debug("[Kuwo] format响应: name=%s status=%d", name, resp.status_code)
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+                if data.get("code") != 200:
+                    logger.debug("[Kuwo] format不可用: name=%s code=%s", name, data.get("code"))
+                    return None
+                play_url = data.get("data", {}).get("url", "")
+                if play_url and play_url.startswith("http"):
+                    logger.debug("[Kuwo] format可用: name=%s url=%s", name, play_url[:80])
+                    return MusicFormat(name=name, bitrate=bitrate, type=ftype, url=play_url)
+                logger.debug("[Kuwo] format无URL: name=%s", name)
+            except Exception as e:
+                logger.debug("[Kuwo] format检查异常: name=%s error=%s", name, e)
+            return None
 
     logger.debug("[Kuwo] 开始获取音质列表: pure_id=%s", pure_id)
     tasks = [_check_format(name, br, bitrate, ftype) for name, br, bitrate, ftype in FORMAT_DEFS]
@@ -504,14 +510,22 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
 
     try:
         client = await _get_client(timeout=timeout)
-        # 1. 获取歌手热门歌曲（PC 端 artist2music 接口，参考 sqmusic ArtistSongListUrl）
+        # 1. 并发获取歌手热门歌曲 + 专辑列表（两个请求互相独立）
         songs_url = (
             f"{KUWO_SEARCH_URL}?pn=0&rn=50&artistid={artist_id}"
             f"&stype=artist2music&sortby=0&encoding=utf8&{_KUWO_PC_PARAMS}"
         )
-        logger.debug("[Kuwo] 歌手歌曲请求: url=%s", songs_url)
-        resp = await client.get(songs_url, timeout=httpx.Timeout(timeout))
+        albums_url = (
+            f"{KUWO_SEARCH_URL}?pn=0&rn=10000&artistid={artist_id}"
+            f"&stype=albumlist&sortby=1&encoding=utf8&{_KUWO_PC_PARAMS}"
+        )
+        logger.debug("[Kuwo] 并发请求歌手歌曲+专辑: artist_id=%s", artist_id)
+        resp, resp2 = await asyncio.gather(
+            client.get(songs_url, timeout=httpx.Timeout(timeout)),
+            client.get(albums_url, timeout=httpx.Timeout(timeout)),
+        )
         resp.raise_for_status()
+        resp2.raise_for_status()
 
         # PC 端 API 返回标准 JSON（双引号），直接解析；移动端返回 Python 风格（单引号）需 _python_to_json
         try:
@@ -597,15 +611,7 @@ async def get_artist_detail(artist_id: str, timeout: float = 10.0) -> dict:
         song_results = await asyncio.gather(*song_tasks, return_exceptions=True)
         result["top_songs"] = [r for r in song_results if r is not None and not isinstance(r, Exception)]
 
-        # 2. 获取歌手专辑列表（PC 端 albumlist 接口，参考 sqmusic ArtistAlbumListUrl）
-        albums_url = (
-            f"{KUWO_SEARCH_URL}?pn=0&rn=10000&artistid={artist_id}"
-            f"&stype=albumlist&sortby=1&encoding=utf8&{_KUWO_PC_PARAMS}"
-        )
-        logger.debug("[Kuwo] 歌手专辑请求: url=%s", albums_url)
-        resp2 = await client.get(albums_url, timeout=httpx.Timeout(timeout))
-        resp2.raise_for_status()
-
+        # 2. 解析专辑列表（resp2 已在上方并发获取）
         # PC 端标准 JSON，直接解析；降级用 _python_to_json
         try:
             album_data = json.loads(resp2.text)

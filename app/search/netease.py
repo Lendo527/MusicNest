@@ -682,14 +682,29 @@ async def get_artist_detail(
         return result
 
     try:
-        # 1. 获取歌手热门歌曲（top 50）
-        songs_result = await _netease_request(
-            "/artist/top/song",
-            params={"id": artist_id},
-            cookie=cookie,
-            timeout=timeout,
+        # 并发获取歌手热门歌曲 + 详情 + 专辑列表（三个请求互相独立）
+        songs_result, detail_result, albums_result = await asyncio.gather(
+            _netease_request(
+                "/artist/top/song",
+                params={"id": artist_id},
+                cookie=cookie,
+                timeout=timeout,
+            ),
+            _netease_request(
+                "/artist/detail",
+                params={"id": artist_id},
+                cookie=cookie,
+                timeout=timeout,
+            ),
+            _netease_request(
+                "/artist/album",
+                params={"id": artist_id, "limit": 50},
+                cookie=cookie,
+                timeout=timeout,
+            ),
         )
 
+        # 1. 解析热门歌曲
         if songs_result.get("code") == 200:
             songs = songs_result.get("songs", [])
             for song in songs[:20]:
@@ -703,14 +718,7 @@ async def get_artist_detail(
                 if ar:
                     result["name"] = (ar[0].get("name") or "").strip()
 
-        # 2. 获取歌手详情（含头像）
-        detail_result = await _netease_request(
-            "/artist/detail",
-            params={"id": artist_id},
-            cookie=cookie,
-            timeout=timeout,
-        )
-
+        # 2. 解析歌手详情（含头像）
         if detail_result.get("code") == 200:
             artist_data = (detail_result.get("data") or {}).get("artist", {})
             if artist_data:
@@ -718,14 +726,7 @@ async def get_artist_detail(
                     result["name"] = (artist_data.get("name") or "").strip()
                 result["image"] = artist_data.get("picUrl") or artist_data.get("cover") or ""
 
-        # 3. 获取歌手专辑列表
-        albums_result = await _netease_request(
-            "/artist/album",
-            params={"id": artist_id, "limit": 50},
-            cookie=cookie,
-            timeout=timeout,
-        )
-
+        # 3. 解析专辑列表
         if albums_result.get("code") == 200:
             albums_data = albums_result.get("hotAlbums") or albums_result.get("albums") or []
             for alb in albums_data[:20]:

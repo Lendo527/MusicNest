@@ -7,6 +7,21 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.83 - P2深度审阅修复search模块(None返回/并发限制/并行化):
+           问题1(kuwo _python_to_json返回None): 超长文本时return None,
+                 但函数签名是->str, 调用方json.loads(None)抛TypeError(非JSONDecodeError),
+                 except json.JSONDecodeError捕获不到, 异常向上传播;
+           修复1: return ""替代None, json.loads("")正确抛JSONDecodeError被调用方捕获;
+           问题2(kuwo search无并发限制): skip_formats=False(下载路径)时,
+                 limit×5=50个并发HTTP请求同时发往mobi.kuwo.cn, 可能被限流/封IP;
+           修复2: 新增_format_semaphore=asyncio.Semaphore(10),
+                 _check_format用async with _format_semaphore包裹整个HTTP请求;
+           问题3(kuwo get_artist_detail串行请求): 歌手歌曲和专辑列表两个独立HTTP请求串行,
+                 用户等待时间=请求1+请求2;
+           修复3: 改为asyncio.gather并发, 用户等待时间=max(请求1,请求2);
+           问题4(netease get_artist_detail串行请求): 热门歌曲/详情/专辑三个独立HTTP请求串行,
+                 每个请求内部可能遍历多个网关(每个10s超时), 最坏情况总延迟=3×10网关×10s=300s;
+           修复4: 改为asyncio.gather并发, 总延迟降为1×网关遍历时间;
   0.0.82 - P2深度审阅修复engine模块(退避/窗口/冷却/异常):
            问题1(monitor _poll_loop无退避): _poll_all持续异常时每0.2s打印一条warning,
                  日志刷屏; media_watcher已有指数退避但monitor没有;
@@ -729,4 +744,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.82"
+__version__ = "0.0.83"
