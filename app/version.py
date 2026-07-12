@@ -7,6 +7,21 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.76 - P0深度审阅修复(4个严重问题):
+           问题1(client.py): _ubus_request在code!=0时仍返回dict,
+                 所有调用方用`is not None`误判成功,导致播放失败被误认为成功;
+           修复1: _ubus_request在code!=0时返回None,统一收口;
+                 stop_all_media的success_count判断适配为`isinstance(r, dict)`;
+           问题2(media_watcher.py): 解析失败20次后_paused_at未设置,
+                 导致设备永久暂停(无法进入冷却重试分支);
+           修复2: 解析失败分支也设置_paused_at,与网络异常分支对齐;
+           问题3(media_watcher.py): 拦截回调全失败仍标记query已处理,
+                 用户指令被永久丢弃;
+           修复3: 仅当至少一个回调成功时才mark_query_handled,
+                 全失败时不标记让轨道1兜底;
+           问题4(player.py): 整个647行文件是死代码(无任何文件导入),
+                 误导维护者,PlaylistManager/PlayState/PlayMode与main.py无关;
+           修复4: 删除player.py;
   0.0.75 - 修复本地播放路径play_music_url往返期间小爱版启动(LET IT GO案例):
            问题: v0.0.74只修复了在线路径,但LET IT GO走的是本地播放路径;
                  日志证据: 14:31:20用户说话(answer="请欣赏试听版")
@@ -614,4 +629,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.75"
+__version__ = "0.0.76"

@@ -240,6 +240,12 @@ class MediaWatcher:
         current_status = self._parse_status(raw)
         if current_status is None:
             self._consecutive_failures[device_id] = self._consecutive_failures.get(device_id, 0) + 1
+            if self._consecutive_failures[device_id] == MAX_CONSECUTIVE_FAILURES:
+                self._paused_at[device_id] = time.time()
+                logger.error(
+                    "[MediaWatcher] 设备 %s 连续解析失败 %d 次，暂停监控",
+                    device_id[:12], MAX_CONSECUTIVE_FAILURES
+                )
             return
 
         # 失败计数清零
@@ -319,17 +325,24 @@ class MediaWatcher:
 
         # 4. 触发拦截回调
         self._last_intercept_at[device_id] = now
+        success_count = 0
         for name, cb in self._intercept_callbacks:
             try:
                 await cb(device_id, recent_query)
+                success_count += 1
             except Exception as e:
                 logger.error(
                     "[MediaWatcher] 拦截回调 %s 执行异常: %s", name, e, exc_info=True
                 )
 
-        # 拦截后标记 query 为已处理，避免轨道 1 重复触发
-        if self._monitor:
+        # 仅当至少一个回调成功时才标记 query 为已处理，避免全失败时用户指令被永久丢弃
+        if success_count > 0 and self._monitor:
             self._monitor.mark_query_handled(device_id, recent_query)
+        elif success_count == 0:
+            logger.warning(
+                "[MediaWatcher] 设备 %s 所有拦截回调均失败，query %r 未标记为已处理（轨道1可兜底）",
+                device_id[:12], recent_query[:40]
+            )
 
     @staticmethod
     def _parse_status(raw) -> Optional[int]:

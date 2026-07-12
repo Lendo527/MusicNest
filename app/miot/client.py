@@ -212,7 +212,8 @@ class MinaHTTPClient:
             ), timeout=3.0),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        success_count = sum(1 for r in results if isinstance(r, dict) and r.get("code") == 0)
+        # _ubus_request 在 code!=0 时返回 None，code==0 时返回 dict
+        success_count = sum(1 for r in results if isinstance(r, dict))
         if success_count == 0:
             logger.warning(f"[MIoT] stop_all_media 全部失败: device_id={device_id[:12]}...")
         else:
@@ -413,7 +414,8 @@ class MinaHTTPClient:
                 "[MIoT] _ubus_request 响应: method=%s code=%s",
                 method, result.get("code") if result else "None"
             )
-        # C2: UBus code != 0 时记录日志（不返回 None，保留 result 让调用方判断）
+        # C2: UBus code != 0 时记录日志并返回 None
+        # 统一收口：code!=0 表示设备端错误，调用方用 `is not None` 判断成功
         if isinstance(result, dict) and result.get("code", 0) != 0:
             code = result.get("code", 0)
             data = result.get("data", "")
@@ -425,6 +427,7 @@ class MinaHTTPClient:
                 # 截断 data 避免超长 Java 堆栈污染日志
                 data_str = str(data)[:200] if data else ""
                 logger.warning("[MIoT] UBus %s 返回错误 code=%s data=%s", method, code, data_str)
+            return None
         return result
 
     async def _do_get(self, url: str) -> Optional[dict]:
