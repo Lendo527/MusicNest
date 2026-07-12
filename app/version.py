@@ -7,6 +7,16 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.79 - P1修复auth.py cookie jar竞态:
+           问题: exchange_token与扫码登录(get_qr_code/poll_qr_result)共享同一httpx client,
+                 并发清空cookie jar(client.cookies=httpx.Cookies())时互相破坏;
+                 场景: 用户正在扫码(30s长轮询)时后台401触发exchange_token,
+                 后者清空cookie jar导致扫码轮询cookie丢失,登录流程失败;
+           修复: 为MiAuth添加_cookie_lock(asyncio.Lock),
+                 get_qr_code/exchange_token/login_with_password三个方法
+                 全部用async with self._cookie_lock包裹整个方法体,
+                 确保cookie jar操作串行化;
+                 login_with_password同时补加cookie重置(之前缺失);
   0.0.78 - P1修复tracker.py竞态 + worker.py三个问题:
            问题1(tracker.py add_task竞态): ON CONFLICT条件含'loading',
                  用户在任务正在loading时重新触发下载,会将loading重置为waiting,
@@ -655,4 +665,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.78"
+__version__ = "0.0.79"
