@@ -101,8 +101,8 @@ def _find_lyrics(audio_path: Path) -> Optional[str]:
 class MusicScanner:
     """音乐库扫描器 - 支持多层文件夹结构"""
 
-    # 缓存文件路径（/data 持久卷）
-    CACHE_FILE = "/data/songs_cache.json"
+    # 缓存文件路径（/data 持久卷，支持环境变量覆盖以便测试和多实例隔离）
+    CACHE_FILE = os.environ.get("SCANNER_CACHE_FILE", "/data/songs_cache.json")
 
     def __init__(self, music_path: str = "/music"):
         self._music_path = music_path
@@ -189,7 +189,8 @@ class MusicScanner:
             logger.info(f"[Scanner] 缓存校验: 移除 {removed} 首不存在的歌曲")
 
         self._songs = valid_songs
-        self._scan_time = time.time()
+        # 不在此设置 _scan_time：仅从缓存加载不代表执行过扫描，
+        # _scan_time 应只在 scan()/scan_new() 实际扫描后设置
         logger.info(f"[Scanner] 从缓存加载: {len(valid_songs)} 首歌曲")
         return True
 
@@ -239,6 +240,103 @@ class MusicScanner:
         with self._thread_lock:
             self._load_cache()
 
+    async def _build_song_metadata(self, filepath: Path, root: Path) -> dict:
+        """构建歌曲元数据字典（scan 和 scan_new 共用，确保路径解析逻辑一致）
+
+        支持的结构：
+            music/Artist/Album/song.mp3                           → artist=Artist, album=Album
+            music/Artist/Album/01-song.mp3                        → artist=Artist, album=Album
+            music/Artist/Album/Disc 1/01-song.mp3                 → artist=Artist, album=Album
+            music/Artist - Album/01 - song.mp3                    → artist=Artist, album=Album
+            music/song.mp3                                        → 仅标题
+            music/Album/song.mp3                                  → artist=未知, album=Album
+        """
+        relative = filepath.relative_to(root)
+        parts = relative.parts
+
+        filename = filepath.stem
+        title = _clean_title(filename)
+        # ffprobe 读取标签+时长（一次调用）
+        meta_tags = await _probe_file_async(filepath)
+        if meta_tags.get("title"):
+            title = meta_tags["title"]
+        artist = meta_tags.get("artist", "")
+        album = meta_tags.get("album", "")
+        duration = meta_tags.get("duration", 0)
+
+        # ===== 多层路径解析（仅当标签未提供 artist/album 时作为 fallback）=====
+        if len(parts) == 1:
+            # 根目录：music/song.mp3
+            pass
+
+        elif len(parts) >= 3:
+            # artist/album/song 或更深
+            # 跳过中间的额外子目录（如 Disc 1, CD1 等）
+            if not artist:
+                artist = parts[0]
+            if not album:
+                album = parts[1]
+
+            # 如果第3层看起来像独立目录（Disc 1, CD 1 等），跳过它
+            extra_dirs = {"disc", "cd", "disk", "volume", "vol", "part", "pt"}
+            for part in parts[2:-1]:
+                p_lower = part.lower()
+                if any(
+                    p_lower.startswith(d) and (len(p_lower) == len(d) or p_lower[len(d):].lstrip().isdigit())
+                    for d in extra_dirs
+                ):
+                    continue  # 跳过 Disc 1 / CD1 这类
+                # 其他中间目录作为专辑名补充
+                if album:
+                    album = f"{album} / {part}"
+                else:
+                    album = part
+
+        elif len(parts) == 2:
+            # music/Artist/song.mp3 或 music/Album/song.mp3
+            first_part = parts[0]
+            # 如果文件夹名带 " - " 分隔，可能是 artist - album
+            if " - " in first_part:
+                split_aa = first_part.split(" - ", 1)
+                if not artist:
+                    artist = split_aa[0].strip()
+                if not album:
+                    album = split_aa[1].strip()
+            else:
+                # 无法判断，统一作为 artist
+                if not artist:
+                    artist = first_part
+
+        # 歌词关联
+        lyrics_path = _find_lyrics(filepath)
+
+        # 构建歌手路径和专辑路径（用于封面查找）
+        artist_path = str(root / parts[0]) if len(parts) >= 2 and parts[0] else ""
+        album_path = ""
+        if len(parts) >= 3 and parts[0] and parts[1]:
+            album_path = str(root / parts[0] / parts[1])
+        elif len(parts) == 2 and " - " in parts[0]:
+            # artist - album 格式
+            album_path = str(root / parts[0])
+
+        try:
+            file_size = filepath.stat().st_size if filepath.exists() else 0
+        except (FileNotFoundError, PermissionError):
+            file_size = 0
+
+        return {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "duration": duration,
+            "format": filepath.suffix.removeprefix(".").upper(),
+            "filepath": str(filepath),
+            "lyrics_path": lyrics_path,
+            "size": file_size,
+            "artist_path": artist_path,
+            "album_path": album_path,
+        }
+
     async def scan(self) -> list[dict]:
         """扫描音乐目录，返回歌曲列表"""
         async with self._get_async_lock():
@@ -269,102 +367,7 @@ class MusicScanner:
 
             async def process_file(filepath):
                 async with sem:
-                    relative = filepath.relative_to(root)
-                    parts = relative.parts
-
-                    filename = filepath.stem
-                    title = _clean_title(filename)
-                    # 并发 ffprobe 读取标签+时长（一次调用）
-                    meta_tags = await _probe_file_async(filepath)
-                    if meta_tags.get("title"):
-                        title = meta_tags["title"]
-                    artist = meta_tags.get("artist", "")
-                    album = meta_tags.get("album", "")
-                    duration = meta_tags.get("duration", 0)
-
-                    # ===== 多层路径解析（仅当标签未提供 artist/album 时作为 fallback）=====
-                    # 支持的结构：
-                    #   music/Artist/Album/song.mp3                           → artist=Artist, album=Album, title=song
-                    #   music/Artist/Album/01-song.mp3                        → artist=Artist, album=Album, title=song
-                    #   music/Artist/Album/Disc 1/01-song.mp3                 → artist=Artist, album=Album, title=song
-                    #   music/Artist/Album/song.mp3 + song.lrc                → 关联歌词
-                    #   music/Artist - Album/01 - song.mp3                    → artist=Artist, album=Album, title=song
-                    #   music/song.mp3                                        → 仅标题
-                    #   music/Album/song.mp3                                  → artist=未知, album=Album
-
-                    if len(parts) == 1:
-                        # 根目录：music/song.mp3
-                        pass
-
-                    elif len(parts) >= 3:
-                        # artist/album/song 或更深
-                        # 跳过中间的额外子目录（如 Disc 1, CD1 等）
-                        if not artist:
-                            artist = parts[0]
-                        if not album:
-                            album = parts[1]
-
-                        # 如果第3层看起来像独立目录（Disc 1, CD 1 等），跳过它
-                        extra_dirs = {"disc", "cd", "disk", "volume", "vol", "part", "pt"}
-                        for part in parts[2:-1]:
-                            p_lower = part.lower()
-                            if any(
-                                p_lower.startswith(d) and (len(p_lower) == len(d) or p_lower[len(d):].lstrip().isdigit())
-                                for d in extra_dirs
-                            ):
-                                continue  # 跳过 Disc 1 / CD1 这类
-                            # 其他中间目录作为专辑名补充
-                            if album:
-                                album = f"{album} / {part}"
-                            else:
-                                album = part
-
-                    elif len(parts) == 2:
-                        # music/Artist/song.mp3 或 music/Album/song.mp3
-                        # 判断是歌手还是专辑（通常歌手的文件夹名不会像曲名）
-                        first_part = parts[0]
-                        # 如果文件夹名带 " - " 分隔，可能是 artist - album
-                        if " - " in first_part:
-                            split_aa = first_part.split(" - ", 1)
-                            if not artist:
-                                artist = split_aa[0].strip()
-                            if not album:
-                                album = split_aa[1].strip()
-                        else:
-                            # 无法判断，统一作为 artist
-                            if not artist:
-                                artist = first_part
-
-                    # 歌词关联
-                    lyrics_path = _find_lyrics(filepath)
-
-                    # 构建歌手路径和专辑路径（用于封面查找）
-                    artist_path = str(root / parts[0]) if len(parts) >= 2 and parts[0] else ""
-                    album_path = ""
-                    if len(parts) >= 3 and parts[0] and parts[1]:
-                        album_path = str(root / parts[0] / parts[1])
-                    elif len(parts) == 2 and " - " in parts[0]:
-                        # artist - album 格式
-                        split_aa = parts[0].split(" - ", 1)
-                        album_path = str(root / parts[0])
-
-                    try:
-                        file_size = filepath.stat().st_size if filepath.exists() else 0
-                    except (FileNotFoundError, PermissionError):
-                        file_size = 0
-
-                    return {
-                        "title": title,
-                        "artist": artist,
-                        "album": album,
-                        "duration": duration,
-                        "format": filepath.suffix.removeprefix(".").upper(),
-                        "filepath": str(filepath),
-                        "lyrics_path": lyrics_path,
-                        "size": file_size,
-                        "artist_path": artist_path,
-                        "album_path": album_path,
-                    }
+                    return await self._build_song_metadata(filepath, root)
 
             tasks = [process_file(fp) for fp in audio_files]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -412,40 +415,7 @@ class MusicScanner:
 
             async def _probe_one(p: Path) -> dict:
                 async with sem:
-                    relative = p.relative_to(root)
-                    parts = relative.parts
-                    filename = p.stem
-                    title = _clean_title(filename)
-                    meta_tags = await _probe_file_async(p)
-                    if meta_tags.get("title"):
-                        title = meta_tags["title"]
-                    artist = meta_tags.get("artist", "")
-                    album = meta_tags.get("album", "")
-                    duration = meta_tags.get("duration", 0)
-                    if len(parts) >= 3:
-                        if not artist: artist = parts[0]
-                        if not album: album = parts[1]
-                    elif len(parts) == 2:
-                        if " - " in parts[0]:
-                            aa = parts[0].split(" - ", 1)
-                            if not artist: artist = aa[0].strip()
-                            if not album: album = aa[1].strip()
-                        else:
-                            if not artist: artist = parts[0]
-                    lyrics_path = _find_lyrics(p)
-                    artist_path = str(root / parts[0]) if len(parts) >= 2 else ""
-                    album_path = str(root / parts[0] / parts[1]) if len(parts) >= 3 else ""
-                    try:
-                        size = p.stat().st_size if p.exists() else 0
-                    except (FileNotFoundError, PermissionError):
-                        size = 0
-                    return {
-                        "title": title, "artist": artist, "album": album,
-                        "duration": duration, "format": p.suffix.removeprefix(".").upper(),
-                        "filepath": str(p), "lyrics_path": lyrics_path,
-                        "size": size,
-                        "artist_path": artist_path, "album_path": album_path,
-                    }
+                    return await self._build_song_metadata(p, root)
 
             tasks = [_probe_one(p) for p in valid_files]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -458,6 +428,7 @@ class MusicScanner:
                 with self._thread_lock:
                     self._songs.extend(new_songs)
                     self._songs.sort(key=lambda s: (s["artist"].lower(), s["album"].lower(), s["title"].lower()))
+                    self._scan_time = time.time()  # 增量扫描也更新扫描时间
                 self._save_cache()
             return len(new_songs)
 
@@ -479,7 +450,7 @@ class MusicScanner:
                 return removed
             return None
 
-    def iter_songs(self) -> list:
+    def iter_songs(self) -> list[dict]:
         """返回 songs 的快照副本，供外部安全迭代"""
         with self._thread_lock:
             # M1: 深拷贝每首歌，避免外部修改污染内部缓存

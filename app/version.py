@@ -7,6 +7,39 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.85 - P2/P3深度审阅修复voice/config/scanner模块(配置缺失/防抖/缓存路径/路径解析一致性):
+           问题1(config.py create_alarm在DEFAULT_CONFIG中缺失): voice.py定义了create_alarm
+                 指令(关键词"设置闹钟"等), 但config.py的DEFAULT_CONFIG["voice_commands"]
+                 只含14条不含create_alarm; 从配置文件加载时该指令缺失, 用户说"设置闹钟"无法匹配;
+           修复1: DEFAULT_CONFIG["voice_commands"]添加create_alarm条目;
+           问题2(config.py update()无防抖): set()用_schedule_save(500ms防抖合并),
+                 update()直接_save()同步写入, 高频调用时每次写文件, I/O压力;
+           修复2: update()改为_schedule_save(), 与set()行为一致;
+           问题3(config.py _save临时文件名不唯一): path.with_suffix(".tmp")固定为config.tmp,
+                 多实例并发_save时tmp文件互相覆盖(虽os.replace原子, 但写入过程可能读到不完整tmp);
+           修复3: 改为pid+毫秒时间戳唯一临时文件名, 参照scanner.py模式;
+           问题4(config.py全局_config_save_timer多实例冲突): _config_save_timer是模块级全局变量,
+                 多个ConfigManager实例共享同一timer, 一个实例的_schedule_save会取消另一个实例的待执行保存;
+           修复4: _save_timer和_save_lock改为实例变量(__init__中初始化),
+                 每个实例独立防抖, 互不影响;
+           问题5(scanner.py CACHE_FILE硬编码): CACHE_FILE="/data/songs_cache.json"不可配置,
+                 config.py和worker.py都用env var覆盖, scanner.py缺乏同样灵活性;
+           修复5: CACHE_FILE改为os.environ.get("SCANNER_CACHE_FILE", ...), 支持环境变量覆盖;
+           问题6(scanner.py scan_new不更新_scan_time): scan()设置_scan_time, scan_new()不设置;
+                 get_stats()返回的last_scan停留在上次全量扫描时间, 误导用户;
+           修复6: scan_new在锁内更新_scan_time=time.time(), 与scan()模式一致;
+           问题7(scanner.py scan_new路径解析与scan不一致): scan处理Disc/CD中间目录、
+                 parts[0]空值检查、" - "分隔的album_path, scan_new都不处理;
+                 同一文件全量扫描和增量扫描得到不同artist/album/封面路径;
+           修复7: 提取_build_song_metadata共享方法, scan和scan_new都调用它,
+                 消除路径解析逻辑重复和不一致;
+           问题8(scanner.py _load_cache误设_scan_time): _load_cache中self._scan_time=time.time(),
+                 但只是从缓存加载未执行扫描, last_scan显示为启动时间而非最后扫描时间;
+           修复8: 移除_load_cache中的_scan_time赋值, _scan_time只在scan()/scan_new()实际扫描后设置;
+           问题9(voice.py注释指令数量错误): 注释写"12条规则"但实际15条;
+           修复9: 注释从12改为15;
+           问题10(scanner.py iter_songs返回类型标注不精确): 标注为裸list, 应为list[dict];
+           修复10: 改为list[dict];
   0.0.84 - P2深度审阅修复download模块(同步写入/格式fallback/默认值/part清理):
            问题1(_download_file同步写入阻塞事件循环): f.write(chunk)是同步阻塞I/O,
                  httpx aiter_bytes()虽然异步yield chunk, 但每个chunk的write仍阻塞;
@@ -768,4 +801,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.84"
+__version__ = "0.0.85"

@@ -68,10 +68,10 @@ _COMMAND_PRIORITY: dict[str, int] = {
 }
 
 
-# ===== 默认语音指令（12 条规则）=====
+# ===== 默认语音指令（15 条规则）=====
 
 def _default_commands() -> list[VoiceCommand]:
-    """获取默认语音口令配置（12 条）
+    """获取默认语音口令配置（15 条）
 
     翻译自 Go 源码: plugins/songloft-plugin-xiaomi/config/manager.go GetDefaultVoiceCommands()
     """
@@ -183,7 +183,7 @@ class VoiceEngine:
         """初始化引擎
 
         Args:
-            commands: 自定义语音指令列表。若为 None，使用默认 12 条规则。
+            commands: 自定义语音指令列表。若为 None，使用默认 15 条规则。
         """
         self._commands: list[VoiceCommand] = list(
             commands if commands is not None else _default_commands()

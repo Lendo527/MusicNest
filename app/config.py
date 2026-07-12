@@ -5,6 +5,7 @@ import copy
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,6 +45,7 @@ DEFAULT_CONFIG = {
         {"type": "stop", "keywords": ["停止播放", "停止", "别播了", "关掉音乐", "关机"], "enabled": True},
         {"type": "download_current", "keywords": ["下载当前歌曲", "下载这首歌", "下载当前", "下载此歌"], "enabled": True},
         {"type": "download", "keywords": ["下载歌曲", "下载"], "enabled": True},
+        {"type": "create_alarm", "keywords": ["设置闹钟", "新建闹钟", "添加闹钟"], "enabled": True},
     ],
     "alarms": [],
     "playlists": [],  # [{"id", "name", "songs": [索引列表], "created_at"}]
@@ -60,9 +62,6 @@ DEFAULT_CONFIG = {
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/data/config.yaml")
 
-_config_save_timer: threading.Timer | None = None
-_config_save_lock = threading.Lock()
-
 
 class ConfigManager:
     """线程安全的配置管理器，自动持久化到 YAML 文件"""
@@ -70,6 +69,9 @@ class ConfigManager:
     def __init__(self, config_path: str = CONFIG_PATH):
         self._config_path = config_path
         self._lock = threading.Lock()
+        # 防抖保存的 timer 和 lock 改为实例变量，避免多实例共享同一 timer 导致互相取消
+        self._save_timer: threading.Timer | None = None
+        self._save_lock = threading.Lock()
         # C1: 深拷贝避免 DEFAULT_CONFIG 被永久污染
         self._data: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
         try:
@@ -118,7 +120,8 @@ class ConfigManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             data = copy.deepcopy(self._data)
-        tmp_path = path.with_suffix(".tmp")
+        # 使用 pid+时间戳的唯一临时文件名，避免多实例并发写入时冲突
+        tmp_path = path.parent / f"config.{os.getpid()}.{int(time.time() * 1000)}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False)
@@ -135,21 +138,19 @@ class ConfigManager:
 
     def _schedule_save(self) -> None:
         """防抖保存：延迟 500ms 合并多次写入，避免高频调用时频繁写文件"""
-        global _config_save_timer
-        with _config_save_lock:
-            if _config_save_timer is not None:
-                _config_save_timer.cancel()
-            _config_save_timer = threading.Timer(0.5, self._save)
-            _config_save_timer.daemon = True
-            _config_save_timer.start()
+        with self._save_lock:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+            self._save_timer = threading.Timer(0.5, self._save)
+            self._save_timer.daemon = True
+            self._save_timer.start()
 
     def flush_save(self) -> None:
         """立即刷新待保存的配置（用于进程退出前调用）"""
-        global _config_save_timer
-        with _config_save_lock:
-            if _config_save_timer is not None:
-                _config_save_timer.cancel()
-                _config_save_timer = None
+        with self._save_lock:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+                self._save_timer = None
         self._save()
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -172,7 +173,7 @@ class ConfigManager:
         with self._lock:
             for k, v in updates.items():
                 self._data[k] = copy.deepcopy(v)
-        self._save()
+        self._schedule_save()
 
     def get_all(self) -> dict[str, Any]:
         with self._lock:
