@@ -7,6 +7,32 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.80 - P2深度审阅修复main.py(锁/同步I/O/上限/竞态/防护):
+           问题1(play_state多处未加锁): api_player_mode/api_player_playlist/api_player_volume/
+                 _sleep_timer/_enrich_playlist_metadata修改play_state字段时未持_play_lock,
+                 与语音指令并发修改时产生竞态(部分更新状态被API读取);
+           修复1: 上述5处全部加async with _play_lock; _enrich_playlist_metadata锁内重新校验
+                 real_index < len(play_state.playlist)(playlist可能在await期间被其他协程修改);
+           问题2(_alarm_loop check-then-act竞态): playlist空检查+加载在锁外,
+                 与并发指令竞态可能加载两次或读到部分更新;
+           修复2: playlist加载+校验+播放全部移入_play_lock;
+           问题3(_fix_play_state_after_delete未加锁): 同步函数修改play_state无锁,
+                 且被async端点调用(3处),与其他play_state修改竞态;
+           修复3: 改为async def + async with _play_lock, 3处调用方加await;
+           问题4(同步文件I/O阻塞事件循环): _delete_song_by_filepath及artist/album删除端点
+                 的shutil.rmtree是同步阻塞操作,大目录删除会卡住事件循环;
+           修复4: shutil.rmtree全部用asyncio.to_thread包裹; _delete_song_by_filepath改async def;
+           问题5(API limit参数无上限): api_search_online/api_music_songs的limit参数
+                 无上限,恶意请求limit=999999可导致内存爆炸;
+           修复5: api_search_online limit=min(max(limit,1),50);
+                 api_music_songs limit=min(max(limit,1),1000);
+           问题6(_suppress_native finally超时太短): asyncio.wait timeout=0.1s,
+                 stop的UBus请求可能还没发出就被cancel,压制循环末尾的stop丢失;
+           修复6: timeout从0.1改为2.0,确保stop请求完整发出;
+           问题7(lifespan shutdown NameError): _download_task/_sync_task仅在启动成功时赋值,
+                 若启动中途异常(lifespan yield前),shutdown代码_download_task.cancel()抛NameError;
+           修复7: 在lifespan开头预声明_download_task/_sync_task=None,
+                 shutdown加if is not None防护;
   0.0.79 - P1修复auth.py cookie jar竞态:
            问题: exchange_token与扫码登录(get_qr_code/poll_qr_result)共享同一httpx client,
                  并发清空cookie jar(client.cookies=httpx.Cookies())时互相破坏;
@@ -665,4 +691,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.79"
+__version__ = "0.0.80"
