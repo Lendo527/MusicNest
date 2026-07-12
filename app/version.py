@@ -7,6 +7,18 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.77 - P1修复netease.py三个严重问题:
+           问题1(size类型崩溃): _build_quality_formats中l.get("size",0)>0假设size是数值,
+                 若网关返回字符串型size(如"12345"或"")会抛TypeError,
+                 导致search()/get_playlist_tracks()整体异常,单条坏数据让整批结果丢失;
+           修复1: 抽取_has_size()辅助函数,校验isinstance(size,(int,float))后再比较;
+           问题2(timeout失效): _netease_request和verify_cookie的client.post未传timeout参数,
+                 调用方传入的timeout仅在首次创建client时生效,已存在client时被丢弃;
+           修复2: client.post显式传timeout=timeout,与kuwo.py行为一致;
+           问题3(verify_cookie 300秒阻塞): 3端点×10网关=30次串行POST,每次最长10s超时,
+                 Cookie无效时调用方需等待~300秒,严重阻塞启动/校验;
+           修复3: 改为网关间并发(asyncio.wait+FIRST_COMPLETED),总超时15秒,
+                 任一网关成功即返回,最坏15秒而非300秒;
   0.0.76 - P0深度审阅修复(4个严重问题):
            问题1(client.py): _ubus_request在code!=0时仍返回dict,
                  所有调用方用`is not None`误判成功,导致播放失败被误认为成功;
@@ -629,4 +641,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.76"
+__version__ = "0.0.77"

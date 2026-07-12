@@ -81,7 +81,7 @@ async def _netease_request(
         # 加时间戳到 URL 防网关缓存（Post JSON body 不会影响缓存 key）
         url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(time.time() * 1000))
         try:
-            resp = await client.post(url, json=params, headers=headers)
+            resp = await client.post(url, json=params, headers=headers, timeout=timeout)
             resp.raise_for_status()
             data = resp.json()
             # 成功返回
@@ -113,24 +113,31 @@ def _build_quality_formats(song: dict) -> List[MusicFormat]:
     """
     formats = []
 
+    def _has_size(d) -> bool:
+        """安全检查 size 字段：必须是数值且大于0（兼容部分网关返回字符串型 size）"""
+        if not isinstance(d, dict):
+            return False
+        size = d.get("size", 0)
+        return isinstance(size, (int, float)) and size > 0
+
     l = song.get("l")
-    if isinstance(l, dict) and l.get("size", 0) > 0:
+    if _has_size(l):
         formats.append(MusicFormat(name="128K", bitrate=128, type="mp3"))
 
     m = song.get("m")
-    if isinstance(m, dict) and m.get("size", 0) > 0:
+    if _has_size(m):
         formats.append(MusicFormat(name="192K", bitrate=192, type="mp3"))
 
     h = song.get("h")
-    if isinstance(h, dict) and h.get("size", 0) > 0:
+    if _has_size(h):
         formats.append(MusicFormat(name="320K", bitrate=320, type="mp3"))
 
     sq = song.get("sq")
-    if isinstance(sq, dict) and sq.get("size", 0) > 0:
+    if _has_size(sq):
         formats.append(MusicFormat(name="FLAC", bitrate=2000, type="flac"))
 
     hr = song.get("hr")
-    if isinstance(hr, dict) and hr.get("size", 0) > 0:
+    if _has_size(hr):
         formats.append(MusicFormat(name="Hi-Res FLAC", bitrate=3000, type="flac"))
 
     # 全空时返回空列表，不强行兜底 128K（避免掩盖真实问题）
@@ -593,34 +600,46 @@ async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
         ("/user/detail", "profile"),
     ]
 
-    # 阶段 1：逐端点 + 逐网关验证
+    # 阶段 1：逐端点验证，网关间并发（任一成功即返回），总超时15秒
     client = await _get_client(timeout=timeout)
+
+    async def _try_verify(base_url: str, endpoint: str, key_path: str) -> bool:
+        """单个端点+网关的验证"""
+        params = {"uid": 1} if endpoint == "/user/detail" else {}
+        try:
+            url = f"{base_url}{endpoint}"
+            headers = {"Content-Type": "application/json; charset=utf-8", "Cookie": cookie}
+            resp = await client.post(url, json=params, headers=headers, timeout=timeout)
+            data = resp.json()
+            if data.get("code") == 200:
+                account = data.get("account") or data.get("data", {}).get("account")
+                profile = data.get("profile") or data.get("data", {}).get("profile")
+                if account or profile:
+                    nickname = (profile or {}).get("nickname") or (account or {}).get("userName", "未知")
+                    logger.info("[Netease] Cookie 有效 (via %s %s), 用户: %s",
+                                base_url, endpoint, nickname)
+                    return True
+                logger.debug("[Netease] %s %s 返回 200 但无 account/profile: keys=%s",
+                             base_url, endpoint, list(data.keys()))
+            else:
+                logger.debug("[Netease] %s %s 返回 code=%s",
+                             base_url, endpoint, data.get("code"))
+        except Exception as e:
+            logger.debug("[Netease] %s %s 失败: %s", base_url, endpoint, e)
+        return False
+
     for endpoint, key_path in verify_endpoints:
-        for base_url in NETEASE_API_BASE_URLS:
-            # 搜索需要传 params，其他端点不需要
-            params = {"uid": 1} if endpoint == "/user/detail" else {}
-            try:
-                url = f"{base_url}{endpoint}"
-                headers = {"Content-Type": "application/json; charset=utf-8", "Cookie": cookie}
-                resp = await client.post(url, json=params, headers=headers)
-                data = resp.json()
-                if data.get("code") == 200:
-                    # 检查关键字段
-                    account = data.get("account") or data.get("data", {}).get("account")
-                    profile = data.get("profile") or data.get("data", {}).get("profile")
-                    if account or profile:
-                        nickname = (profile or {}).get("nickname") or (account or {}).get("userName", "未知")
-                        logger.info("[Netease] Cookie 有效 (via %s %s), 用户: %s",
-                                    base_url, endpoint, nickname)
-                        return True
-                    # 有结果但字段名不同，打印提示
-                    logger.debug("[Netease] %s %s 返回 200 但无 account/profile: keys=%s",
-                                 base_url, endpoint, list(data.keys()))
-                else:
-                    logger.debug("[Netease] %s %s 返回 code=%s",
-                                 base_url, endpoint, data.get("code"))
-            except Exception as e:
-                logger.debug("[Netease] %s %s 失败: %s", base_url, endpoint, e)
+        # 对同一端点的所有网关并发尝试，任一成功即返回
+        tasks = [_try_verify(base_url, endpoint, key_path) for base_url in NETEASE_API_BASE_URLS]
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=15.0, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            for t in done:
+                if t.result():
+                    return True
+        except Exception:
+            pass
 
     # 只保留阶段 1（/user/account 等端点验证）；
     # 搜索/下载验证已删除：部分网关搜索不校验 cookie，会误判无效 Cookie 为有效
