@@ -27,6 +27,32 @@ from app.search.netease import get_download_url as netease_download_url
 logger = logging.getLogger("musicnest.download")
 
 
+def _cleanup_orphaned_part_files(music_path: str) -> int:
+    """启动时清理残留的 .part 文件（崩溃/中断的下载残留）
+
+    .part 文件只在下载成功后原子重命名为目标文件，崩溃/SIGKILL/容器重启
+    会留下永久残留的 .part 文件占用磁盘。本函数在 worker 启动时扫描清理。
+
+    Returns:
+        清理的文件数量
+    """
+    count = 0
+    try:
+        for root, _dirs, files in os.walk(music_path):
+            for name in files:
+                if name.endswith(".part"):
+                    try:
+                        os.remove(os.path.join(root, name))
+                        count += 1
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"[Download] 清理 .part 文件异常: {e}")
+    if count > 0:
+        logger.info(f"[Download] 启动时清理 {count} 个残留 .part 文件")
+    return count
+
+
 async def _record_sync_if_needed(task_id: str) -> None:
     """歌单同步任务下载成功后记录同步，避免失败歌曲被永久跳过
 
@@ -138,15 +164,25 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                 total = int(resp.headers.get("content-length", 0))
                 downloaded = 0
                 last_log_pct = -1
+                # 批量缓冲写入：累积到 256KB 后通过 asyncio.to_thread 写入，
+                # 避免每个 chunk 同步 write 阻塞事件循环（FLAC 30MB×470次 write 累积阻塞明显）
+                write_buffer = bytearray()
+                _WRITE_FLUSH = 256 * 1024
                 with open(dest_part, "wb") as f:
                     async for chunk in resp.aiter_bytes():
-                        f.write(chunk)
+                        write_buffer.extend(chunk)
                         downloaded += len(chunk)
+                        if len(write_buffer) >= _WRITE_FLUSH:
+                            await asyncio.to_thread(f.write, bytes(write_buffer))
+                            write_buffer.clear()
                         if total > 0:
                             pct = int(downloaded * 100 / total)
                             if pct >= last_log_pct + 10:
                                 logger.info("[Download] 下载进度: %s - %d%% (%d/%d KB)", task_id[:8] if task_id else "?", pct, downloaded // 1024, total // 1024)
                                 last_log_pct = pct
+                    # 写入剩余缓冲
+                    if write_buffer:
+                        await asyncio.to_thread(f.write, bytes(write_buffer))
                 # 下载完成，原子重命名到目标路径
                 os.replace(dest_part, dest)
                 return True
@@ -354,11 +390,13 @@ async def _process_task(task) -> bool:
                 if fmt.type == format_type and fmt.url:
                     download_url = fmt.url
                     break
-            # fallback: 任意可用格式
+            # fallback: 任意可用格式（同时更新 format_type 以匹配实际下载的格式，确保扩展名正确）
             if not download_url:
                 for fmt in fmt_list:
                     if fmt.url:
                         download_url = fmt.url
+                        format_type = fmt.type
+                        logger.info(f"[Download] {task_id} 指定格式不可用，降级到 {fmt.type} ({fmt.name})")
                         break
 
         elif source == "netease":
@@ -382,8 +420,12 @@ async def _process_task(task) -> bool:
             br_map = {"flac": 999000, "mp3": 320000}
             br = br_map.get(format_type, 320000)
             download_url = await netease_download_url(music_id, br=br, cookie=netease_cookie)
-            if not download_url:
+            if not download_url and format_type != "mp3":
+                # FLAC 不可用时降级到 MP3 320k，同步更新 format_type 确保扩展名正确
                 download_url = await netease_download_url(music_id, br=320000, cookie=netease_cookie)
+                if download_url:
+                    format_type = "mp3"
+                    logger.info(f"[Download] {task_id} FLAC 不可用，降级到 mp3 320k")
 
         if not download_url:
             await update_task_status(task_id, "error", "无法获取下载链接")
@@ -487,6 +529,11 @@ async def download_worker(poll_interval: float = 5.0):
 
     # 启动时重置上次崩溃残留的 loading 任务，避免卡死（阈值 60 分钟，避免误杀大文件任务）
     await reset_stale_loading_tasks(timeout_minutes=60)
+
+    # 清理上次崩溃/中断残留的 .part 文件（os.walk 是同步阻塞，用 to_thread 包裹）
+    from app.config import config
+    _music_path = config.get("music_path", "/music")
+    await asyncio.to_thread(_cleanup_orphaned_part_files, _music_path)
 
     # 并发限制：由 semaphore 真正限流，DB 查询 limit 放大以充分填充并发槽
     sem = asyncio.Semaphore(MAX_CONCURRENT)

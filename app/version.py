@@ -7,6 +7,30 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.84 - P2深度审阅修复download模块(同步写入/格式fallback/默认值/part清理):
+           问题1(_download_file同步写入阻塞事件循环): f.write(chunk)是同步阻塞I/O,
+                 httpx aiter_bytes()虽然异步yield chunk, 但每个chunk的write仍阻塞;
+                 FLAC 30MB文件约470次write, 慢盘/网络文件系统下每次write可能10-100ms,
+                 累积阻塞可达数秒, 期间事件循环完全停滞(其他协程无法执行);
+           修复1: 引入256KB write_buffer, 累积到阈值后通过asyncio.to_thread批量写入,
+                 减少线程调度次数(470次→~120次)的同时不阻塞事件循环;
+                 剩余缓冲在循环结束后flush;
+           问题2(格式fallback不更新format_type导致扩展名不匹配):
+                 kuwo fallback选了fmt.url但format_type保持原值(如flac),
+                 netease FLAC不可用时降级请求mp3但format_type仍为flac;
+                 下游ext = format_type if format_type in ("flac","mp3","wav") else "mp3"
+                 导致mp3内容保存为.flac扩展名, 播放器/扫描器误判格式;
+           修复2: kuwo/netease两处fallback路径在选定实际URL后同步更新format_type=fmt.type/mp3,
+                 确保文件扩展名与实际音频内容一致;
+           问题3(无.part文件启动清理): worker启动只调reset_stale_loading_tasks重置DB状态,
+                 不清理文件系统残留的.part文件; 容器SIGKILL/崩溃/重启时.part文件永久残留,
+                 长期累积占用磁盘空间;
+           修复3: 新增_cleanup_orphaned_part_files函数, os.walk扫描music_path下所有.part文件并删除,
+                 在download_worker启动时通过asyncio.to_thread调用(os.walk同步阻塞);
+           问题4(tracker get_waiting_tasks默认limit=2): get_tasks默认limit=50,
+                 get_waiting_tasks默认limit=2, 25倍不一致; worker虽显式传limit=10,
+                 但默认值过小会误导其他调用方, 且与worker.py注释"DB查询limit放大"矛盾;
+           修复4: get_waiting_tasks默认limit从2改为10, 与worker显式调用一致;
   0.0.83 - P2深度审阅修复search模块(None返回/并发限制/并行化):
            问题1(kuwo _python_to_json返回None): 超长文本时return None,
                  但函数签名是->str, 调用方json.loads(None)抛TypeError(非JSONDecodeError),
@@ -744,4 +768,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.83"
+__version__ = "0.0.84"

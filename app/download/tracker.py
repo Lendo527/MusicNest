@@ -203,7 +203,7 @@ def add_task(
 
 
 @_async_wrap
-def get_waiting_tasks(limit: int = 2) -> List[DownloadTask]:
+def get_waiting_tasks(limit: int = 10) -> List[DownloadTask]:
     """获取等待中的下载任务"""
     # 读操作：WAL 模式下读不阻塞写，无需持锁
     conn = _get_conn()
