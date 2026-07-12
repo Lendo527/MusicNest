@@ -264,14 +264,11 @@ def update_task_format(task_id: str, format_type: str):
     now = time.time()
     with _lock:
         conn = _get_conn()
-        try:
-            conn.execute(
-                "UPDATE download_queue SET format_type=?, updated_at=? WHERE task_id=?",
-                (format_type, now, task_id),
-            )
-            conn.commit()
-        finally:
-            pass
+        conn.execute(
+            "UPDATE download_queue SET format_type=?, updated_at=? WHERE task_id=?",
+            (format_type, now, task_id),
+        )
+        conn.commit()
 
 
 @_async_wrap

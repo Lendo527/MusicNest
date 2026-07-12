@@ -92,18 +92,19 @@ async def aggregate_search_by_keyword(keyword: str, timeout: float = 10.0) -> di
         })
         logger.debug(f"[Aggregate] 酷我候选: {data.get('title')} score={score}")
 
-    # 网易云结果（需获取 URL）
+    # 网易云结果（需获取 URL）— 并发获取前 3 个候选的 URL，避免串行 3×10s=30s
     if netease_result:
-        for r in netease_result[:3]:  # 只取前 3 个结果尝试获取 URL
-            score = _match_score(r.title, r.artist, keyword)
-            # 尝试获取播放 URL
+        netease_cookie = _get_netease_cookie()
+
+        async def _fetch_netease_url(r):
+            """并发获取单个网易云歌曲的播放 URL"""
             try:
-                netease_cookie = _get_netease_cookie()
                 pure_id = r.id.replace("netease_", "")
                 url = await netease_download_url(pure_id, br=320000, cookie=netease_cookie, timeout=timeout)
                 if url:
-                    score += 20  # 有 URL 加分
-                    candidates.append({
+                    score = _match_score(r.title, r.artist, keyword) + 20  # 有 URL 加分
+                    logger.debug(f"[Aggregate] 网易云候选: {r.title} score={score}")
+                    return {
                         "score": score,
                         "data": {
                             "title": r.title,
@@ -118,10 +119,16 @@ async def aggregate_search_by_keyword(keyword: str, timeout: float = 10.0) -> di
                             },
                         },
                         "source": "netease",
-                    })
-                    logger.debug(f"[Aggregate] 网易云候选: {r.title} score={score}")
+                    }
             except Exception as e:
                 logger.debug(f"[Aggregate] 网易云获取URL失败: {r.title} err={e}")
+            return None
+
+        url_tasks = [_fetch_netease_url(r) for r in netease_result[:3]]
+        url_results = await asyncio.gather(*url_tasks)
+        for result in url_results:
+            if result:
+                candidates.append(result)
 
     if not candidates:
         logger.info(f"[Aggregate] 聚合搜索无结果: {keyword}")

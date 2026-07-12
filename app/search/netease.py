@@ -652,7 +652,7 @@ async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
         ("/user/detail", "profile"),
     ]
 
-    # 阶段 1：逐端点验证，网关间并发（任一成功即返回），总超时15秒
+    # 阶段 1：逐端点验证，网关间并发（任一成功即返回），每端点超时15秒
     client = await _get_client(timeout=timeout)
     req_timeout = httpx.Timeout(timeout)
 

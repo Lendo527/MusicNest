@@ -59,14 +59,15 @@ class PluginManager:
             plugin_name: 插件文件名（不含 .py）
 
         Returns:
-            True 加载成功，False 失败
+            True 至少加载一个 provider，False 失败
         """
         try:
             # 动态导入插件模块
             module_path = f"app.search.plugins.{plugin_name}"
             module = importlib.import_module(module_path)
 
-            # 查找模块中所有 SearchProvider 子类
+            # 查找模块中所有 SearchProvider 子类（一个插件可定义多个 Provider）
+            loaded_any = False
             for attr_name in dir(module):
                 attr = getattr(module, attr_name)
                 if (isinstance(attr, type)
@@ -77,13 +78,14 @@ class PluginManager:
                         provider = attr()
                         self._providers[provider.name] = provider
                         logger.info(f"[Plugins] 加载插件成功: {plugin_name} -> {provider.name}")
-                        return True
+                        loaded_any = True
                     except Exception as e:
                         logger.warning(f"[Plugins] 插件实例化失败: {plugin_name} err={e}")
-                        return False
 
-            logger.warning(f"[Plugins] 插件 {plugin_name} 未找到 SearchProvider 子类")
-            return False
+            if not loaded_any:
+                logger.warning(f"[Plugins] 插件 {plugin_name} 未找到可用的 SearchProvider 子类")
+                return False
+            return True
         except Exception as e:
             logger.warning(f"[Plugins] 加载插件失败: {plugin_name} err={e}")
             return False
@@ -138,7 +140,8 @@ async def search_with_plugins(keyword: str, limit: int = 10, timeout: float = 10
     """
     import asyncio
 
-    if not plugin_manager._providers:
+    providers = plugin_manager.get_all_providers()
+    if not providers:
         return []
 
     async def _safe_search(provider: SearchProvider) -> list[SearchResult]:
@@ -157,7 +160,7 @@ async def search_with_plugins(keyword: str, limit: int = 10, timeout: float = 10
             logger.warning(f"[Plugins] {provider.name} 搜索失败: {e}")
             return []
 
-    tasks = [_safe_search(p) for p in plugin_manager._providers.values()]
+    tasks = [_safe_search(p) for p in providers.values()]
     results = await asyncio.gather(*tasks)
 
     # 合并所有结果

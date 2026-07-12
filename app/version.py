@@ -7,6 +7,74 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.88 - v0.0.87新增/修改文件深度审阅修复+三轮深度复审(P0/P1定时器/seek+P2惰性校验/并发/正则/锁+P3清理):
+           问题1(main.py P1 F5智能定时器暂停误触发): _sleep_timer_smart 中
+                 if not current or not play_state.is_playing: break 会在用户暂停时
+                 误判为播放结束，立即执行stop_all_media强制停止;
+           修复1: 区分暂停和停止 — 暂停时 _play_start_time 保留(>0)，停止时被清零(==0)，
+                 改为 if not current or (not is_playing and _play_start_time==0): break;
+           问题2(main.py P1 F5智能定时器finally竞态): 定时器A触发停止执行try块期间
+                 用户启动定时器B(设置新全局变量)，A的finally清空B的状态;
+           修复2: finally中检查 _sleep_timer_task is my_task(当前task)，
+                 只在仍是活跃task时才清理，避免清清新task的状态;
+           问题3(main.py P1 F5智能定时器task检测错误): if _sleep_timer_task is None: return
+                 当新task替换旧task时 _sleep_timer_task 非None(指向新task)，旧task继续运行;
+           修复3: 改为 if _sleep_timer_task is not my_task: return，用current_task比较;
+           问题4(main.py P1 F14 seek方向反义词): 快进组正则含"向后"(应后退)，
+                 后退组正则含"向前"(应快进)，方向完全反了;
+           修复4: 快进组改为(快进|前进|向前)，后退组改为(后退|倒退|回退|向后);
+           问题5(main.py P0 F14 seek方法不存在): 代码调用 miot_client.player_seek()
+                 但 client.py 中方法名是 seek()，player_seek 不存在，F14 seek功能完全不可用;
+           修复5: player_seek 改为 seek，同时 _ubus_request 改为公开的 get_player_status;
+           问题6(scanner.py P2 B13死代码): _cache_validated 三处赋值但从未读取，
+                 惰性校验逻辑未实现，缓存中已删除文件的歌曲会一直存在到下次全量scan;
+           修复6: 实现_ensure_validated()方法，首次读取时触发后台scan异步校验，
+                 在iter_songs/get_songs/get_index_by_filepath/search中调用;
+           问题7(aggregate.py P2 网易云URL串行获取): for r in netease_result[:3] 串行
+                 获取URL，每次最长10s，最坏3×10s=30s，而酷我通常1-2s返回;
+           修复7: 改为asyncio.gather并发获取3个候选URL;
+           问题8(main.py P2 F14播放XX的歌正则过宽): 播放(.+?)的(?:歌|歌曲|音乐|曲子)
+                 会匹配"播放我的歌""播放你的歌""播放一些歌"等常见短语;
+           修复8: 添加 _ARTIST_BLACKLIST 排除代词/形容词 + len>=2 最小长度检查;
+           问题9(main.py P2 F14歌手播放锁外修改): is_playing 和 _play_start_time
+                 在 _play_lock 外修改，与 B9 修复的 api_player_next/prev 同类竞态;
+           修复9: is_playing 和 _play_start_time 移入 async with _play_lock;
+           问题10(main.py P2 O1压制效果退化): _smart_stop 在 status=0 时不发 stop，
+                 小爱版可能从0→1过渡期短暂出声，用户明确要求"不接受任何出声风险";
+           修复10: 回退为无条件 stop(放弃O1优化)，恢复每0.3s无条件发 light_stop;
+           问题11(main.py P3 F14 seek调用私有方法): miot_client._ubus_request 是私有方法;
+           修复11: 改用公开的 get_player_status(已合并到问题5修复);
+           问题12(main.py P3 _app_start_time声明在使用点之后): 代码组织混乱;
+           修复12: 声明移到 api_stats_dashboard 函数定义之前;
+           问题13(plugin_manager.py P3 访问私有_providers): search_with_plugins
+                 直接访问 plugin_manager._providers;
+           修复13: 改用 get_all_providers() 公开方法;
+           问题14(plugin_manager.py P3 load_plugin只加载第一个Provider): return True
+                 立即退出循环，一个插件模块定义多个SearchProvider子类时后续被忽略;
+           修复14: 改为 loaded_any 标志收集所有Provider，循环结束后返回;
+           问题15(tracker.py P3 死finally:pass): update_task_format 中 try/finally:pass
+                 无任何操作;
+           修复15: 删除无用的 try/finally 包装;
+           问题16(netease.py P3 verify_cookie注释错误): 注释"总超时15秒"实际是每端点15s，
+                 3个端点最坏45s;
+           修复16: 注释改为"每端点超时15秒";
+           问题17(main.py P0 F14 seek进度解析错误-第二轮审阅发现): 代码用
+                 data.get("playPos",0) 获取当前进度，但 playPos 不在 data 层级，
+                 实际嵌套在 data.info JSON 字符串的 play_song_detail.position 中(毫秒)，
+                 data.get("playPos",0) 恒返回0，seek 总是从开头跳转 seconds 秒;
+           修复17: 改用 _parse_player_info(progress_resp) 解析 UBus 响应中的嵌套 JSON，
+                 正确取 position(ms→s转换) 后加 seconds;
+           问题18(main.py P1 F5智能定时器_sleep_timer_remaining未清理-第三轮审阅发现):
+                 智能定时器finally块未清零 _sleep_timer_remaining，语音指令启动智能定时器时
+                 也不重置该值，前端轮询可能读到上一次 duration 模式的残留值;
+           修复18: 智能定时器finally块添加 _sleep_timer_remaining=0，
+                 语音指令启动智能定时器(end_of_song/end_of_album)和取消定时器时也置0;
+           问题19(main.py P2 _ARTIST_BLACKLIST不完整-第二轮审阅发现): 初始黑名单
+                 缺少"这首""那首""这些""那些"等常见短语，仍可能误匹配;
+           修复19: 扩展黑名单，补充"这首""那首""这些""那些""哪些""大家""全部""所有""各种";
+           问题20(main.py P3 冗余global声明-第三轮审阅发现): F5智能定时器语音指令路径
+                 同一函数作用域内有两处相同的 global 声明;
+           修复20: 删除冗余的 global 声明，保留函数开头的一处;
   0.0.86 - 全代码库审阅修复(P0崩溃+P1竞态/死代码+P2重复代码/并行化+P3清理):
            问题1(auth.py P0崩溃): _cookie_lock = asyncio.Lock() 使用了 asyncio，
                  但文件未 import asyncio，main.py 模块级实例化 MiAuth() 时必抛 NameError，
@@ -892,4 +960,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
 # F14: 语音指令自然语言增强 — "这是什么歌"(播报当前歌曲)、"快进30秒"/"后退10秒"(seek)、
 #   "回到开头"(重播)、"播放XX的歌"(按歌手搜索本地库播放)。
 
-__version__ = "0.0.87"
+__version__ = "0.0.88"

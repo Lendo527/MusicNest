@@ -364,7 +364,7 @@ async def _sleep_timer_smart(mode: str):
         mode: "end_of_song" — 当前歌曲结束后停止
               "end_of_album" — 当前专辑所有歌曲结束后停止
     """
-    global _sleep_timer_target_album, _sleep_timer_start_song
+    global _sleep_timer_target_album, _sleep_timer_start_song, _sleep_timer_task, _sleep_timer_mode, _sleep_timer_remaining
     # 记录启动时的歌曲和专辑
     current_song = play_state.current_song()
     if not current_song:
@@ -378,15 +378,18 @@ async def _sleep_timer_smart(mode: str):
 
     # 轮询监听播放状态变化
     last_song_title = _sleep_timer_start_song
+    my_task = asyncio.current_task()
     while True:
         await asyncio.sleep(2.0)
-        # 检查是否被取消
-        if _sleep_timer_task is None:
+        # 检查是否被取消或被新 task 替换（避免旧 task 醒来后误操作）
+        if _sleep_timer_task is not my_task:
             return
         try:
             current = play_state.current_song()
-            # 播放停止（无当前歌曲或 is_playing=False）
-            if not current or not play_state.is_playing:
+            # 只在真正停止时才触发：
+            # - current 为 None 表示歌单播完
+            # - _play_start_time==0 且 is_playing=False 表示被 stop_playing 清零（暂停时 _play_start_time 保留）
+            if not current or (not play_state.is_playing and play_state._play_start_time == 0):
                 logger.info(f"[Timer] 智能定时器: 播放已停止")
                 break
             current_title = current.get("title", "")
@@ -422,9 +425,13 @@ async def _sleep_timer_smart(mode: str):
     except Exception as e:
         logger.error(f"[Timer] 智能定时器停止失败: {e}", exc_info=True)
     finally:
-        _sleep_timer_mode = ""
-        _sleep_timer_target_album = ""
-        _sleep_timer_start_song = ""
+        # 只在当前 task 仍是活跃 task 时才清理，避免清清新启动 task 的状态
+        if _sleep_timer_task is my_task:
+            _sleep_timer_task = None
+            _sleep_timer_mode = ""
+            _sleep_timer_target_album = ""
+            _sleep_timer_start_song = ""
+            _sleep_timer_remaining = 0
 
 
 # ===== 闹钟 =====
@@ -470,8 +477,8 @@ async def _suppress_native(device_id: str):
     每0.3秒 fire-and-forget 一次轻量 stop。调用方在 with 块内完成搜索和处理，
     退出 with 块后再发送 play_music_url（此时所有 stop 已完成，不会取消 play）。
 
-    O1 优化：先检查设备播放状态，只在 status=1（正在播放）时才发 stop。
-    设备 IDLE 时跳过 stop 请求，减少 UBus 请求量（搜索 5s 从 ~16 次降到 0-3 次）。
+    注意：无条件发 stop（不查状态），因为 status=0→1 的过渡期不发 stop 会导致
+    小爱版短暂出声。用户明确要求"不接受任何出声风险"，因此放弃 O1 的智能压制优化。
 
     用法:
         async with _suppress_native(device_id):
@@ -499,28 +506,12 @@ async def _suppress_native(device_id: str):
         except Exception:
             pass  # fire-and-forget，忽略超时和错误
 
-    # O1: 智能压制 — 先查状态，只在 status=1（正在播放）时才发 stop
-    async def _smart_stop():
-        try:
-            status = await client.get_player_status(device_id)
-            # player_get_play_status 返回的 data 中 status=1 表示正在播放
-            if status and isinstance(status, dict):
-                data = status.get("data", {})
-                if isinstance(data, dict) and data.get("status") == 1:
-                    await _light_stop()
-                    return True
-            return False
-        except Exception:
-            # 查状态失败时降级为直接发 stop（保守策略）
-            await _light_stop()
-            return True
-
     # 收集所有 stop 任务，确保 finally 中全部 await 完成，避免孤儿任务在 play 之后到达
-    all_stop_tasks: list = [asyncio.create_task(_smart_stop())]
+    all_stop_tasks: list = [asyncio.create_task(_light_stop())]
 
     async def _suppress_loop():
         while True:
-            all_stop_tasks.append(asyncio.create_task(_smart_stop()))
+            all_stop_tasks.append(asyncio.create_task(_light_stop()))
             await asyncio.sleep(0.3)
 
     suppress_task = asyncio.create_task(_suppress_loop())
@@ -880,10 +871,10 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
 
     # F5: 智能睡眠定时 — "播完这首就停" / "播完当前专辑就停"
     if re.search(r'播完.{0,4}(这首|这首歌|当前.{0,2}歌).{0,4}(停|停止|关闭|结束)', query):
-        global _sleep_timer_task, _sleep_timer_mode
         if _sleep_timer_task:
             await _safe_cancel(_sleep_timer_task)
         _sleep_timer_mode = "end_of_song"
+        _sleep_timer_remaining = 0
         _sleep_timer_task = asyncio.create_task(_sleep_timer_smart("end_of_song"))
         logger.info(f"[VoiceCmd] 智能定时: 播完当前歌曲后停止")
         return
@@ -892,6 +883,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         if _sleep_timer_task:
             await _safe_cancel(_sleep_timer_task)
         _sleep_timer_mode = "end_of_album"
+        _sleep_timer_remaining = 0
         _sleep_timer_task = asyncio.create_task(_sleep_timer_smart("end_of_album"))
         logger.info(f"[VoiceCmd] 智能定时: 播完当前专辑后停止")
         return
@@ -959,39 +951,36 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
             return
 
     # "快进30秒" / "后退10秒" / "回到开头" — seek 控制
-    seek_match = re.search(r'(快进|前进|向后)(\d+)(秒|s)', query)
+    # 注意：向前=快进（时间增大），向后=后退（时间减小）
+    seek_match = re.search(r'(快进|前进|向前)(\d+)(秒|s)', query)
     if seek_match:
         seconds = int(seek_match.group(2))
         if miot_client and play_state.device_id:
             try:
-                # 获取当前进度
-                progress_resp = await miot_client._ubus_request(
-                    play_state.device_id, "player_get_play_status", "mediaplayer", {}
-                )
-                if progress_resp and progress_resp.get("code") == 0:
-                    data = progress_resp.get("data", {})
-                    pos = data.get("playPos", 0) + seconds
-                    await miot_client.player_seek(play_state.device_id, int(pos))
-                    logger.info(f"[VoiceCmd] 快进 {seconds}s -> pos={int(pos)}")
+                # 获取当前进度（用 _parse_player_info 解析 UBus 响应中的 info JSON）
+                progress_resp = await miot_client.get_player_status(play_state.device_id)
+                if progress_resp:
+                    info = _parse_player_info(progress_resp)
+                    pos = info["position"] + seconds
+                    await miot_client.seek(play_state.device_id, int(pos))
+                    logger.info(f"[VoiceCmd] 快进 {seconds}s -> pos={int(pos)}s")
             except Exception as e:
                 logger.warning(f"[VoiceCmd] 快进失败: {e}")
         if monitor:
             monitor.mark_query_handled(device_id, query)
         return
 
-    back_match = re.search(r'(后退|倒退|回退|向前)(\d+)(秒|s)', query)
+    back_match = re.search(r'(后退|倒退|回退|向后)(\d+)(秒|s)', query)
     if back_match:
         seconds = int(back_match.group(2))
         if miot_client and play_state.device_id:
             try:
-                progress_resp = await miot_client._ubus_request(
-                    play_state.device_id, "player_get_play_status", "mediaplayer", {}
-                )
-                if progress_resp and progress_resp.get("code") == 0:
-                    data = progress_resp.get("data", {})
-                    pos = max(0, data.get("playPos", 0) - seconds)
-                    await miot_client.player_seek(play_state.device_id, int(pos))
-                    logger.info(f"[VoiceCmd] 后退 {seconds}s -> pos={int(pos)}")
+                progress_resp = await miot_client.get_player_status(play_state.device_id)
+                if progress_resp:
+                    info = _parse_player_info(progress_resp)
+                    pos = max(0, info["position"] - seconds)
+                    await miot_client.seek(play_state.device_id, int(pos))
+                    logger.info(f"[VoiceCmd] 后退 {seconds}s -> pos={int(pos)}s")
             except Exception as e:
                 logger.warning(f"[VoiceCmd] 后退失败: {e}")
         if monitor:
@@ -1001,7 +990,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
     if re.search(r'回到开头|从头.{0,2}(开始|播放)|重新开始', query):
         if miot_client and play_state.device_id:
             try:
-                await miot_client.player_seek(play_state.device_id, 0)
+                await miot_client.seek(play_state.device_id, 0)
                 logger.info(f"[VoiceCmd] 回到开头")
             except Exception as e:
                 logger.warning(f"[VoiceCmd] 回到开头失败: {e}")
@@ -1010,10 +999,16 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         return
 
     # "播放XX的歌" — 按歌手搜索本地库
+    # 排除代词/形容词等误匹配（"我的歌"/"你的歌"/"一些歌"/"这首歌"等）
     artist_match = re.search(r'播放(.+?)的(?:歌|歌曲|音乐|曲子)', query)
     if artist_match:
         artist_name = artist_match.group(1).strip()
-        if artist_name:
+        # 过滤掉单字、代词、常见形容词，避免"播放我的歌"等误匹配
+        _ARTIST_BLACKLIST = {
+            "我", "你", "他", "她", "它", "这", "那", "一些", "点", "首", "首儿",
+            "这首", "那首", "这些", "那些", "哪些", "大家", "全部", "所有", "各种",
+        }
+        if len(artist_name) >= 2 and artist_name not in _ARTIST_BLACKLIST:
             # 搜索本地库中该歌手的所有歌曲
             local_results = await asyncio.to_thread(scanner.search, artist_name)
             # 过滤匹配歌手的结果
@@ -1038,8 +1033,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                     async with _suppress_native(device_id):
                         ok = await _play_on_device(device_id, 0)
                         if ok:
-                            play_state.is_playing = True
-                            play_state._play_start_time = time.monotonic()
+                            async with _play_lock:
+                                play_state.is_playing = True
+                                play_state._play_start_time = time.monotonic()
                             logger.info(f"[VoiceCmd] 按歌手播放: {artist_name} ({len(playlist)} 首)")
                 if monitor:
                     monitor.mark_query_handled(device_id, query)
@@ -2163,6 +2159,9 @@ async def api_music_stats() -> dict:
 
 
 # F11: 统计仪表板 — 整合库统计+下载统计+系统状态
+_app_start_time: float = 0.0  # 在 lifespan 中设置
+
+
 @app.get("/api/stats/dashboard")
 async def api_stats_dashboard() -> dict:
     """综合统计仪表板
@@ -2232,9 +2231,6 @@ async def api_stats_dashboard() -> dict:
             "alarms_active": alarm_count,
         }
     }
-
-
-_app_start_time: float = 0.0  # F11: 在 lifespan 中设置
 
 
 def _is_token_invalid_cached() -> bool:

@@ -133,11 +133,39 @@ class MusicScanner:
         self._lock = asyncio.Lock()  # 直接创建，避免惰性初始化的线程安全问题
         self._thread_lock = threading.RLock()  # 可重入锁，允许嵌套调用 _save_cache
         self._cache_validated: bool = True  # 文件存在性是否已校验（B13: 启动时惰性）
+        self._validation_task: Optional["asyncio.Task"] = None  # B13: 后台惰性校验 task
         self._load_cache()  # 启动时立即加载缓存
 
     def _get_async_lock(self) -> asyncio.Lock:
         """获取 asyncio.Lock"""
         return self._lock
+
+    def _ensure_validated(self) -> None:
+        """B13: 惰性校验 — 首次读取时触发后台 scan 异步校验文件存在性
+
+        缓存加载后 _cache_validated=False，首次调用 iter_songs/get_songs 等读取方法时
+        触发后台 scan（不阻塞当前调用），scan 完成后 _cache_validated=True。
+        期间读取返回的是未校验缓存（可能含已删除文件），scan 完成后自动刷新。
+        """
+        if self._cache_validated or self._validation_task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 无运行中的事件循环（如同步上下文），跳过
+            return
+        self._validation_task = loop.create_task(self._lazy_validate())
+
+    async def _lazy_validate(self) -> None:
+        """B13: 后台惰性校验 — 执行一次 scan 并标记已校验"""
+        try:
+            logger.info("[Scanner] 启动后台惰性校验（首次读取触发）")
+            await self.scan()
+            logger.info("[Scanner] 惰性校验完成")
+        except Exception as e:
+            logger.warning(f"[Scanner] 惰性校验扫描异常: {e}")
+        finally:
+            self._validation_task = None
 
     def _is_path_safe(self, filepath: Path) -> bool:
         """检查文件路径 resolve() 后是否仍在 music_path 下（防符号链接越界）。
@@ -456,6 +484,7 @@ class MusicScanner:
 
     def get_index_by_filepath(self, filepath: str) -> Optional[int]:
         """通过 filepath 查找歌曲索引"""
+        self._ensure_validated()  # B13: 惰性校验
         with self._thread_lock:
             for i, s in enumerate(self._songs):
                 if s.get("filepath") == filepath:
@@ -474,6 +503,7 @@ class MusicScanner:
 
     def iter_songs(self) -> list[dict]:
         """返回 songs 的快照副本，供外部安全迭代"""
+        self._ensure_validated()  # B13: 惰性校验
         with self._thread_lock:
             # M1: 深拷贝每首歌，避免外部修改污染内部缓存
             return [copy.deepcopy(s) for s in self._songs]
@@ -554,6 +584,7 @@ class MusicScanner:
 
     def get_songs(self, limit: int = 500, offset: int = 0) -> list[dict]:
         """获取歌曲列表（分页）"""
+        self._ensure_validated()  # B13: 惰性校验
         with self._thread_lock:
             # M1: 深拷贝每首歌，避免外部修改污染内部缓存
             return [copy.deepcopy(s) for s in self._songs[offset:offset + limit]]
@@ -562,6 +593,7 @@ class MusicScanner:
         """搜索本地歌曲"""
         if not keyword:
             return []
+        self._ensure_validated()  # B13: 惰性校验
         kw = keyword.lower()
         with self._thread_lock:
             songs_snapshot = list(self._songs)
