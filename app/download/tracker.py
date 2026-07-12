@@ -43,9 +43,17 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _close_thread_local_conn() -> None:
-    """关闭当前线程的局部数据库连接（atexit 注册，进程退出时调用）"""
+    """关闭当前线程的局部数据库连接（atexit 注册，进程退出时调用）
+
+    O8: 关闭前执行 wal_checkpoint(PASSIVE)，将 WAL 日志合并到主数据库，
+    防止长期运行 WAL 文件膨胀。
+    """
     conn = getattr(_thread_local, "conn", None)
     if conn is not None:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
         try:
             conn.close()
         except Exception:
@@ -248,6 +256,22 @@ def get_task_by_id(task_id: str) -> Optional[DownloadTask]:
         return None
     finally:
         pass  # 线程局部连接复用，不主动关闭
+
+
+@_async_wrap
+def update_task_format(task_id: str, format_type: str):
+    """更新任务格式（B12: 格式降级时持久化，避免重试时再次尝试原始格式）"""
+    now = time.time()
+    with _lock:
+        conn = _get_conn()
+        try:
+            conn.execute(
+                "UPDATE download_queue SET format_type=?, updated_at=? WHERE task_id=?",
+                (format_type, now, task_id),
+            )
+            conn.commit()
+        finally:
+            pass
 
 
 @_async_wrap

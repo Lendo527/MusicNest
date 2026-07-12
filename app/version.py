@@ -847,4 +847,49 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.86"
+# v0.0.87 — 第三轮深度审查：13个Bug修复 + 9项性能/体验优化 + 6项功能拓展
+#
+# [Bug修复]
+# B1 (P0回归): _play_online_song 的 mark_query_handled 传了搜索词(keyword)而非原始query,
+#   导致跨轨道去重失效,play_music_url缓慢时MediaWatcher误拦截自己触发的播放。
+#   修复:加 original_query 参数,两处调用点传入原始用户语音文本。
+# B2 (P1): _alarm_loop 截断sleep后未校验目标时间,可能提前1小时触发闹钟。
+#   修复:sleep后加 datetime.now() < target 校验。
+# B3 (P1): 网易云网关HTTP 200但应用层code!=200时不切换网关,单网关限流导致全面失败。
+#   修复:应用层错误也continue到下一网关。
+# B4 (P1): verify_cookie 的 FIRST_COMPLETED 竞态,快速失败的网关会取消可能成功的慢网关。
+#   修复:改为等待全部完成后判断。
+# B5: 共享httpx客户端timeout固化,首次10s后续30s被忽略。修复:请求级httpx.Timeout覆盖。
+# B6: _download_file 大文件总超时风险。修复:分阶段超时(connect=10s, read=60s)。
+# B7: _write_id3_tags 的 os.killpg/start_new_session 在Windows不兼容。修复:跨平台守卫。
+# B8: hardware_task 早返回未取消。修复:三处提前返回前 cancel()。
+# B9: api_player_next/prev 锁外读取索引竞态。修复:_get_next_index 移入 _play_lock 内。
+# B10: stop_refresh_loop() 死代码。修复:移除两处调用。
+# B11: api_config 双重保存。修复:合并到单次 config.update。
+# B12: _process_task 降级格式未持久化,重试时再次尝试原始格式。修复:新增 update_task_format。
+# B13: _load_cache 同步文件存在性检查阻塞大库启动。修复:改为惰性校验。
+#
+# [性能/体验优化]
+# O1: _suppress_native 智能压制 — 先查status,只在status=1时发stop,UBus请求量降80%+。
+# O2: _find_lyrics 目录文件列表缓存,避免O(n²)遍历。
+# O3: 网易云网关健康度 — 失败计数+降权+5分钟恢复期,避免按固定顺序尝试全量网关。
+# O4: media_watcher 自适应频率 — 全设备IDLE时降频到1s,活跃时保持0.2s。
+# O5: _download_file 断点续传 — HTTP Range支持,大文件失败可从已下载位置继续。
+# O6: 语音反馈 — 搜索无结果/URL无效时记录明确warning日志。
+# O7: 下一首空列表引导 — 返回"播放列表已结束,可以说播放XXX来搜索新歌曲"。
+# O8: tracker SQLite wal_checkpoint — 连接关闭前合并WAL日志,防止膨胀。
+# O9: _online_urls TTL+LRU — 存储改为(url,timestamp)tuple,6小时TTL校验。
+#
+# [功能拓展]
+# F1: 多音源聚合搜索 — 并发查询酷我+网易云,按标题+歌手匹配度合并去重(config开关)。
+# F3: 歌词同步API — /api/lyrics/current 返回当前播放进度对应的LRC歌词行+上下文,
+#   /api/lyrics/file 返回完整歌词。支持多编码自动检测。
+# F5: 睡眠定时器升级 — 与现有定时关闭模式结合,新增"播完这首就停"/"播完当前专辑就停"
+#   两种智能模式,监听播放状态变化触发停止。语音指令+Web API均支持。
+# F11: 统计仪表板 — /api/stats/dashboard 整合库统计+下载队列+播放状态+系统状态。
+# F12: 插件式音源架构 — PluginManager动态发现/加载 app/search/plugins/ 下的Provider,
+#   配套模板文件 _template.py,支持热插拔扩展新音源。
+# F14: 语音指令自然语言增强 — "这是什么歌"(播报当前歌曲)、"快进30秒"/"后退10秒"(seek)、
+#   "回到开头"(重播)、"播放XX的歌"(按歌手搜索本地库播放)。
+
+__version__ = "0.0.87"

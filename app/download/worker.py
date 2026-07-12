@@ -17,6 +17,7 @@ import httpx
 from app.download.tracker import (
     get_waiting_tasks,
     update_task_status,
+    update_task_format,
     add_task,
     reset_stale_loading_tasks,
     record_sync,
@@ -150,6 +151,9 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
 
     采用原子写入：先下载到 `.part` 临时文件，成功后 os.replace 原子重命名，
     避免下载中断时残留半成品文件被误判为已下载。
+
+    B6: 分阶段超时（connect=10s, read=60s），避免大文件总超时失败。
+    O5: 支持 HTTP Range 断点续传，大文件失败后可从已下载位置继续。
     """
     dest_part = dest.with_suffix(dest.suffix + ".part")
     try:
@@ -157,18 +161,38 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
             "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
             "Referer": "http://www.kuwo.cn/",
         }
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        # O5: 断点续传 — 检查已下载的 .part 文件大小，发送 Range 请求
+        existing_size = 0
+        if dest_part.exists():
+            try:
+                existing_size = dest_part.stat().st_size
+                if existing_size > 0:
+                    headers["Range"] = f"bytes={existing_size}-"
+                    logger.info("[Download] 断点续传: %s 已有 %d 字节", task_id[:8] if task_id else "?", existing_size)
+            except Exception:
+                pass
+
+        # B6: 分阶段超时，connect 短但 read 长以支持大文件
+        req_timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=req_timeout, follow_redirects=True, headers=headers) as client:
             async with client.stream("GET", url) as resp:
-                resp.raise_for_status()
+                # 206 Partial Content 表示服务器支持续传，200 表示从头开始
+                if resp.status_code not in (200, 206):
+                    resp.raise_for_status()
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 total = int(resp.headers.get("content-length", 0))
-                downloaded = 0
+                if resp.status_code == 206:
+                    # 续传：total 是剩余大小，实际总量需加上已下载的
+                    total += existing_size
+                downloaded = existing_size
                 last_log_pct = -1
                 # 批量缓冲写入：累积到 256KB 后通过 asyncio.to_thread 写入，
                 # 避免每个 chunk 同步 write 阻塞事件循环（FLAC 30MB×470次 write 累积阻塞明显）
                 write_buffer = bytearray()
                 _WRITE_FLUSH = 256 * 1024
-                with open(dest_part, "wb") as f:
+                # 续传时用 "ab" 追加，全新下载用 "wb"
+                mode = "ab" if resp.status_code == 206 and existing_size > 0 else "wb"
+                with open(dest_part, mode) as f:
                     async for chunk in resp.aiter_bytes():
                         write_buffer.extend(chunk)
                         downloaded += len(chunk)
@@ -188,12 +212,7 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                 return True
     except Exception as e:
         logger.warning(f"[Download] 下载文件失败: {url[:80]}... err={e}")
-        # 清理 partial 文件，避免下次误判为成功
-        try:
-            if dest_part.exists():
-                dest_part.unlink()
-        except Exception:
-            pass
+        # 不清理 .part 文件，保留以支持断点续传（O5）
         return False
 
 
@@ -282,32 +301,49 @@ async def _write_id3_tags(track_path: Path, title: str, artist: str, album: str,
         cmd += [tmp_path]
 
         # start_new_session=True 让子进程成为新进程组组长，便于 killpg 杀掉整个进程组
+        # B7: Windows 不支持 start_new_session 和 killpg，用跨平台方式处理
+        is_windows = os.name == 'nt'
+        kwargs = {}
+        if not is_windows:
+            kwargs['start_new_session'] = True
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            **kwargs,
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
         except asyncio.TimeoutError:
-            # 优先优雅终止整个进程组（ffmpeg 可能派生子进程）
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            except Exception:
-                pass
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                # 2 秒后仍未退出，强杀整个进程组
+            # 优先优雅终止：POSIX 用 killpg，Windows 直接 terminate
+            if not is_windows:
                 try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
                     pass
                 except Exception:
                     pass
+            else:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                # 2 秒后仍未退出，强杀
+                if not is_windows:
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
                 await process.wait()
             logger.warning(f"[ID3] ffmpeg 超时: title={title}, artist={artist}")
             if os.path.exists(tmp_path):
@@ -407,6 +443,11 @@ async def _process_task(task) -> bool:
                     if fmt.url:
                         download_url = fmt.url
                         format_type = fmt.type
+                        # B12: 持久化降级格式，避免重试时再次尝试原始格式
+                        try:
+                            await update_task_format(task_id, format_type)
+                        except Exception as e:
+                            logger.debug(f"[Download] 更新任务格式失败: {e}")
                         logger.info(f"[Download] {task_id} 指定格式不可用，降级到 {fmt.type} ({fmt.name})")
                         break
 
@@ -436,6 +477,11 @@ async def _process_task(task) -> bool:
                 download_url = await netease_download_url(music_id, br=320000, cookie=netease_cookie)
                 if download_url:
                     format_type = "mp3"
+                    # B12: 持久化降级格式
+                    try:
+                        await update_task_format(task_id, format_type)
+                    except Exception as e:
+                        logger.debug(f"[Download] 更新任务格式失败: {e}")
                     logger.info(f"[Download] {task_id} FLAC 不可用，降级到 mp3 320k")
 
         if not download_url:

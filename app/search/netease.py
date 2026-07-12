@@ -16,13 +16,53 @@ logger = logging.getLogger("musicnest.netease")
 _shared_client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
 
+# O3: 网关健康度记录 — 失败计数+降权，避免每次按固定顺序尝试全量网关
+_gateway_health: dict[str, dict] = {}  # base_url -> {"fail_count": int, "last_fail_ts": float}
+_GATEWAY_RECOVERY_SEC = 300  # 5 分钟后恢复尝试
+
+
+def _record_gateway_result(base_url: str, success: bool) -> None:
+    """记录网关健康度，失败时计数，成功时重置"""
+    now = time.time()
+    health = _gateway_health.setdefault(base_url, {"fail_count": 0, "last_fail_ts": 0})
+    if success:
+        health["fail_count"] = 0
+        health["last_fail_ts"] = 0
+    else:
+        health["fail_count"] += 1
+        health["last_fail_ts"] = now
+
+
+def _get_sorted_gateways() -> list[str]:
+    """按健康度排序网关：连续失败 <3 次的优先，失败次数多的排后；
+    超过恢复期的重置计数"""
+    now = time.time()
+    healthy: list[str] = []
+    degraded: list[str] = []
+    for gw in NETEASE_API_BASE_URLS:
+        health = _gateway_health.get(gw, {"fail_count": 0, "last_fail_ts": 0})
+        # 超过恢复期，重置计数
+        if health["fail_count"] > 0 and now - health["last_fail_ts"] > _GATEWAY_RECOVERY_SEC:
+            health["fail_count"] = 0
+            health["last_fail_ts"] = 0
+        if health["fail_count"] < 3:
+            healthy.append(gw)
+        else:
+            degraded.append(gw)
+    # 健康网关在前，降级网关在后（仍尝试作为 fallback）
+    return healthy + degraded
+
 
 async def _get_client(timeout: float = 10.0) -> httpx.AsyncClient:
-    """获取共享 httpx 客户端，复用连接池"""
+    """获取共享 httpx 客户端，复用连接池
+
+    B5: timeout 只在首次创建时生效，后续调用传入的 timeout 被忽略。
+    解决：每次请求级别用 httpx.Timeout 覆盖。
+    """
     global _shared_client
     async with _client_lock:
         if _shared_client is None or _shared_client.is_closed:
-            _shared_client = httpx.AsyncClient(timeout=timeout)
+            _shared_client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
         return _shared_client
 
 
@@ -72,27 +112,39 @@ async def _netease_request(
     if cookie:
         headers["Cookie"] = cookie
 
-    urls_to_try = [base_url_override] if base_url_override else NETEASE_API_BASE_URLS
+    urls_to_try = [base_url_override] if base_url_override else _get_sorted_gateways()
 
     last_error = None
     client = await _get_client(timeout=timeout)
+    req_timeout = httpx.Timeout(timeout)
     for base_url in urls_to_try:
         url = f"{base_url}{endpoint}"
         # 加时间戳到 URL 防网关缓存（Post JSON body 不会影响缓存 key）
         url += ('?' if '?' not in endpoint else '&') + '_t=' + str(int(time.time() * 1000))
         try:
-            resp = await client.post(url, json=params, headers=headers, timeout=timeout)
+            resp = await client.post(url, json=params, headers=headers, timeout=req_timeout)
             resp.raise_for_status()
             data = resp.json()
+            # 应用层错误（code != 200）也切换网关，避免单网关限流导致全面失败
+            if isinstance(data, dict) and data.get("code") not in (200, None):
+                # 记录网关健康度（O3：失败计数+降权）
+                _record_gateway_result(base_url, False)
+                last_error = f"app code={data.get('code')}: {data.get('msg', '')}"
+                logger.debug(f"[Netease] {url} 应用层错误 code={data.get('code')}，尝试下一个网关")
+                continue
             # 成功返回
+            _record_gateway_result(base_url, True)
             return data
         except httpx.TimeoutException as e:
+            _record_gateway_result(base_url, False)
             last_error = f"timeout: {e}"
             logger.warning(f"[Netease] {url} 超时，尝试下一个网关")
         except httpx.RequestError as e:
+            _record_gateway_result(base_url, False)
             last_error = f"request: {e}"
             logger.warning(f"[Netease] {url} 请求失败: {e}，尝试下一个网关")
         except Exception as e:
+            _record_gateway_result(base_url, False)
             last_error = f"exception: {e}"
             logger.warning(f"[Netease] {url} 异常: {e}，尝试下一个网关")
 
@@ -602,6 +654,7 @@ async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
 
     # 阶段 1：逐端点验证，网关间并发（任一成功即返回），总超时15秒
     client = await _get_client(timeout=timeout)
+    req_timeout = httpx.Timeout(timeout)
 
     async def _try_verify(base_url: str, endpoint: str, key_path: str) -> bool:
         """单个端点+网关的验证"""
@@ -609,7 +662,7 @@ async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
         try:
             url = f"{base_url}{endpoint}"
             headers = {"Content-Type": "application/json; charset=utf-8", "Cookie": cookie}
-            resp = await client.post(url, json=params, headers=headers, timeout=timeout)
+            resp = await client.post(url, json=params, headers=headers, timeout=req_timeout)
             data = resp.json()
             if data.get("code") == 200:
                 account = data.get("account") or data.get("data", {}).get("account")
@@ -629,15 +682,19 @@ async def verify_cookie(cookie: str, timeout: float = 10.0) -> bool:
         return False
 
     for endpoint, key_path in verify_endpoints:
-        # 对同一端点的所有网关并发尝试，任一成功即返回
-        tasks = [_try_verify(base_url, endpoint, key_path) for base_url in NETEASE_API_BASE_URLS]
+        # 对同一端点的所有网关并发尝试，等待全部完成（B4: FIRST_COMPLETED 会在快速失败时
+        # 取消可能成功的慢网关，改为等待全部结果后判断）
+        tasks = [_try_verify(base_url, endpoint, key_path) for base_url in _get_sorted_gateways()]
         try:
-            done, pending = await asyncio.wait(tasks, timeout=15.0, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(tasks, timeout=15.0)
             for t in pending:
                 t.cancel()
             for t in done:
-                if t.result():
-                    return True
+                try:
+                    if t.result():
+                        return True
+                except Exception:
+                    pass
         except Exception:
             pass
 

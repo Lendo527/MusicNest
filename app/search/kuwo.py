@@ -23,11 +23,16 @@ _format_semaphore = asyncio.Semaphore(10)
 
 
 async def _get_client(timeout: float = 10.0) -> httpx.AsyncClient:
+    """获取共享 httpx 客户端，复用连接池
+
+    B5: timeout 只在首次创建时生效，后续调用传入的 timeout 被忽略。
+    解决：请求级别用 httpx.Timeout 覆盖。
+    """
     global _shared_client
     async with _client_lock:
         if _shared_client is None or _shared_client.is_closed:
             _shared_client = httpx.AsyncClient(
-                timeout=timeout,
+                timeout=httpx.Timeout(timeout),
                 headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
                          "Referer": "http://www.kuwo.cn/"}
             )

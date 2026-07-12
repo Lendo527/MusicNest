@@ -72,6 +72,28 @@ async def _probe_file_async(filepath: Path) -> dict:
     return {}
 
 
+# O2: 目录文件列表缓存，避免 _find_lyrics 对同目录每个文件都遍历一次（O(n²)）
+_lyrics_dir_cache: dict[str, list] = {}
+_LYRICS_CACHE_MAX = 200  # 最多缓存 200 个目录的文件列表
+
+
+def _get_dir_siblings(parent: Path) -> list:
+    """获取目录下的文件列表（带缓存）"""
+    parent_str = str(parent)
+    cached = _lyrics_dir_cache.get(parent_str)
+    if cached is not None:
+        return cached
+    try:
+        siblings = list(parent.iterdir())
+    except (PermissionError, FileNotFoundError, OSError):
+        siblings = []
+    # LRU 淘汰
+    if len(_lyrics_dir_cache) >= _LYRICS_CACHE_MAX:
+        _lyrics_dir_cache.pop(next(iter(_lyrics_dir_cache)))
+    _lyrics_dir_cache[parent_str] = siblings
+    return siblings
+
+
 def _find_lyrics(audio_path: Path) -> Optional[str]:
     """查找同名的歌词文件"""
     stem = audio_path.stem
@@ -83,11 +105,8 @@ def _find_lyrics(audio_path: Path) -> Optional[str]:
         stems.append(clean_stem)
     stem_lower_set = {s.lower() for s in stems}
 
-    # L3: 大小写不敏感匹配（遍历同目录文件，兼容 song.LRC / Song.lrc 等命名）
-    try:
-        siblings = list(parent.iterdir())
-    except (PermissionError, FileNotFoundError, OSError):
-        return None
+    # O2: 使用缓存的目录文件列表，避免 O(n²) 遍历
+    siblings = _get_dir_siblings(parent)
     for sibling in siblings:
         if not sibling.is_file():
             continue
@@ -113,6 +132,7 @@ class MusicScanner:
         # 使用 asyncio.Lock 避免在 async 函数中阻塞事件循环
         self._lock = asyncio.Lock()  # 直接创建，避免惰性初始化的线程安全问题
         self._thread_lock = threading.RLock()  # 可重入锁，允许嵌套调用 _save_cache
+        self._cache_validated: bool = True  # 文件存在性是否已校验（B13: 启动时惰性）
         self._load_cache()  # 启动时立即加载缓存
 
     def _get_async_lock(self) -> asyncio.Lock:
@@ -134,7 +154,10 @@ class MusicScanner:
             return False
 
     def _load_cache(self) -> bool:
-        """从缓存文件加载歌曲列表。成功返回 True"""
+        """从缓存文件加载歌曲列表。成功返回 True
+
+        B13: 文件存在性检查改为惰性 — 大库启动时不阻塞，首次 scan 时再校验。
+        """
         cache_path = Path(self.CACHE_FILE)
         if not cache_path.exists():
             return False
@@ -181,17 +204,15 @@ class MusicScanner:
             else:
                 logger.debug(f"[Scanner] 丢弃无效缓存项: {s}")
 
-        # M3: 缓存与实际文件一致性校验，过滤掉文件不存在的项
-        before_count = len(valid_songs)
-        valid_songs = [s for s in valid_songs if Path(s.get("filepath", "")).exists()]
-        removed = before_count - len(valid_songs)
-        if removed > 0:
-            logger.info(f"[Scanner] 缓存校验: 移除 {removed} 首不存在的歌曲")
-
+        # B13: 文件存在性检查改为惰性 — 大库（1000+歌曲）同步检查会阻塞启动数秒。
+        # 启动时只加载缓存不校验文件，首次 scan() 会全量重扫自然过滤不存在的文件。
+        # 标记需要惰性校验，get_songs/search 等读取时按需过滤
         self._songs = valid_songs
+        self._cache_validated = False  # 标记未校验文件存在性
+
         # 不在此设置 _scan_time：仅从缓存加载不代表执行过扫描，
         # _scan_time 应只在 scan()/scan_new() 实际扫描后设置
-        logger.info(f"[Scanner] 从缓存加载: {len(valid_songs)} 首歌曲")
+        logger.info(f"[Scanner] 从缓存加载: {len(valid_songs)} 首歌曲（文件存在性将在首次扫描时校验）")
         return True
 
     def _write_cache_with_snapshot(self, snapshot: list[dict]) -> None:
@@ -381,6 +402,7 @@ class MusicScanner:
             with self._thread_lock:
                 self._songs = songs
                 self._scan_time = time.time()
+                self._cache_validated = True  # scan 已全量校验文件存在性
                 snapshot = list(self._songs)
             # 锁外写文件，snapshot 已固定
             self._write_cache_with_snapshot(snapshot)
@@ -503,6 +525,8 @@ class MusicScanner:
         artists = set()
         albums = set()
         total_size = 0
+        total_duration = 0
+        format_dist = {}  # F11: 格式分布统计
         for s in songs_snapshot:
             artist = (s.get("artist") or "").strip()
             if artist:
@@ -512,12 +536,17 @@ class MusicScanner:
             if album_name:
                 albums.add((album_name, s.get("artist", "")))
             total_size += s.get("size", 0)
+            total_duration += s.get("duration", 0)
+            fmt = (s.get("format") or "UNKNOWN").upper()
+            format_dist[fmt] = format_dist.get(fmt, 0) + 1
 
         return {
             "total_songs": len(songs_snapshot),
             "total_artists": len(artists),
             "total_albums": len(albums),
             "total_size": total_size,
+            "total_duration": total_duration,
+            "format_distribution": format_dist,
             "music_path": self._music_path,
             "last_scan": self._scan_time,
             "auto_scan_interval": self._auto_scan_interval,

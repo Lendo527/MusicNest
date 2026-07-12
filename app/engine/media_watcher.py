@@ -176,10 +176,15 @@ class MediaWatcher:
         }
 
     async def _watch_loop(self) -> None:
-        """主循环"""
+        """主循环
+
+        O4: 自适应轮询频率 — 所有设备 IDLE 时降频到 1s，
+        有设备活跃（status=1）时保持 0.2s 快速响应。
+        """
         from app.miot.token_refresh import is_token_invalid
         _token_invalid_logged = False
         backoff = self._poll_interval
+        _idle_slow_interval = 1.0  # IDLE 状态慢速轮询间隔
         while self._enabled:
             # token 失效时暂停轮询，避免疯狂 401（每30秒检查一次是否已重新登录）
             if is_token_invalid():
@@ -191,7 +196,15 @@ class MediaWatcher:
             _token_invalid_logged = False
             try:
                 await self._watch_all_devices()
-                backoff = self._poll_interval
+                # O4: 检查是否所有设备都 IDLE，是则降频
+                all_idle = all(
+                    self._device_states.get(did) == DevicePlayState.IDLE
+                    for did, selected in self._device_selected.items() if selected
+                )
+                if all_idle:
+                    backoff = _idle_slow_interval
+                else:
+                    backoff = self._poll_interval
             except Exception as e:
                 logger.warning(f"[MediaWatcher] _watch_all_devices 异常: {e}", exc_info=True)
                 backoff = min(backoff * 2, 5.0)
