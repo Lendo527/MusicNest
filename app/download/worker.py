@@ -19,11 +19,40 @@ from app.download.tracker import (
     update_task_status,
     add_task,
     reset_stale_loading_tasks,
+    record_sync,
 )
 from app.search.kuwo import search as kuwo_search
 from app.search.netease import get_download_url as netease_download_url
 
 logger = logging.getLogger("musicnest.download")
+
+
+async def _record_sync_if_needed(task_id: str) -> None:
+    """歌单同步任务下载成功后记录同步，避免失败歌曲被永久跳过
+
+    task_id 格式: {source}_sync_{pl_id}_{track.id}
+    非同步任务（task_id 不含 _sync_）忽略。
+    """
+    if "_sync_" not in task_id:
+        return
+    try:
+        # 解析 task_id: {source}_sync_{pl_id}_{track.id}
+        # source 可能含下划线（如 netease），用 _sync_ 分割
+        parts = task_id.split("_sync_", 1)
+        if len(parts) != 2:
+            return
+        source = parts[0]
+        remainder = parts[1]
+        # remainder = {pl_id}_{track.id}，pl_id 和 track.id 都可能含下划线
+        # 用第一个下划线分割：pl_id 是纯数字
+        idx = remainder.find("_")
+        if idx <= 0:
+            return
+        pl_id = remainder[:idx]
+        track_id = remainder[idx + 1:]
+        await record_sync(source, pl_id, track_id)
+    except Exception as e:
+        logger.debug("[Download] record_sync_if_needed 解析失败: task_id=%s error=%s", task_id, e)
 
 RUNNING = False
 
@@ -272,8 +301,12 @@ async def _process_task(task) -> bool:
 
     logger.info(f"[Download] 开始处理: {task_id} {title} - {artist} [{source}]")
 
-    # 标记为 loading
-    await update_task_status(task_id, "loading")
+    # 标记为 loading（移入 try 块内，失败时跳过该任务而非无限重试）
+    try:
+        await update_task_status(task_id, "loading")
+    except Exception as e:
+        logger.error(f"[Download] 标记 loading 失败，跳过该任务: {task_id} error={e}")
+        return
 
     try:
         # ==== 第一步：获取歌曲详情（含封面、专辑ID、歌手ID）====
@@ -383,6 +416,7 @@ async def _process_task(task) -> bool:
             if resolved_cover:
                 await _download_cover(resolved_cover, artist_dir, album_dir)
             await update_task_status(task_id, "success", file_path=str(track_path))
+            await _record_sync_if_needed(task_id)
             return True
 
         # ==== 第三步：下载音频 ====
@@ -422,6 +456,8 @@ async def _process_task(task) -> bool:
 
         await update_task_status(task_id, "success", file_path=str(track_path))
         logger.info(f"[Download] 完成: {task_id} -> {track_path}")
+        # 歌单同步任务：下载成功后记录同步，避免失败歌曲被永久跳过
+        await _record_sync_if_needed(task_id)
         # 通知扫描器增量更新（优先使用外部 scanner 引用，避免缓存不同步）
         scanned = False
         if _external_scanner is not None:
@@ -601,8 +637,8 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                             cover_url=track.cover or "",
                             format_type=fmt,
                         )
-                        # add_task 的 ON CONFLICT 已自动将 error/loading 状态重置为 waiting
-                        await record_sync(source, pl_id, track.id)
+                        # 不立即 record_sync：下载成功后由 worker 调用 _record_sync_if_needed
+                        # 避免下载失败的歌曲被永久跳过
                         new_count += 1
                     except Exception as e:
                         logger.error(f"[PlaylistSync] 处理单曲失败: {track.artist} - {track.title} err={e}", exc_info=True)

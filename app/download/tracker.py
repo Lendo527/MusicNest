@@ -186,7 +186,7 @@ def add_task(
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?)
                    ON CONFLICT(task_id) DO UPDATE SET
                    status='waiting', error_msg='', file_path='', updated_at=excluded.updated_at
-                   WHERE download_queue.status IN ('error', 'loading')""",
+                   WHERE download_queue.status = 'error'""",
                 (task_id, source, music_id, title, artist, album, cover_url, format_type, now, now),
             )
             conn.commit()

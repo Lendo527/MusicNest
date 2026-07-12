@@ -7,6 +7,20 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.78 - P1修复tracker.py竞态 + worker.py三个问题:
+           问题1(tracker.py add_task竞态): ON CONFLICT条件含'loading',
+                 用户在任务正在loading时重新触发下载,会将loading重置为waiting,
+                 导致worker A处理完成后设success,但任务已被改为waiting被worker B再次拉取,
+                 重复下载+文件写入冲突;
+           修复1: ON CONFLICT条件改为只允许从'error'状态重置,移除'loading';
+           问题2(worker.py loading状态失败): update_task_status("loading")在try块外,
+                 数据库临时不可用时抛异常,_process_task直接抛出,gather吞掉异常,
+                 下一轮polling再次拉取同一任务,形成无限重试循环;
+           修复2: 将update_task_status("loading")移入独立try块,失败时跳过该任务;
+           问题3(worker.py 歌单同步不重试失败歌曲): add_task后立即record_sync,
+                 下载失败的歌曲已在sync_history中,下次同步被跳过,永远不会重试;
+           修复3: 移除立即record_sync,改为worker下载成功后调用_record_sync_if_needed,
+                 失败歌曲下次同步时会重新add_task(ON CONFLICT从error重置为waiting);
   0.0.77 - P1修复netease.py三个严重问题:
            问题1(size类型崩溃): _build_quality_formats中l.get("size",0)>0假设size是数值,
                  若网关返回字符串型size(如"12345"或"")会抛TypeError,
@@ -641,4 +655,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.77"
+__version__ = "0.0.78"
