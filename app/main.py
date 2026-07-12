@@ -3314,7 +3314,7 @@ async def api_player_next() -> dict:
             play_state.stop_playing()
             logger.info("[Player] 没有下一曲，播放结束")
             # O7: 空列表引导提示
-            return {"code": 0, "data": play_state.get_state_dict(), "msg": "播放列表已结束，可以说"播放XXX"来搜索新歌曲"}
+            return {"code": 0, "data": play_state.get_state_dict(), "msg": "播放列表已结束，可以说「播放XXX」来搜索新歌曲"}
 
         play_state.current_index = next_idx
         if play_state.device_id:
