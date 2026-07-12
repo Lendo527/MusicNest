@@ -2800,6 +2800,16 @@ async function loadVoiceCommands() {
                             <option value="stop">停止播放</option>
                             <option value="download_current">下载当前歌曲</option>
                             <option value="download">下载指定歌曲</option>
+                            <option value="create_alarm">设置闹钟</option>
+                            <option value="sleep_timer">睡眠定时(正则)</option>
+                            <option value="sleep_timer_end_song">播完这首歌停(正则)</option>
+                            <option value="sleep_timer_end_album">播完专辑停(正则)</option>
+                            <option value="cancel_timer">取消定时(正则)</option>
+                            <option value="query_current_song">查询当前歌曲(正则)</option>
+                            <option value="seek_forward">快进(正则)</option>
+                            <option value="seek_backward">后退(正则)</option>
+                            <option value="seek_start">回到开头(正则)</option>
+                            <option value="play_artist">按歌手播放(正则)</option>
                         </select>
                     </div>
                     <div class="col-auto">
@@ -2858,6 +2868,16 @@ function showAddVoiceCmd() {
                             <option value="stop">停止播放</option>
                             <option value="download_current">下载当前歌曲</option>
                             <option value="download">下载指定歌曲</option>
+                            <option value="create_alarm">设置闹钟</option>
+                            <option value="sleep_timer">睡眠定时(正则)</option>
+                            <option value="sleep_timer_end_song">播完这首歌停(正则)</option>
+                            <option value="sleep_timer_end_album">播完专辑停(正则)</option>
+                            <option value="cancel_timer">取消定时(正则)</option>
+                            <option value="query_current_song">查询当前歌曲(正则)</option>
+                            <option value="seek_forward">快进(正则)</option>
+                            <option value="seek_backward">后退(正则)</option>
+                            <option value="seek_start">回到开头(正则)</option>
+                            <option value="play_artist">按歌手播放(正则)</option>
                         </select>
                     </div>
                     <div class="col-auto">
@@ -2900,7 +2920,12 @@ function showAddVoiceCmd() {
 function setDefaultParam(id) {
     const type = document.getElementById('vcType_' + id).value;
     const paramInput = document.getElementById('vcParam_' + id);
-    const defaults = {'set_play_mode': 'random', 'set_volume': 'absolute'};
+    const defaults = {
+        'set_play_mode': 'random',
+        'set_volume': 'absolute',
+        'sleep_timer_end_song': 'end_of_song',
+        'sleep_timer_end_album': 'end_of_album',
+    };
     if (defaults[type] !== undefined && !paramInput.value) {
         paramInput.value = defaults[type];
     }

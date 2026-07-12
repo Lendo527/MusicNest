@@ -672,7 +672,18 @@ def _init_voice_engine() -> None:
                 if cmd.type == "play_song" and "播放" not in cmd.keywords:
                     cmd.keywords.append("播放")
                     logger.info("[VoiceCmd] 已补全 play_song 关键词: 添加\"播放\"")
+            # 版本升级：自动补充旧配置中缺失的新增指令 type（不恢复用户主动删除的旧 type）
+            existing_types = {cmd.type for cmd in commands}
+            added = []
+            for default_cmd in _default_commands():
+                if default_cmd.type not in existing_types:
+                    commands.append(default_cmd)
+                    added.append(default_cmd.type)
+                    logger.info(f"[VoiceCmd] 自动补充新增指令: type={default_cmd.type}")
             voice_engine.set_commands(commands)
+            # 补充了新指令则立即持久化，避免每次启动重复补充
+            if added:
+                config.set("voice_commands", _serialize_commands())
         else:
             voice_engine.set_commands(_default_commands())
     else:
@@ -693,6 +704,19 @@ def _serialize_commands() -> list[dict]:
         }
         for cmd in voice_engine.commands
     ]
+
+
+def _is_voice_cmd_enabled(cmd_type: str) -> bool:
+    """检查某类语音指令是否启用（正则指令的 enabled 检查）。
+
+    正则指令（F5睡眠定时/F14 seek/歌手播放等）在 main.py 中用正则直接匹配，
+    不经过 VoiceEngine 关键词匹配。用户可在前端管理界面禁用对应 type，
+    此函数查询 voice_engine.commands 中该 type 的 enabled 状态。
+    """
+    for cmd in voice_engine.commands:
+        if cmd.type == cmd_type:
+            return cmd.enabled
+    return True  # 未找到配置，默认启用
 
 
 # 中文数字映射（用于音量语音指令解析）
@@ -858,19 +882,21 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         return
 
     # === 睡眠定时 / 闹钟 指令（正则匹配，优先级高于通用语音引擎） ===
-    timer_minutes = _parse_timer_minutes(query)
-    if timer_minutes is not None:
-        # "X分钟后停止播放" / "X分钟停止" / "定时X分钟"
-        global _sleep_timer_task, _sleep_timer_mode, _sleep_timer_remaining
-        if _sleep_timer_task:
-            await _safe_cancel(_sleep_timer_task)
-        _sleep_timer_mode = "duration"
-        _sleep_timer_task = asyncio.create_task(_sleep_timer(timer_minutes))
-        logger.info(f"[VoiceCmd] 睡眠定时: {timer_minutes} 分钟")
-        return
+    # 各指令可通过前端管理界面禁用（_is_voice_cmd_enabled 检查 voice_engine.commands 中对应 type）
+    if _is_voice_cmd_enabled("sleep_timer"):
+        timer_minutes = _parse_timer_minutes(query)
+        if timer_minutes is not None:
+            # "X分钟后停止播放" / "X分钟停止" / "定时X分钟"
+            global _sleep_timer_task, _sleep_timer_mode, _sleep_timer_remaining
+            if _sleep_timer_task:
+                await _safe_cancel(_sleep_timer_task)
+            _sleep_timer_mode = "duration"
+            _sleep_timer_task = asyncio.create_task(_sleep_timer(timer_minutes))
+            logger.info(f"[VoiceCmd] 睡眠定时: {timer_minutes} 分钟")
+            return
 
     # F5: 智能睡眠定时 — "播完这首就停" / "播完当前专辑就停"
-    if re.search(r'播完.{0,4}(这首|这首歌|当前.{0,2}歌).{0,4}(停|停止|关闭|结束)', query):
+    if _is_voice_cmd_enabled("sleep_timer_end_song") and re.search(r'播完.{0,4}(这首|这首歌|当前.{0,2}歌).{0,4}(停|停止|关闭|结束)', query):
         if _sleep_timer_task:
             await _safe_cancel(_sleep_timer_task)
         _sleep_timer_mode = "end_of_song"
@@ -879,7 +905,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         logger.info(f"[VoiceCmd] 智能定时: 播完当前歌曲后停止")
         return
 
-    if re.search(r'播完.{0,4}(这张专辑|这个专辑|当前.{0,2}专辑|整张专辑).{0,4}(停|停止|关闭|结束)', query):
+    if _is_voice_cmd_enabled("sleep_timer_end_album") and re.search(r'播完.{0,4}(这张专辑|这个专辑|当前.{0,2}专辑|整张专辑).{0,4}(停|停止|关闭|结束)', query):
         if _sleep_timer_task:
             await _safe_cancel(_sleep_timer_task)
         _sleep_timer_mode = "end_of_album"
@@ -888,7 +914,7 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         logger.info(f"[VoiceCmd] 智能定时: 播完当前专辑后停止")
         return
 
-    if re.search(r'取消(?:睡眠)?定时|关掉定时|停掉定时', query):
+    if _is_voice_cmd_enabled("cancel_timer") and re.search(r'取消(?:睡眠)?定时|关掉定时|停掉定时', query):
         if _sleep_timer_task:
             await _safe_cancel(_sleep_timer_task)
             _sleep_timer_task = None
@@ -898,7 +924,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         return
 
     # 闹钟: "每天早上X点播放" / "每天早上X点X分播放" / "X点播放XXX"
-    alarm_match = _parse_alarm_from_query(query)
+    # create_alarm 已在 voice_commands 中，通过 VoiceEngine 检查 enabled；此处正则路径也检查
+    if _is_voice_cmd_enabled("create_alarm"):
+        alarm_match = _parse_alarm_from_query(query)
+    else:
+        alarm_match = None
     if alarm_match:
         hour_val, minute_val, song_hint = alarm_match
         alarm_id = str(uuid.uuid4())[:8]
@@ -928,9 +958,9 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         logger.info(f"[VoiceCmd] 创建闹钟: {hour_val:02d}:{minute_val:02d}{' 歌曲:' + song_hint if song_hint else ''}")
         return
 
-    # === F14: 自然语言增强指令 ===
+    # === F14: 自然语言增强指令（各指令可通过前端管理界面禁用）===
     # "这是什么歌" / "现在放的什么歌" — 播报当前歌曲信息
-    if re.search(r'(什么|啥|哪).{0,4}(歌|曲子|音乐)|现在.{0,4}放.{0,4}啥|当前.{0,4}歌曲', query):
+    if _is_voice_cmd_enabled("query_current_song") and re.search(r'(什么|啥|哪).{0,4}(歌|曲子|音乐)|现在.{0,4}放.{0,4}啥|当前.{0,4}歌曲', query):
         song = play_state.current_song()
         if song:
             title = song.get("title", "未知")
@@ -952,42 +982,44 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
 
     # "快进30秒" / "后退10秒" / "回到开头" — seek 控制
     # 注意：向前=快进（时间增大），向后=后退（时间减小）
-    seek_match = re.search(r'(快进|前进|向前)(\d+)(秒|s)', query)
-    if seek_match:
-        seconds = int(seek_match.group(2))
-        if miot_client and play_state.device_id:
-            try:
-                # 获取当前进度（用 _parse_player_info 解析 UBus 响应中的 info JSON）
-                progress_resp = await miot_client.get_player_status(play_state.device_id)
-                if progress_resp:
-                    info = _parse_player_info(progress_resp)
-                    pos = info["position"] + seconds
-                    await miot_client.seek(play_state.device_id, int(pos))
-                    logger.info(f"[VoiceCmd] 快进 {seconds}s -> pos={int(pos)}s")
-            except Exception as e:
-                logger.warning(f"[VoiceCmd] 快进失败: {e}")
-        if monitor:
-            monitor.mark_query_handled(device_id, query)
-        return
+    if _is_voice_cmd_enabled("seek_forward"):
+        seek_match = re.search(r'(快进|前进|向前)(\d+)(秒|s)', query)
+        if seek_match:
+            seconds = int(seek_match.group(2))
+            if miot_client and play_state.device_id:
+                try:
+                    # 获取当前进度（用 _parse_player_info 解析 UBus 响应中的 info JSON）
+                    progress_resp = await miot_client.get_player_status(play_state.device_id)
+                    if progress_resp:
+                        info = _parse_player_info(progress_resp)
+                        pos = info["position"] + seconds
+                        await miot_client.seek(play_state.device_id, int(pos))
+                        logger.info(f"[VoiceCmd] 快进 {seconds}s -> pos={int(pos)}s")
+                except Exception as e:
+                    logger.warning(f"[VoiceCmd] 快进失败: {e}")
+            if monitor:
+                monitor.mark_query_handled(device_id, query)
+            return
 
-    back_match = re.search(r'(后退|倒退|回退|向后)(\d+)(秒|s)', query)
-    if back_match:
-        seconds = int(back_match.group(2))
-        if miot_client and play_state.device_id:
-            try:
-                progress_resp = await miot_client.get_player_status(play_state.device_id)
-                if progress_resp:
-                    info = _parse_player_info(progress_resp)
-                    pos = max(0, info["position"] - seconds)
-                    await miot_client.seek(play_state.device_id, int(pos))
-                    logger.info(f"[VoiceCmd] 后退 {seconds}s -> pos={int(pos)}s")
-            except Exception as e:
-                logger.warning(f"[VoiceCmd] 后退失败: {e}")
-        if monitor:
-            monitor.mark_query_handled(device_id, query)
-        return
+    if _is_voice_cmd_enabled("seek_backward"):
+        back_match = re.search(r'(后退|倒退|回退|向后)(\d+)(秒|s)', query)
+        if back_match:
+            seconds = int(back_match.group(2))
+            if miot_client and play_state.device_id:
+                try:
+                    progress_resp = await miot_client.get_player_status(play_state.device_id)
+                    if progress_resp:
+                        info = _parse_player_info(progress_resp)
+                        pos = max(0, info["position"] - seconds)
+                        await miot_client.seek(play_state.device_id, int(pos))
+                        logger.info(f"[VoiceCmd] 后退 {seconds}s -> pos={int(pos)}s")
+                except Exception as e:
+                    logger.warning(f"[VoiceCmd] 后退失败: {e}")
+            if monitor:
+                monitor.mark_query_handled(device_id, query)
+            return
 
-    if re.search(r'回到开头|从头.{0,2}(开始|播放)|重新开始', query):
+    if _is_voice_cmd_enabled("seek_start") and re.search(r'回到开头|从头.{0,2}(开始|播放)|重新开始', query):
         if miot_client and play_state.device_id:
             try:
                 await miot_client.seek(play_state.device_id, 0)
@@ -1000,7 +1032,10 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
 
     # "播放XX的歌" — 按歌手搜索本地库
     # 排除代词/形容词等误匹配（"我的歌"/"你的歌"/"一些歌"/"这首歌"等）
-    artist_match = re.search(r'播放(.+?)的(?:歌|歌曲|音乐|曲子)', query)
+    if _is_voice_cmd_enabled("play_artist"):
+        artist_match = re.search(r'播放(.+?)的(?:歌|歌曲|音乐|曲子)', query)
+    else:
+        artist_match = None
     if artist_match:
         artist_name = artist_match.group(1).strip()
         # 过滤掉单字、代词、常见形容词，避免"播放我的歌"等误匹配

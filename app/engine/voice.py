@@ -65,13 +65,27 @@ _COMMAND_PRIORITY: dict[str, int] = {
     "download_current": 8,
     "download": 9,
     "create_alarm": 10,
+    # 以下指令由 main.py 正则直接匹配，VoiceEngine 通常不会命中（正则优先处理），
+    # 但仍需注册优先级，以便用户禁用时 VoiceEngine 也跳过
+    "sleep_timer": 11,
+    "sleep_timer_end_song": 12,
+    "sleep_timer_end_album": 13,
+    "cancel_timer": 14,
+    "query_current_song": 15,
+    "seek_forward": 16,
+    "seek_backward": 17,
+    "seek_start": 18,
+    "play_artist": 19,
 }
 
 
-# ===== 默认语音指令（15 条规则）=====
+# ===== 默认语音指令（24 条规则：15 条精确匹配 + 9 条正则展示）=====
 
 def _default_commands() -> list[VoiceCommand]:
-    """获取默认语音口令配置（15 条）
+    """获取默认语音口令配置（24 条）
+
+    前 15 条由 VoiceEngine 精确关键词匹配，后 9 条由 main.py 正则直接匹配（模糊匹配）。
+    正则指令的关键词仅用于前端展示和 enabled 开关，实际匹配走 main.py 硬编码正则。
 
     翻译自 Go 源码: plugins/songloft-plugin-xiaomi/config/manager.go GetDefaultVoiceCommands()
     """
@@ -156,6 +170,54 @@ def _default_commands() -> list[VoiceCommand]:
         VoiceCommand(
             type="create_alarm",
             keywords=["设置闹钟", "新建闹钟", "添加闹钟"],
+            enabled=True,
+        ),
+        # ===== 正则指令（main.py 正则直接匹配，关键词仅用于展示和 enabled 开关）=====
+        VoiceCommand(
+            type="sleep_timer",
+            keywords=["分钟后停止", "分钟停止", "定时分钟"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="sleep_timer_end_song",
+            keywords=["播完这首停", "播完这首歌停"],
+            param="end_of_song",
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="sleep_timer_end_album",
+            keywords=["播完专辑停", "播完这张专辑停"],
+            param="end_of_album",
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="cancel_timer",
+            keywords=["取消定时", "取消睡眠定时", "关掉定时"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="query_current_song",
+            keywords=["什么歌", "啥歌", "现在放什么"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="seek_forward",
+            keywords=["快进", "前进"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="seek_backward",
+            keywords=["后退", "倒退"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="seek_start",
+            keywords=["回到开头", "从头开始", "重新开始"],
+            enabled=True,
+        ),
+        VoiceCommand(
+            type="play_artist",
+            keywords=["播放的歌"],
             enabled=True,
         ),
     ]

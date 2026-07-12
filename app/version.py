@@ -7,6 +7,18 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.89 - 语音指令管理接入正则指令(9类F5/F14指令可见可禁用+旧配置自动升级):
+           问题1(main.py 正则指令不在voice_commands中): F5睡眠定时/F14 seek/歌手播放等9类指令
+                 由main.py正则直接匹配,不在voice_commands配置中,前端管理界面看不到;
+           修复1: config.py/voice.py添加9类指令条目(sleep_timer/sleep_timer_end_song/
+                 sleep_timer_end_album/cancel_timer/query_current_song/seek_forward/
+                 seek_backward/seek_start/play_artist),关键词用于展示,实际匹配走正则;
+           修复2: main.py添加_is_voice_cmd_enabled辅助函数,各正则块前检查对应type的enabled,
+                 用户可在前端管理界面禁用某类正则指令;
+           修复3: _init_voice_engine添加版本升级逻辑,自动补充旧配置中缺失的新增指令type,
+                 补充后立即持久化避免每次启动重复补充;
+           修复4: index.html编辑/新增下拉菜单添加create_alarm和9类正则指令选项,
+                 setDefaultParam添加sleep_timer_end_song/end_album默认参数;
   0.0.88 - v0.0.87新增/修改文件深度审阅修复+三轮深度复审(P0/P1定时器/seek+P2惰性校验/并发/正则/锁+P3清理):
            问题1(main.py P1 F5智能定时器暂停误触发): _sleep_timer_smart 中
                  if not current or not play_state.is_playing: break 会在用户暂停时
@@ -960,4 +972,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
 # F14: 语音指令自然语言增强 — "这是什么歌"(播报当前歌曲)、"快进30秒"/"后退10秒"(seek)、
 #   "回到开头"(重播)、"播放XX的歌"(按歌手搜索本地库播放)。
 
-__version__ = "0.0.88"
+__version__ = "0.0.89"

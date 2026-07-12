@@ -46,6 +46,16 @@ DEFAULT_CONFIG = {
         {"type": "download_current", "keywords": ["下载当前歌曲", "下载这首歌", "下载当前", "下载此歌"], "enabled": True},
         {"type": "download", "keywords": ["下载歌曲", "下载"], "enabled": True},
         {"type": "create_alarm", "keywords": ["设置闹钟", "新建闹钟", "添加闹钟"], "enabled": True},
+        # 以下指令由 main.py 正则直接匹配（模糊匹配），关键词仅用于前端展示和 enabled 开关
+        {"type": "sleep_timer", "keywords": ["分钟后停止", "分钟停止", "定时分钟"], "enabled": True},
+        {"type": "sleep_timer_end_song", "keywords": ["播完这首停", "播完这首歌停"], "param": "end_of_song", "enabled": True},
+        {"type": "sleep_timer_end_album", "keywords": ["播完专辑停", "播完这张专辑停"], "param": "end_of_album", "enabled": True},
+        {"type": "cancel_timer", "keywords": ["取消定时", "取消睡眠定时", "关掉定时"], "enabled": True},
+        {"type": "query_current_song", "keywords": ["什么歌", "啥歌", "现在放什么"], "enabled": True},
+        {"type": "seek_forward", "keywords": ["快进", "前进"], "enabled": True},
+        {"type": "seek_backward", "keywords": ["后退", "倒退"], "enabled": True},
+        {"type": "seek_start", "keywords": ["回到开头", "从头开始", "重新开始"], "enabled": True},
+        {"type": "play_artist", "keywords": ["播放的歌"], "enabled": True},
     ],
     "alarms": [],
     "playlists": [],  # [{"id", "name", "songs": [索引列表], "created_at"}]
