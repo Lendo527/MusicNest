@@ -163,9 +163,10 @@ class ConversationMonitor:
         }
 
     async def _poll_loop(self) -> None:
-        """轮询循环（异常不静默）"""
+        """轮询循环（异常不静默 + 指数退避防刷屏）"""
         from app.miot.token_refresh import is_token_invalid
         _token_invalid_logged = False
+        backoff = self._poll_interval
         while self._enabled:
             # token 失效时暂停轮询，避免疯狂 401（每30秒检查一次是否已重新登录）
             if is_token_invalid():
@@ -177,9 +178,11 @@ class ConversationMonitor:
             _token_invalid_logged = False
             try:
                 await self._poll_all()
+                backoff = self._poll_interval
             except Exception as e:
                 logger.warning(f"[Monitor] _poll_all 异常: {e}", exc_info=True)
-            await asyncio.sleep(self._poll_interval)
+                backoff = min(backoff * 2, 5.0)
+            await asyncio.sleep(backoff)
 
     async def _poll_all(self) -> None:
         """轮询所有已勾选的设备（跳过未勾选的）"""

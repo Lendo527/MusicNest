@@ -7,6 +7,24 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.82 - P2深度审阅修复engine模块(退避/窗口/冷却/异常):
+           问题1(monitor _poll_loop无退避): _poll_all持续异常时每0.2s打印一条warning,
+                 日志刷屏; media_watcher已有指数退避但monitor没有;
+           修复1: _poll_loop添加backoff=min(backoff*2, 5.0), 成功时重置;
+           问题2(OWN_PLAY_WINDOW 30s太长): mark_own_play在UBus响应后调用,
+                 实际只需覆盖 URL请求+转码(5-8s)+缓冲(2-3s)≈10-12s;
+                 30s窗口导致: 我们的歌曲播放10s后用户让小爱播放另一首,
+                 0→1跳变时仍在窗口内,MediaWatcher误判为own_play不拦截;
+           修复2: OWN_PLAY_WINDOW_SEC从30降到15;
+           问题3(_last_intercept_at在非拦截场景被设置): own_play/no_query/already_handled
+                 三种不拦截的路径都设置了_last_intercept_at,导致5s冷却期内
+                 后续合法的原生播放被跳过(误冷却);
+           修复3: 仅在实际拦截时设置_last_intercept_at,非拦截路径不设置;
+                 own_play由is_own_play_recent去重,already_handled由is_query_handled去重;
+           问题4(_on_playback_started异常被静默吞掉): _watch_device中
+                 _on_playback_started调用在try块外,异常被asyncio.gather(return_exceptions=True)
+                 静默捕获,不记录日志;
+           修复4: 用try/except包裹,异常时logger.error记录;
   0.0.81 - P2深度审阅修复miot模块(60s假死/token失效/回调泄漏/回调重复):
            问题1(stop_all_media 60s假死): stop_all_media的6个UBus请求用wait_for(3.0)
                  包裹,若token过期全部401,第一个请求的handle_token_expired被3s timeout取消,
@@ -711,4 +729,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.81"
+__version__ = "0.0.82"

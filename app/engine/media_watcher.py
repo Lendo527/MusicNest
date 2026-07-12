@@ -36,9 +36,10 @@ logger = logging.getLogger(__name__)
 # 默认轮询间隔（秒）— 200ms 平衡了响应速度和服务器压力
 DEFAULT_WATCH_INTERVAL = 0.2
 
-# "自己触发的播放"判定窗口（秒）— 30 秒
-# 覆盖转码5秒 + 音箱请求URL延迟14秒 + 播放启动缓冲10秒，避免MediaWatcher误判自己的播放
-OWN_PLAY_WINDOW_SEC = 30.0
+# "自己触发的播放"判定窗口（秒）— 15 秒
+# 覆盖 mark_own_play(UBus响应后) → 设备请求URL → 转码(首次5-8s) → 缓冲启动播放
+# 30s太长：我们的歌曲播放10s后用户让小爱播放另一首，0→1跳变时仍在窗口内导致不拦截
+OWN_PLAY_WINDOW_SEC = 15.0
 
 # 反查对话记录的窗口（秒）— 扩大到 30 秒，覆盖转码+播放启动的全流程
 RECENT_QUERY_WINDOW_SEC = 30.0
@@ -261,7 +262,13 @@ class MediaWatcher:
 
         # 检测 status: 0→1 跳变
         if prev_status != 1 and current_status == 1:
-            await self._on_playback_started(device_id)
+            try:
+                await self._on_playback_started(device_id)
+            except Exception as e:
+                logger.error(
+                    "[MediaWatcher] _on_playback_started 异常: device=%s error=%s",
+                    device_id[:12], e, exc_info=True
+                )
 
     async def _on_playback_started(self, device_id: str) -> None:
         """检测到设备开始播放（status: 0→1）"""
@@ -279,7 +286,6 @@ class MediaWatcher:
         if self._client.is_own_play_recent(device_id, OWN_PLAY_WINDOW_SEC):
             # 自己触发的播放，不干预
             self._device_states[device_id] = DevicePlayState.OWN_PLAYING
-            self._last_intercept_at[device_id] = now
             logger.debug(
                 "[MediaWatcher] 设备 %s 自己触发的播放，不干预",
                 device_id[:12]
@@ -304,7 +310,6 @@ class MediaWatcher:
                 "[MediaWatcher] 设备 %s 原生播放但无最近对话，视为用户主动唤醒，不干预",
                 device_id[:12]
             )
-            self._last_intercept_at[device_id] = now
             return
 
         # 2. 检查是否已被轨道1 处理过
@@ -313,7 +318,6 @@ class MediaWatcher:
                 "[MediaWatcher] 设备 %s 原生播放，但 query %r 已被轨道1处理，跳过",
                 device_id[:12], recent_query[:40]
             )
-            self._last_intercept_at[device_id] = now
             return
 
         # 3. 确认需要拦截：先 stop 所有媒体通道，确保完成后再触发回调
