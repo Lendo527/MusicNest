@@ -7,6 +7,26 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.81 - P2深度审阅修复miot模块(60s假死/token失效/回调泄漏/回调重复):
+           问题1(stop_all_media 60s假死): stop_all_media的6个UBus请求用wait_for(3.0)
+                 包裹,若token过期全部401,第一个请求的handle_token_expired被3s timeout取消,
+                 但_last_relogin_at已在获取锁前设置为now,导致后续60s内所有401被节流,
+                 无法刷新token,服务假死60秒;
+           修复1: _last_relogin_at从锁外"占位"改为锁内设置(_do_refresh之前),
+                 并在CancelledError时重置为0,允许下次401立即重试;
+                 _refresh_lock已确保并发串行化,无需锁外占位;
+           问题2(handle_token_expired未检查_token_invalid): passToken已过期时
+                 _token_invalid=True,但handle_token_expired仍尝试刷新,
+                 浪费锁占用和网络请求;
+           修复2: 函数入口检查_token_invalid,为True时直接返回False;
+           问题3(close()未注销回调): client.close()只关闭httpx client,
+                 未从token_refresh._client_callbacks注销self._on_token_refreshed,
+                 重新初始化client时旧回调残留,token刷新时调用已关闭client的方法;
+           修复3: close()中调用token_refresh.unregister_client_callback注销回调;
+           问题4(register_client_callback无去重): 重新初始化client时
+                 同一回调可能被重复注册(虽然close已注销,但防御性去重更安全);
+           修复4: 注册前检查cb not in _client_callbacks;
+           新增unregister_client_callback函数;
   0.0.80 - P2深度审阅修复main.py(锁/同步I/O/上限/竞态/防护):
            问题1(play_state多处未加锁): api_player_mode/api_player_playlist/api_player_volume/
                  _sleep_timer/_enrich_playlist_metadata修改play_state字段时未持_play_lock,
@@ -691,4 +711,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
   0.0.1  - 项目骨架 + 基础扫描 + Web 管理
 """
 
-__version__ = "0.0.80"
+__version__ = "0.0.81"

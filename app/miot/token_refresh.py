@@ -48,7 +48,16 @@ def reset_token_invalid() -> None:
 
 def register_client_callback(cb) -> None:
     """注册 client 更新回调，token 刷新成功后调用"""
-    _client_callbacks.append(cb)
+    if cb not in _client_callbacks:
+        _client_callbacks.append(cb)
+
+
+def unregister_client_callback(cb) -> None:
+    """注销 client 更新回调（client.close() 时调用，防止旧回调累积）"""
+    try:
+        _client_callbacks.remove(cb)
+    except ValueError:
+        pass
 
 
 def clear_client_callbacks() -> None:
@@ -139,6 +148,11 @@ async def handle_token_expired(miauth: MiAuth) -> bool:
     """
     global _last_relogin_at
 
+    # token 已确认失效（passToken 过期等），直接返回，不再尝试刷新
+    # 避免无效刷新占用锁，阻塞其他调用
+    if _token_invalid:
+        return False
+
     # 记录调用前的 token，用于判断是否已被其他并发调用刷新
     pre_token = config.get("miot_token", "")
 
@@ -157,9 +171,6 @@ async def handle_token_expired(miauth: MiAuth) -> bool:
                 return True
             return False
 
-    # 通过节流检查，立即占位（防止并发 401 全部通过节流检查引发刷新风暴）
-    _last_relogin_at = time.time()
-
     # 串行化刷新：第一个 401 拿到锁执行刷新，后续 401 等锁释放后复用结果
     async with _refresh_lock:
         # 拿到锁后检查：等锁期间 token 是否已被其他调用刷新
@@ -168,8 +179,18 @@ async def handle_token_expired(miauth: MiAuth) -> bool:
             logger.info("[TokenRefresh] 复用其他调用的刷新结果")
             return True
 
+        # 占位防并发刷新：锁内设置节流时间戳，防止锁外已通过节流检查的
+        # 后续 401 在锁内重复执行 _do_refresh
+        _last_relogin_at = time.time()
+
         logger.info("[TokenRefresh] 检测到 401，尝试用 passToken 刷新 serviceToken...")
-        ok = await _do_refresh(miauth)
-        if not ok:
-            logger.error("[TokenRefresh] 无法自动刷新 token，请重新扫码登录")
-        return ok
+        try:
+            ok = await _do_refresh(miauth)
+            if not ok:
+                logger.error("[TokenRefresh] 无法自动刷新 token，请重新扫码登录")
+            return ok
+        except asyncio.CancelledError:
+            # 被 wait_for 等超时取消时重置节流，允许下次 401 立即重试，
+            # 避免 stop_all_media 的 3s timeout 取消刷新后导致 60s 假死
+            _last_relogin_at = 0.0
+            raise

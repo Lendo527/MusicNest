@@ -79,6 +79,9 @@ class MinaHTTPClient:
         logger.info("[MIoT] token 已通过回调更新")
 
     async def close(self) -> None:
+        # 注销 token 刷新回调，防止 close 后旧回调仍被调用
+        from app.miot import token_refresh
+        token_refresh.unregister_client_callback(self._on_token_refreshed)
         await self._client.aclose()
 
     def update_token(self, service_token: str, ssecurity: str = "") -> None:
