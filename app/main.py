@@ -378,6 +378,8 @@ async def _sleep_timer_smart(mode: str):
 
     # 轮询监听播放状态变化
     last_song_title = _sleep_timer_start_song
+    # 目标专辑内已播过的曲目（用于列表循环模式下检测"专辑播完从头开始"）
+    seen_album_titles: set = {_sleep_timer_start_song}
     my_task = asyncio.current_task()
     while True:
         await asyncio.sleep(2.0)
@@ -393,6 +395,20 @@ async def _sleep_timer_smart(mode: str):
                 logger.info(f"[Timer] 智能定时器: 播放已停止")
                 break
             current_title = current.get("title", "")
+            # 单曲循环模式下标题永不变化（音箱自己重播同一首），无法靠标题切换判定
+            # 本曲结束：用播放进度超过时长（+3s 容差兜底元数据误差）判定重播点
+            if (mode == "end_of_song"
+                    and play_state.duration > 0
+                    and play_state.is_playing
+                    and play_state._play_start_time > 0):
+                from app.music.lyrics import estimate_play_position
+                pos = estimate_play_position(
+                    play_state._play_start_time, play_state.duration,
+                    play_state.is_playing, play_state._pause_elapsed,
+                )
+                if pos >= play_state.duration + 3:
+                    logger.info(f"[Timer] 智能定时器: 播放进度已超过歌曲时长（{int(pos)}s/{play_state.duration}s），视为本曲结束")
+                    break
             # 歌曲变化检测
             if current_title != last_song_title:
                 if mode == "end_of_song":
@@ -405,6 +421,11 @@ async def _sleep_timer_smart(mode: str):
                     if current_album != _sleep_timer_target_album:
                         logger.info(f"[Timer] 智能定时器: 专辑已结束 ({_sleep_timer_target_album} -> {current_album})")
                         break
+                    # 同专辑内出现播过的曲目 = 列表循环模式下专辑已播完一轮
+                    if current_title in seen_album_titles:
+                        logger.info(f"[Timer] 智能定时器: 专辑内曲目 {current_title!r} 重复出现（已循环一轮），视为专辑结束")
+                        break
+                    seen_album_titles.add(current_title)
                     # 同专辑下一首，继续监听
                     last_song_title = current_title
             else:
@@ -721,10 +742,10 @@ def _is_voice_cmd_enabled(cmd_type: str) -> bool:
 
 # 中文数字映射（用于音量语音指令解析）
 _CN_DIGITS = {'零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
-              '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+              '六': 6, '七': 7, '八': 8, '九': 9}
 
 def _parse_cn_number(text: str) -> Optional[int]:
-    """解析中文数字（0-100），支持 '三十' '二十' '五十' '一百' 等"""
+    """解析中文数字，支持 '三十' '二十三' '五十' '一百' '一百零五' '两百' 等"""
     text = text.strip()
     if not text:
         return None
@@ -734,28 +755,26 @@ def _parse_cn_number(text: str) -> Optional[int]:
     nums = re.findall(r'\d+', text)
     if nums:
         return int(nums[0])
-    # 中文数字解析
-    if text == '一百':
-        return 100
     if text == '半':
         return 50
-    result = 0
+    # 标准中文数字解析：数字 + 十/百单位逐段累加
+    # 例：一百零五 → 1*100 + 5 = 105；两百 → 2*100 = 200；二十三 → 2*10 + 3 = 23
+    result = 0      # 已累计值
+    current = 0     # 当前段数字（单位前的乘数）
     has_cn = False
     for ch in text:
         if ch in _CN_DIGITS:
             has_cn = True
-            val = _CN_DIGITS[ch]
-            if val == 10:  # 十
-                if result == 0:
-                    result = 10
-                else:
-                    result *= 10
-            else:
-                if result >= 10 and result % 10 == 0:
-                    # 已经有十位（如 二十），加个位
-                    result += val
-                else:
-                    result = result * 10 + val if result > 0 else val
+            current = _CN_DIGITS[ch]
+        elif ch == '十':
+            has_cn = True
+            result += (current or 1) * 10
+            current = 0
+        elif ch == '百':
+            has_cn = True
+            result += (current or 1) * 100
+            current = 0
+    result += current
     return result if has_cn else None
 
 
@@ -864,8 +883,12 @@ async def _play_online_song(
     return ok, song_dict, song_data
 
 
-async def _on_voice_message(device_id: str, msg: dict) -> None:
-    """语音消息回调：VoiceEngine 匹配 → 执行播放控制 + 睡眠定时/闹钟"""
+async def _on_voice_message(device_id: str, msg: dict, _claimed: bool = False) -> None:
+    """语音消息回调：VoiceEngine 匹配 → 执行播放控制 + 睡眠定时/闹钟
+
+    _claimed=True 表示调用方（轨道2拦截路径）已通过 try_claim_query 原子认领，
+    此处不再重复认领。
+    """
     # 检查设备是否已勾选
     selections: dict = config.get("device_selections", {})
     if not selections.get(device_id, False):
@@ -875,9 +898,11 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
     if not query:
         return
 
-    # 去重：如果该 query 已被处理过（轨道2 先拦截 → 轨道1 后到，或反之），跳过
+    # 去重：原子认领。双轨道（对话监控/媒体拦截）并发到达同一 query 时
+    # 只有先到者认领成功，消除"检查→数秒处理→标记"窗口内另一轨道重复执行
+    # （重复执行曾导致重复创建闹钟/孤儿睡眠定时器/播放互相打断）
     # 时间窗口 5 秒，避免用户连续说两次相同指令被漏处理
-    if monitor and monitor.is_query_handled(device_id, query, within_sec=5.0):
+    if not _claimed and monitor and not monitor.try_claim_query(device_id, query, within_sec=5.0):
         logger.debug(f"[VoiceCmd] query 已被处理，跳过: device={device_id[:12]}... query={query[:40]!r}")
         return
 
@@ -1135,11 +1160,14 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
                             play_state.playlist = list(local_results)
                         else:
                             play_state.playlist = list(all_songs)
+                        # 传赋值后的 playlist 对象本身（而非 all_songs）：
+                        # enrich 内通过身份校验防止 await 期间歌单被替换后写错位置
+                        new_playlist = play_state.playlist
                         play_state.current_index = real_index
                         play_state.device_id = device_id
 
                         # 元数据查询改 fire-and-forget（不阻塞播放）
-                        _create_background_task(_enrich_playlist_metadata(song_name, real_index, all_songs), "enrich_metadata")
+                        _create_background_task(_enrich_playlist_metadata(song_name, real_index, new_playlist), "enrich_metadata")
 
                         # 提前 mark_own_play：告诉 MediaWatcher "我正在处理"，避免在 _play_on_device
                         # 执行期间（UBus请求需1-2秒）MediaWatcher 检测到原生播放并触发重复拦截。
@@ -1459,29 +1487,33 @@ async def _on_voice_message(device_id: str, msg: dict) -> None:
         logger.warning(f"[VoiceCmd] 语音指令 '{query}' 未能触发播放（可能搜索无结果或 URL 无效）")
 
 
-async def _enrich_playlist_metadata(song_name: str, real_index: int, all_songs: list) -> None:
+async def _enrich_playlist_metadata(song_name: str, real_index: int, playlist: list) -> None:
     """后台补全播放列表中的在线元数据（fire-and-forget，不阻塞播放）
 
-    从酷我/网易云获取封面、歌手、标题等显示字段，写入 play_state.playlist[real_index]。
+    从酷我/网易云获取封面、歌手、标题等显示字段，写入 playlist[real_index]。
     失败静默，不影响播放。
+
+    playlist 必须传入赋值给 play_state.playlist 的那个列表对象本身：
+    await 搜索期间 playlist 可能被其他协程整体替换（如新的播放指令），
+    锁内通过身份（is）校验，只有仍是同一个列表时才写入，
+    避免把旧歌单的元数据写进新歌单的同位置。
     """
     try:
         kw_search = await search_by_keyword(song_name)
         if kw_search.get("code") == 0 and kw_search.get("data"):
             online = kw_search["data"]
-            if (real_index is not None
-                and real_index < len(all_songs)):
+            if real_index is not None and real_index < len(playlist):
                 async with _play_lock:
-                    # 锁内重新校验：playlist 可能在 await 期间被其他协程修改
-                    if real_index < len(play_state.playlist):
-                        play_state.playlist[real_index] = dict(all_songs[real_index])
-                        enriched = play_state.playlist[real_index]
+                    # 锁内身份校验：playlist 在 await 期间可能已被整体替换
+                    if play_state.playlist is playlist and real_index < len(playlist):
+                        enriched = dict(playlist[real_index])
                         if online.get("cover_url"):
                             enriched["cover_url"] = online["cover_url"]
                         if online.get("artist"):
                             enriched["display_artist"] = online["artist"]
                         if online.get("title"):
                             enriched["display_title"] = online["title"]
+                        playlist[real_index] = enriched
                         logger.info(
                             f"[VoiceCmd] 在线元数据已补充: title={online.get('title')} artist={online.get('artist')}"
                         )
@@ -1546,9 +1578,9 @@ async def _on_native_playback_intercept(device_id: str, query: Optional[str]) ->
     if not query:
         return
 
-    # 复用 _on_voice_message 的逻辑
+    # 复用 _on_voice_message 的逻辑（_claimed=True：media_watcher 已原子认领该 query）
     logger.info(f"[MediaWatcher] 触发拦截: device={device_id[:12]}... query={query!r}")
-    await _on_voice_message(device_id, {"query": query, "answer": ""})
+    await _on_voice_message(device_id, {"query": query, "answer": ""}, _claimed=True)
 
 
 async def _smart_resume_playback(device_id: str, timeout: int = 30) -> None:
@@ -1643,6 +1675,8 @@ def _parse_alarm_from_query(query: str) -> Optional[tuple[int, int, Optional[str
         """根据时段修饰词转换小时数（12小时制 → 24小时制）"""
         if period in ("下午", "晚上", "傍晚") and 1 <= hour <= 11:
             return hour + 12
+        if period == "晚上" and hour == 12:
+            return 0  # 晚上12点 = 午夜0点（不转换会被当成正午12点）
         if period == "中午" and hour == 12:
             return 12  # 中午12点 = 12:00
         if period == "中午" and 1 <= hour <= 11:
@@ -1949,10 +1983,13 @@ def _restart_monitor_if_running() -> None:
 
 async def _do_restart_monitor() -> None:
     global monitor
-    if monitor:
-        await monitor.stop()
-        monitor = None
-    await _start_monitor()
+    # 持有 _miot_init_lock 重启：防止与 logout/_start_monitor 并发交错，
+    # 出现刚重建的 monitor 被 logout 置 None 或重复创建 watcher
+    async with _miot_init_lock:
+        if monitor:
+            await monitor.stop()
+            monitor = None
+        await _start_monitor()
 
 
 # ===== 页面路由 =====
@@ -2138,15 +2175,18 @@ async def api_devices_auth(body: dict) -> dict:
         })
         # B10: stop_refresh_loop 已是 no-op（纯被动 401 模式），移除死代码
         global miot_client, monitor, media_watcher
-        if miot_client:
-            await miot_client.close()
-            miot_client = None
-        if monitor:
-            await monitor.stop()
-            monitor = None
-        if media_watcher:
-            await media_watcher.stop()
-            media_watcher = None
+        # 持有 _miot_init_lock 销毁单例：防止与 _check_miot/_init_miot_client 并发交错，
+        # 出现"旧 client 被 close 后仍被其他请求使用"或"刚重建的 client 被 logout 置 None"
+        async with _miot_init_lock:
+            if miot_client:
+                await miot_client.close()
+                miot_client = None
+            if monitor:
+                await monitor.stop()
+                monitor = None
+            if media_watcher:
+                await media_watcher.stop()
+                media_watcher = None
         return {"code": 0, "msg": "已登出"}
 
     return {"code": 1, "msg": f"未知操作: {action}"}
@@ -2246,7 +2286,8 @@ async def api_stats_dashboard() -> dict:
         "miot_token_valid": not _is_token_invalid_cached(),
     }
     try:
-        disk = shutil.disk_usage("/music")
+        # NAS 挂载上的 disk_usage 是同步系统调用，放入线程避免阻塞事件循环
+        disk = await asyncio.to_thread(shutil.disk_usage, "/music")
         system_info["disk_free_gb"] = round(disk.free / (1024 ** 3), 2)
         system_info["disk_total_gb"] = round(disk.total / (1024 ** 3), 2)
     except Exception:
@@ -2573,6 +2614,10 @@ async def api_music_proxy(url_hash: str) -> Response:
 _COVER_CACHE_MAX_BYTES = 200 * 1024 * 1024
 
 
+# 封面缓存清理节流时间戳（清理需 glob+stat 全部缓存文件，放线程执行并限频）
+_last_cover_cleanup_at: float = 0.0
+
+
 def _cleanup_cover_cache(cache_dir: Path) -> None:
     """清理封面缓存目录：总大小超过上限时，按 mtime 升序删除最老的文件"""
     try:
@@ -2605,15 +2650,24 @@ async def api_music_cover(song_index: int) -> Response:
     cache_dir = Path("/tmp/musicnest_cover")
     cache_dir.mkdir(parents=True, exist_ok=True)
     # 缓存大小控制：超过上限时清理最老的封面（避免大曲库场景下无限增长）
-    _cleanup_cover_cache(cache_dir)
+    # 节流 + 放入线程：glob+stat 遍历数千缓存文件是同步 IO，
+    # 封面是高频接口，每次请求都同步执行会阻塞事件循环
+    global _last_cover_cleanup_at
+    now = time.time()
+    if now - _last_cover_cleanup_at > 60.0:
+        _last_cover_cleanup_at = now
+        await asyncio.to_thread(_cleanup_cover_cache, cache_dir)
     cache_key = hashlib.md5(filepath.encode()).hexdigest()
     cache_path = cache_dir / f"{cache_key}.jpg"
 
     if not cache_path.exists():
+        # 提取到唯一临时文件后原子替换：多个请求并发提取同一封面时，
+        # 直接 -y 写最终路径会出现一个请求读到另一 ffmpeg 写了一半的图片
+        tmp_cover = cache_dir / f"{cache_key}.{os.getpid()}.{int(time.time() * 1000)}.part"
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-i", filepath, "-an", "-vcodec", "mjpeg",
-                 "-vframes", "1", "-y", str(cache_path),
+                 "-vframes", "1", "-y", str(tmp_cover),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -2627,17 +2681,24 @@ async def api_music_cover(song_index: int) -> Response:
                     pass
                 await proc.wait()
                 logger.warning(f"[Cover] ffmpeg 提取封面超时: {filepath}")
+                with contextlib.suppress(OSError):
+                    tmp_cover.unlink(missing_ok=True)
                 default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")
                 if os.path.isfile(default_svg):
                     return FileResponse(default_svg, media_type="image/svg+xml")
                 return Response(status_code=404)
-            if proc.returncode != 0 or not cache_path.exists():
+            if proc.returncode != 0 or not tmp_cover.exists():
                 # 无封面 → 返回默认黑胶唱片图
+                with contextlib.suppress(OSError):
+                    tmp_cover.unlink(missing_ok=True)
                 default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")
                 if os.path.isfile(default_svg):
                     return FileResponse(default_svg, media_type="image/svg+xml")
                 return Response(status_code=404)
+            os.replace(tmp_cover, cache_path)
         except Exception:
+            with contextlib.suppress(OSError):
+                tmp_cover.unlink(missing_ok=True)
             default_svg = os.path.join(os.path.dirname(__file__), "static", "vinyl.svg")
             if os.path.isfile(default_svg):
                 return FileResponse(default_svg, media_type="image/svg+xml")
@@ -2824,39 +2885,68 @@ async def _delete_song_by_filepath(filepath: str) -> dict:
     if not _is_safe_path(filepath):
         logger.error(f"[API] 拒绝删除不安全路径: {filepath}")
         return JSONResponse({"code": 1, "msg": "非法路径"}, status_code=400)
-    idx = scanner.get_index_by_filepath(filepath)
-    if idx is None:
+    # 按 filepath 直接取歌曲（get_songs(limit=5000)[idx] 在库超 5000 首时越界，
+    # 且 idx 在下方多个 await 点之间可能失效指向别的歌）
+    song = scanner.get_song_by_filepath(filepath)
+    if song is None:
         return JSONResponse({"code": 1, "msg": "歌曲不存在"}, status_code=404)
-    song = scanner.get_songs(limit=5000)[idx]
     artist_path = song.get("artist_path", "")
     lyrics_path = song.get("lyrics_path", "")
     try:
-        # 删音频
-        deleted_audio = False
-        if filepath and os.path.isfile(filepath):
-            os.remove(filepath)
-            deleted_audio = True
+        # 删音频（NAS 上的删除是网络往返，放入线程避免阻塞事件循环）
+        deleted_audio = await asyncio.to_thread(_remove_file_sync, filepath)
         # 删歌词（仅删除该歌曲对应的 .lrc，保留专辑封面图片）
-        if lyrics_path and os.path.isfile(lyrics_path) and _is_safe_path(lyrics_path):
-            os.remove(lyrics_path)
+        if lyrics_path and _is_safe_path(lyrics_path):
+            await asyncio.to_thread(_remove_file_sync, lyrics_path)
         # 专辑目录若完全为空才删除空目录
         song_dir = os.path.dirname(filepath) if filepath else ""
-        if song_dir and song_dir != artist_path and os.path.isdir(song_dir) and not os.listdir(song_dir):
-            os.rmdir(song_dir)
-        # 检查歌手目录是否还有音频（先校验路径安全性）
+        if song_dir and song_dir != artist_path:
+            await asyncio.to_thread(_rmdir_if_empty_sync, song_dir)
+        # 检查歌手目录是否还有音频（先校验路径安全性；os.walk 递归遍历放入线程）
         if artist_path and not _is_safe_path(artist_path):
             logger.error(f"[API] 拒绝删除不安全歌手路径: {artist_path}")
-        elif artist_path and not _has_audio_files(artist_path):
+        elif artist_path and not await asyncio.to_thread(_has_audio_files, artist_path):
             import shutil
             await asyncio.to_thread(shutil.rmtree, artist_path, ignore_errors=True)
         if deleted_audio:
-            scanner.remove_song(idx)
+            # 按 filepath 删缓存条目（remove_song(idx) 的 idx 在 await 点之间可能失效）
+            await asyncio.to_thread(scanner.remove_by_filepath, filepath)
             await _fix_play_state_after_delete(filepath)
         logger.info(f"[API] 删除歌曲成功: {filepath}")
         return {"code": 0, "msg": "删除成功"}
     except Exception as e:
         logger.error(f"[API] 删除歌曲失败: {e}", exc_info=True)
         return JSONResponse({"code": 1, "msg": f"删除失败: {e}"}, status_code=500)
+
+
+def _remove_file_sync(path: str) -> bool:
+    """同步删除文件（存在才删），异常向上抛"""
+    if path and os.path.isfile(path):
+        os.remove(path)
+        return True
+    return False
+
+
+def _batch_remove_files(filepaths: list[str]) -> int:
+    """同步批量删除文件（存在才删，单个失败跳过），返回实际删除数量"""
+    deleted = 0
+    for fp in filepaths:
+        try:
+            if fp and os.path.isfile(fp):
+                os.remove(fp)
+                deleted += 1
+        except OSError:
+            pass
+    return deleted
+
+
+def _rmdir_if_empty_sync(dirpath: str) -> None:
+    """同步删除空目录（不存在或非空则跳过）"""
+    try:
+        if dirpath and os.path.isdir(dirpath) and not os.listdir(dirpath):
+            os.rmdir(dirpath)
+    except OSError:
+        pass
 
 
 @app.delete("/api/music/song")
@@ -2894,15 +2984,15 @@ async def api_music_artist_delete(artist_name: str) -> dict:
     artist_dir_path = os.path.join(config.get("music_path", "/music"), name)
     if not _is_safe_path(artist_dir_path):
         return {"code": 1, "msg": "路径不在音乐库范围内，已拒绝删除"}
-    deleted = 0
-    for s in scanner.iter_songs():
-        if s.get("artist") == name:
-            fp = s.get("filepath", "")
-            if fp and os.path.isfile(fp):
-                os.remove(fp)
-                deleted += 1
+    songs = scanner.iter_songs()
+    # 大歌手目录数百文件的逐个 os.remove 是同步 IO，放入线程避免阻塞事件循环秒级
+    files_to_delete = [
+        s.get("filepath", "") for s in songs
+        if s.get("artist") == name and s.get("filepath")
+    ]
+    deleted = await asyncio.to_thread(_batch_remove_files, files_to_delete)
     # 删歌手根目录
-    for s in scanner.iter_songs():
+    for s in songs:
         ap = s.get("artist_path", "")
         if ap and s.get("artist") == name and os.path.isdir(ap):
             if _is_safe_path(ap):
@@ -2911,7 +3001,7 @@ async def api_music_artist_delete(artist_name: str) -> dict:
                 logger.error(f"[API] unsafe artist path: {ap}")
             break
     if deleted > 0:
-        scanner.remove_artist(name)
+        await asyncio.to_thread(scanner.remove_artist, name)
         await _fix_play_state_after_delete()  # 检查当前播放是否被删
     return {"code": 0, "msg": f"已删除 {deleted} 首歌曲"}
 
@@ -2928,34 +3018,36 @@ async def api_music_album_delete(album_name: str, artist_name: str) -> dict:
     if not _is_safe_path(album_dir_path):
         return {"code": 1, "msg": "路径不在音乐库范围内，已拒绝删除"}
     album_dir = ""
-    deleted = 0
-    for s in scanner.iter_songs():
+    songs = scanner.iter_songs()
+    files_to_delete = []
+    for s in songs:
         if s.get("album") == aname and s.get("artist") == artname:
             fp = s.get("filepath", "")
             ap = s.get("album_path", "")
             if ap and not album_dir:
                 album_dir = ap
-            if fp and os.path.isfile(fp):
-                os.remove(fp)
-                deleted += 1
+            if fp:
+                files_to_delete.append(fp)
+    # 逐个 os.remove 是同步 IO，放入线程避免阻塞事件循环
+    deleted = await asyncio.to_thread(_batch_remove_files, files_to_delete)
     if album_dir and os.path.isdir(album_dir):
         if _is_safe_path(album_dir):
             await asyncio.to_thread(shutil.rmtree, album_dir, ignore_errors=True)
         else:
             logger.error(f"[API] unsafe album path: {album_dir}")
-    # 检查歌手目录是否还有音频
+    # 检查歌手目录是否还有音频（os.walk 递归遍历放入线程）
     artist_path = ""
-    for s in scanner.iter_songs():
+    for s in songs:
         if s.get("artist") == artname:
             artist_path = s.get("artist_path", "")
             break
-    if artist_path and not _has_audio_files(artist_path):
+    if artist_path and not await asyncio.to_thread(_has_audio_files, artist_path):
         if _is_safe_path(artist_path):
             await asyncio.to_thread(shutil.rmtree, artist_path, ignore_errors=True)
         else:
             logger.error(f"[API] unsafe artist path: {artist_path}")
     if deleted > 0:
-        scanner.remove_album(aname, artname)
+        await asyncio.to_thread(scanner.remove_album, aname, artname)
         await _fix_play_state_after_delete()  # 检查当前播放是否被删
     return {"code": 0, "msg": f"已删除 {deleted} 首歌曲"}
 
@@ -3569,9 +3661,18 @@ async def api_lyrics_file(filepath: str) -> dict:
     if not filepath:
         return {"code": 1, "msg": "缺少 filepath 参数"}
 
+    # 路径校验：filepath 是用户可控输入，_find_lyrics 会在其所在目录执行
+    # iterdir 并读取匹配的 .lrc/.txt 内容，不校验会泄露音乐库外任意文本文件
+    if not _is_safe_path(filepath):
+        return {"code": 1, "msg": "路径不在音乐库目录内"}
+
     audio_path = Path(filepath)
     lrc_path = _find_lyrics(audio_path) or ""
     if not lrc_path:
+        return {"code": 0, "data": {"has_lyrics": False, "lines": []}}
+
+    # 双保险：找到的歌词路径也必须在音乐库内（防止符号链接逃逸）
+    if not _is_safe_path(lrc_path):
         return {"code": 0, "data": {"has_lyrics": False, "lines": []}}
 
     lyrics = load_lyrics_file(lrc_path)
@@ -3844,6 +3945,26 @@ async def api_playlist_remove_song(playlist_id: str, body: dict) -> dict:
 
 # ===== 配置 API =====
 
+# 不通过 /api/config 返回的敏感字段（serviceToken/ssecurity/passToken 可完全
+# 接管小米账号会话，网易云 Cookie 同理；前端不依赖这些值，保存时空值不会覆盖）
+_REDACTED_CONFIG_KEYS = (
+    "miot_token", "miot_ssecurity", "miot_pass_token",
+    "_auth_lp_url", "_auth_device_id", "netease_cookie",
+)
+
+
+def _redact_config(data: dict) -> dict:
+    """脱敏配置：凭据类字段置空，防止未授权 GET 一次性拿到全部账号凭据"""
+    out = dict(data)
+    for k in _REDACTED_CONFIG_KEYS:
+        if k in out:
+            out[k] = ""
+    netease = out.get("netease")
+    if isinstance(netease, dict):
+        out["netease"] = {**netease, "cookie": ""}
+    return out
+
+
 @app.post("/api/config")
 async def api_config(body: dict) -> dict:
     """更新配置"""
@@ -3887,13 +4008,13 @@ async def api_config(body: dict) -> dict:
     if "debug_logging" in body:
         _setup_debug_logging()
 
-    return {"code": 0, "data": config.get_all()}
+    return {"code": 0, "data": _redact_config(config.get_all())}
 
 
 @app.get("/api/config")
 async def api_get_config() -> dict:
-    """获取配置"""
-    return {"code": 0, "data": {**config.get_all(), "version": app.version}}
+    """获取配置（凭据字段脱敏，不返回 token/cookie 明文）"""
+    return {"code": 0, "data": {**_redact_config(config.get_all()), "version": app.version}}
 
 
 # ===== 语音指令 CRUD API =====

@@ -97,6 +97,26 @@ _external_scanner = None
 # 额外去除前导/尾随空格和点（Windows 不允许）
 _INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
+# 按目标文件路径的互斥锁：同一首歌可能从多个歌单入队、或手动下载与歌单同步
+# 同时发生（task_id 不同但 track_path 相同），不加锁时两个协程会同时以
+# "wb"/"ab" 打开同一 .part 文件互相截断，断点续传也会发出错误的 Range 请求
+_path_locks: dict[str, asyncio.Lock] = {}
+_PATH_LOCKS_MAX = 200
+
+
+def _get_path_lock(path: str) -> asyncio.Lock:
+    """获取目标路径的互斥锁（超上限时只淘汰未被持有的锁，避免破坏互斥）"""
+    lock = _path_locks.get(path)
+    if lock is None:
+        lock = asyncio.Lock()
+        _path_locks[path] = lock
+        if len(_path_locks) > _PATH_LOCKS_MAX:
+            for k in list(_path_locks.keys()):
+                if k != path and not _path_locks[k].locked():
+                    _path_locks.pop(k)
+                    break
+    return lock
+
 
 def _sanitize_filename(name: str, max_len: int = 200) -> str:
     """清理文件名/目录名中的非法字符，防止路径越界和创建失败
@@ -190,6 +210,10 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                 # 避免每个 chunk 同步 write 阻塞事件循环（FLAC 30MB×470次 write 累积阻塞明显）
                 write_buffer = bytearray()
                 _WRITE_FLUSH = 256 * 1024
+                # 心跳：每 60 秒刷新任务 updated_at，防止大文件慢速下载超过
+                # reset_stale_loading_tasks 的 60 分钟阈值被误判为卡死任务
+                # 重置回 waiting（会导致同一任务被并发执行两次）
+                last_heartbeat = time.monotonic()
                 # 续传时用 "ab" 追加，全新下载用 "wb"
                 mode = "ab" if resp.status_code == 206 and existing_size > 0 else "wb"
                 with open(dest_part, mode) as f:
@@ -199,6 +223,13 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
                         if len(write_buffer) >= _WRITE_FLUSH:
                             await asyncio.to_thread(f.write, bytes(write_buffer))
                             write_buffer.clear()
+                        now_mono = time.monotonic()
+                        if task_id and now_mono - last_heartbeat >= 60.0:
+                            last_heartbeat = now_mono
+                            try:
+                                await update_task_status(task_id, "loading")
+                            except Exception:
+                                pass
                         if total > 0:
                             pct = int(downloaded * 100 / total)
                             if pct >= last_log_pct + 10:
@@ -389,7 +420,7 @@ async def _process_task(task) -> bool:
         await update_task_status(task_id, "loading")
     except Exception as e:
         logger.error(f"[Download] 标记 loading 失败，跳过该任务: {task_id} error={e}")
-        return
+        return False
 
     try:
         # ==== 第一步：获取歌曲详情（含封面、专辑ID、歌手ID）====
@@ -507,51 +538,56 @@ async def _process_task(task) -> bool:
         # 如果已存在同名文件、大小达标且 ID3 已写入，只补图片
         min_size = _min_size_for_format(format_type)
         id3done_path = track_path.with_suffix(track_path.suffix + ".id3done")
-        file_ready = track_path.exists() and track_path.stat().st_size >= min_size
-        id3_done = id3done_path.exists()
 
-        if file_ready and id3_done:
-            logger.info(f"[Download] 文件已存在: {track_path}")
+        # ==== 按目标路径互斥：同一首歌可能被多个任务并发下载（不同 task_id 相同 track_path），
+        # 两个协程同时以 "wb"/"ab" 打开同一 .part 文件会互相截断损坏数据
+        async with _get_path_lock(str(track_path)):
+            # 拿到锁后重新检查文件状态：等待期间另一任务可能已完成下载
+            file_ready = track_path.exists() and track_path.stat().st_size >= min_size
+            id3_done = id3done_path.exists()
+
+            if file_ready and id3_done:
+                logger.info(f"[Download] 文件已存在: {track_path}")
+                if resolved_cover:
+                    await _download_cover(resolved_cover, artist_dir, album_dir)
+                await update_task_status(task_id, "success", file_path=str(track_path))
+                await _record_sync_if_needed(task_id)
+                return True
+
+            # ==== 第三步：下载音频 ====
+            if file_ready:
+                # 文件已存在但 ID3 未完成，跳过下载只补 ID3
+                logger.info(f"[Download] 音频已存在，跳过下载: {track_path}")
+            else:
+                logger.info(f"[Download] 下载音频: {download_url[:80]}...")
+                success = await _download_file(download_url, track_path, task_id=task_id)
+                if not success:
+                    await update_task_status(task_id, "error", "音频下载失败")
+                    return False
+
+            # ==== 第四步：下载封面 + 歌手图 ====
             if resolved_cover:
                 await _download_cover(resolved_cover, artist_dir, album_dir)
-            await update_task_status(task_id, "success", file_path=str(track_path))
-            await _record_sync_if_needed(task_id)
-            return True
 
-        # ==== 第三步：下载音频 ====
-        if file_ready:
-            # 文件已存在但 ID3 未完成，跳过下载只补 ID3
-            logger.info(f"[Download] 音频已存在，跳过下载: {track_path}")
-        else:
-            logger.info(f"[Download] 下载音频: {download_url[:80]}...")
-            success = await _download_file(download_url, track_path, task_id=task_id)
-            if not success:
-                await update_task_status(task_id, "error", "音频下载失败")
-                return False
+            # ==== 第五步：下载歌词 ====
+            lyrics = await _fetch_lyrics(source, music_id, title, resolved_artist)
+            if lyrics:
+                lrc_path = album_dir / f"{safe_title}.lrc"
+                await asyncio.to_thread(lrc_path.write_text, lyrics, encoding="utf-8")
 
-        # ==== 第四步：下载封面 + 歌手图 ====
-        if resolved_cover:
-            await _download_cover(resolved_cover, artist_dir, album_dir)
+            # ==== 第六步：写入 ID3 标签（用 ffmpeg 写标题/歌手/专辑 + 嵌入封面）====
+            cover_img = album_dir / "cover.jpg"
+            if cover_img.exists():
+                id3_ok = await _write_id3_tags(track_path, title, resolved_artist, resolved_album, cover_img)
+            else:
+                id3_ok = await _write_id3_tags(track_path, title, resolved_artist, resolved_album)
 
-        # ==== 第五步：下载歌词 ====
-        lyrics = await _fetch_lyrics(source, music_id, title, resolved_artist)
-        if lyrics:
-            lrc_path = album_dir / f"{safe_title}.lrc"
-            await asyncio.to_thread(lrc_path.write_text, lyrics, encoding="utf-8")
-
-        # ==== 第六步：写入 ID3 标签（用 ffmpeg 写标题/歌手/专辑 + 嵌入封面）====
-        cover_img = album_dir / "cover.jpg"
-        if cover_img.exists():
-            id3_ok = await _write_id3_tags(track_path, title, resolved_artist, resolved_album, cover_img)
-        else:
-            id3_ok = await _write_id3_tags(track_path, title, resolved_artist, resolved_album)
-
-        # ID3 写入成功后创建标记文件，避免重试时跳过 ID3
-        if id3_ok:
-            try:
-                id3done_path.touch()
-            except Exception as e:
-                logger.warning(f"[Download] 创建 ID3 标记文件失败: {e}")
+            # ID3 写入成功后创建标记文件，避免重试时跳过 ID3
+            if id3_ok:
+                try:
+                    id3done_path.touch()
+                except Exception as e:
+                    logger.warning(f"[Download] 创建 ID3 标记文件失败: {e}")
 
         await update_task_status(task_id, "success", file_path=str(track_path))
         logger.info(f"[Download] 完成: {task_id} -> {track_path}")
@@ -710,7 +746,8 @@ async def playlist_sync_worker(sync_interval: int = 1800):
 
                     try:
                         # 先检查本地是否已有该歌曲（按标题+歌手集合交集匹配）
-                        local_songs = _scanner.search(track.title)
+                        # scanner.search 是同步线性扫描+拷贝，大库时阻塞事件循环，放入线程执行
+                        local_songs = await asyncio.to_thread(_scanner.search, track.title)
                         already_local = False
                         # 将歌手名按分隔符拆分为集合，用集合交集判断（避免子串误匹配）
                         track_artists = {p.strip() for p in re.split(r'[,/、;&]', track.artist or "") if p.strip()}
@@ -748,8 +785,12 @@ async def playlist_sync_worker(sync_interval: int = 1800):
                         logger.error(f"[PlaylistSync] 处理单曲失败: {track.artist} - {track.title} err={e}", exc_info=True)
                         continue
 
-                # 无论是否有新曲目，都更新锚点（避免下次重复拉取）
-                if remote_update or remote_track_update:
+                # 仅当本轮没有新任务入队时才更新锚点：
+                # 有任务入队时推迟到下一轮——若此时更新锚点，下载失败的歌曲停留在
+                # error 状态，下轮同步锚点未变化直接跳过，失败歌曲永远不会自动重试。
+                # 成功的歌曲由 _record_sync_if_needed 记录，下轮会被 synced 检查跳过；
+                # 仍排队中的歌曲 add_task 不会重置其状态，无副作用。
+                if new_count == 0 and (remote_update or remote_track_update):
                     await set_playlist_sync_anchor(source, pl_id, remote_update, remote_track_update)
 
                 if new_count > 0:

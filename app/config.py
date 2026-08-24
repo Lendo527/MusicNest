@@ -82,6 +82,10 @@ class ConfigManager:
         # 防抖保存的 timer 和 lock 改为实例变量，避免多实例共享同一 timer 导致互相取消
         self._save_timer: threading.Timer | None = None
         self._save_lock = threading.Lock()
+        # 文件写入互斥：timer 线程的 _save 与 flush_save 的 _save 可能并发执行，
+        # pid+毫秒时间戳的 tmp 文件名在多线程同毫秒下会重名，两个 writer
+        # 交错写同一 tmp 后各自 os.replace 会导致配置文件损坏
+        self._file_lock = threading.Lock()
         # C1: 深拷贝避免 DEFAULT_CONFIG 被永久污染
         self._data: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
         try:
@@ -130,21 +134,30 @@ class ConfigManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             data = copy.deepcopy(self._data)
-        # 使用 pid+时间戳的唯一临时文件名，避免多实例并发写入时冲突
-        tmp_path = path.parent / f"config.{os.getpid()}.{int(time.time() * 1000)}.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False)
-            os.replace(str(tmp_path), str(path))  # 原子替换
-        except Exception as e:
-            logging.getLogger("musicnest.config").error(
-                "[Config] 配置保存失败: %s", e
+        with self._file_lock:
+            # pid+线程id+时间戳的唯一临时文件名，避免并发写入时同名冲突
+            tmp_path = path.parent / (
+                f"config.{os.getpid()}.{threading.get_ident()}.{int(time.time() * 1000)}.tmp"
             )
-            if tmp_path.exists():
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False)
+                # 配置含小米 serviceToken/ssecurity/passToken 与网易云 Cookie，
+                # 收紧到仅属主可读写（rename 保留 inode 权限，最终文件同为 0600）
                 try:
-                    tmp_path.unlink()
-                except Exception:
+                    os.chmod(tmp_path, 0o600)
+                except OSError:
                     pass
+                os.replace(str(tmp_path), str(path))  # 原子替换
+            except Exception as e:
+                logging.getLogger("musicnest.config").error(
+                    "[Config] 配置保存失败: %s", e
+                )
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
 
     def _schedule_save(self) -> None:
         """防抖保存：延迟 500ms 合并多次写入，避免高频调用时频繁写文件"""

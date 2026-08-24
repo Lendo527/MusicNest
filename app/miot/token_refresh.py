@@ -28,6 +28,13 @@ _last_relogin_at: float = 0.0
 # 置位后 monitor/media_watcher 暂停轮询，避免疯狂 401
 _token_invalid: bool = False
 
+# 连续刷新失败计数：达到阈值才判定 token 失效
+# 单次网络超时/抖动不应锁死自动刷新（passToken 有效期约 1 年，
+# 一次 exchange_token 超时返回 None 就置 invalid 会导致必须手动重登录）；
+# passToken 真正过期时连续失败 3 次后停止重试，避免无效请求刷屏
+_consecutive_failures: int = 0
+TOKEN_INVALID_THRESHOLD = 3
+
 # 并发刷新串行化锁：确保同一时间只有一个刷新在进行，后续 401 复用结果
 _refresh_lock: asyncio.Lock = asyncio.Lock()
 
@@ -42,8 +49,9 @@ def is_token_invalid() -> bool:
 
 def reset_token_invalid() -> None:
     """重置 token 失效状态（用户重新登录后调用）"""
-    global _token_invalid
+    global _token_invalid, _consecutive_failures
     _token_invalid = False
+    _consecutive_failures = 0
 
 
 def register_client_callback(cb) -> None:
@@ -87,21 +95,40 @@ def record_token_created() -> None:
     pass
 
 
+def _mark_refresh_failed(reason: str) -> None:
+    """记录一次刷新失败：未达阈值时 10 秒后允许重试，达到阈值才判定 token 失效"""
+    global _last_relogin_at, _token_invalid, _consecutive_failures
+    _consecutive_failures += 1
+    # 设为 now - 50，让 60 秒节流变成 10 秒后可重试
+    _last_relogin_at = time.time() - 50.0
+    if _consecutive_failures >= TOKEN_INVALID_THRESHOLD:
+        _token_invalid = True
+        logger.warning(
+            "[TokenRefresh] 连续 %d 次刷新失败（%s），判定 token 失效，请重新登录",
+            _consecutive_failures, reason
+        )
+    else:
+        logger.warning(
+            "[TokenRefresh] 刷新失败（%s），第 %d/%d 次，10 秒后自动重试",
+            reason, _consecutive_failures, TOKEN_INVALID_THRESHOLD
+        )
+
+
 async def _do_refresh(miauth: MiAuth) -> bool:
     """执行 token 刷新（使用 passToken）
 
     Returns:
         True 表示刷新成功，False 表示无法刷新（需用户重新登录）
     """
-    global _last_relogin_at, _token_invalid
+    global _last_relogin_at, _token_invalid, _consecutive_failures
 
     pass_token = config.get("miot_pass_token", "")
     user_id = config.get("miot_user_id", "")
     ssecurity = config.get("miot_ssecurity", "")
 
     if not pass_token:
+        # 无 passToken 属于确定性失效（未登录/已登出），直接置位
         logger.warning("[TokenRefresh] 无 passToken，无法自动刷新（请重新扫码登录）")
-        # 失败路径：设为 now - 50，让 60 秒节流变成 10 秒后可重试
         _last_relogin_at = time.time() - 50.0
         _token_invalid = True
         return False
@@ -109,10 +136,7 @@ async def _do_refresh(miauth: MiAuth) -> bool:
     try:
         result = await miauth.exchange_token(pass_token, user_id)
         if not result or not result.get("serviceToken"):
-            logger.warning("[TokenRefresh] passToken 刷新返回空结果（passToken 可能已过期，请重新登录）")
-            # 失败路径：设为 now - 50，让 60 秒节流变成 10 秒后可重试
-            _last_relogin_at = time.time() - 50.0
-            _token_invalid = True
+            _mark_refresh_failed("passToken 刷新返回空结果")
             return False
 
         service_token = result["serviceToken"]
@@ -130,13 +154,12 @@ async def _do_refresh(miauth: MiAuth) -> bool:
         logger.info("[TokenRefresh] passToken 刷新成功，token 已更新并持久化")
         _last_relogin_at = time.time()
         _token_invalid = False
+        _consecutive_failures = 0
         return True
 
     except Exception as e:
-        logger.warning("[TokenRefresh] passToken 刷新异常: %s", e)
-        # 失败路径：设为 now - 50，让 60 秒节流变成 10 秒后可重试
-        _last_relogin_at = time.time() - 50.0
-        _token_invalid = True
+        # 网络超时等瞬时异常：计入连续失败但立即置 invalid，10 秒后可重试
+        _mark_refresh_failed(f"刷新异常: {e}")
         return False
 
 

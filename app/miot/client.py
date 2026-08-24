@@ -54,6 +54,10 @@ class MinaHTTPClient:
         # 最近一次 musicnest 自己触发的播放时间戳（per-device，供轨道2区分"自己触发"vs"小爱原生播放"）
         # 在 play_url / play_music_url 成功后立即写入
         self._last_own_play_at: dict[str, float] = {}  # device_id -> timestamp
+        # userprofile API 连续失败计数与冷却：0.2s 高频轮询下持续失败时（风控/token问题），
+        # 每个 poll 都会先发一次注定失败的 GET 再走 UBus 回退，请求量翻倍且日志刷屏
+        self._userprofile_fail_count: int = 0
+        self._userprofile_cooldown_until: float = 0.0
         # 注册 token 刷新回调，token 刷新成功后自动同步
         from app.miot import token_refresh
         token_refresh.register_client_callback(self._on_token_refreshed)
@@ -122,7 +126,8 @@ class MinaHTTPClient:
         """通过 player_play_url 播放 URL"""
         message = {"url": url, "type": 1 if keep_light else 2, "media": "app_ios"}
         logger.info(f"[MIoT] play_url: device={device_id[:12]}... url={url[:60]}... type={message['type']}")
-        logger.debug("[MIoT] play_url 完整参数: device=%s url=%s message=%s", device_id[:12], url, message)
+        # 不记录完整 URL：外部音源的 URL 带签名参数，debug_logging 默认开启时会落盘
+        logger.debug("[MIoT] play_url 参数: device=%s url=%s type=%s", device_id[:12], url[:120], message["type"])
         result = await self._ubus_request(device_id, "player_play_url", "mediaplayer", message)
         logger.info(f"[MIoT] play_url 响应: {str(result)[:200] if result else 'None'}")
         logger.debug("[MIoT] play_url 完整响应: %s", result)
@@ -279,12 +284,28 @@ class MinaHTTPClient:
         if messages:
             return messages
 
-        # 方法二：UBus nlp_result_get
-        logger.info(f"[MIoT] userprofile API 无结果，尝试 UBus nlp_result_get...")
+        # 方法二：UBus nlp_result_get（userprofile 无结果是常态，不打 INFO 避免 0.2s 轮询刷屏）
+        logger.debug("[MIoT] userprofile API 无结果，尝试 UBus nlp_result_get...")
         messages = await self.get_latest_ask_by_ubus(device_id)
         if messages:
             logger.info(f"[MIoT] UBus nlp_result_get 返回 {len(messages)} 条记录")
         return messages
+
+    def _note_userprofile_failure(self, reason: str) -> None:
+        """记录一次 userprofile API 失败：连续失败达到阈值后进入冷却
+
+        冷却期间直接走 UBus 回退，避免 0.2s 轮询下请求量翻倍 + 日志刷屏
+        （失败状态转换时各打一条日志，不在每次失败时重复打）。
+        """
+        self._userprofile_fail_count += 1
+        if self._userprofile_fail_count >= 5:
+            self._userprofile_cooldown_until = time.time() + 300.0
+            logger.warning(
+                "[MIoT] userprofile API 连续失败 %d 次（%s），5 分钟内直接走 UBus 回退",
+                self._userprofile_fail_count, reason
+            )
+            # 重置计数：冷却结束后需再连续失败 5 次才会重新进入冷却
+            self._userprofile_fail_count = 0
 
     async def _get_latest_ask_via_userprofile(self, device_id: str, hardware: str, limit: int = 2) -> list[dict]:
         """通过 userprofile API 获取对话记录（原版 TS 使用的端点）"""
@@ -300,15 +321,21 @@ class MinaHTTPClient:
         }
 
         # 不打印请求日志（ConversationMonitor 每 0.2s 调用一次，会导致日志爆炸）
+        # 冷却期内直接返回空，让调用方走 UBus（避免每次轮询都先发注定失败的请求）
+        if time.time() < self._userprofile_cooldown_until:
+            return []
         try:
             resp = await self._client.get(api_url, headers=headers)
             if resp.status_code != 200:
-                logger.warning(f"[MIoT] userprofile API 返回 {resp.status_code}")
+                self._note_userprofile_failure(f"HTTP {resp.status_code}")
                 return []
             outer = resp.json()
         except Exception as e:
-            logger.warning(f"[MIoT] userprofile API 异常: {e}")
+            self._note_userprofile_failure(str(e)[:80])
             return []
+
+        # 请求成功，重置失败计数
+        self._userprofile_fail_count = 0
 
         # 外层: {code: 0, message: "Success", data: "{...}"}
         if not isinstance(outer, dict) or outer.get("code") != 0:

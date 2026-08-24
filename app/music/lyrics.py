@@ -131,8 +131,15 @@ def get_current_lyric(
     }
 
 
+# 解析结果缓存：load_lyrics_file 被歌词进度接口高频轮询调用，
+# 不缓存时每次请求都同步读盘 + 完整重新解析 + 最多 5 次编码尝试
+# 按 (mtime, size) 失效，歌词文件被修改/替换后自动重新解析
+_lyrics_cache: dict[str, tuple[float, int, Optional[list[tuple[float, str]]]]] = {}
+_LYRICS_CACHE_MAX = 100
+
+
 def load_lyrics_file(lrc_path: str) -> Optional[list[tuple[float, str]]]:
-    """加载并解析歌词文件
+    """加载并解析歌词文件（带 mtime/size 缓存）
 
     Args:
         lrc_path: .lrc 文件路径
@@ -143,8 +150,26 @@ def load_lyrics_file(lrc_path: str) -> Optional[list[tuple[float, str]]]:
     if not lrc_path:
         return None
     path = Path(lrc_path)
-    if not path.exists() or not path.is_file():
+    try:
+        st = path.stat()
+    except OSError:
         return None
+    if not path.is_file():
+        return None
+    cache_key = str(path)
+    cached = _lyrics_cache.get(cache_key)
+    if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+
+    parsed = _parse_lyrics_from_disk(path)
+    if len(_lyrics_cache) >= _LYRICS_CACHE_MAX:
+        _lyrics_cache.pop(next(iter(_lyrics_cache)))
+    _lyrics_cache[cache_key] = (st.st_mtime, st.st_size, parsed)
+    return parsed
+
+
+def _parse_lyrics_from_disk(path: Path) -> Optional[list[tuple[float, str]]]:
+    """读盘并解析歌词（多编码尝试）"""
     try:
         # 尝试多种编码
         for encoding in ["utf-8", "gbk", "gb2312", "utf-16"]:
@@ -157,7 +182,7 @@ def load_lyrics_file(lrc_path: str) -> Optional[list[tuple[float, str]]]:
         text = path.read_text(encoding="utf-8", errors="ignore")
         return parse_lrc(text)
     except Exception as e:
-        logger.warning(f"[Lyrics] 加载歌词文件失败: {lrc_path} err={e}")
+        logger.warning(f"[Lyrics] 加载歌词文件失败: {path} err={e}")
         return None
 
 

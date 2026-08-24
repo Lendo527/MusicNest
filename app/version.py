@@ -7,6 +7,59 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.90 - 全量代码审阅第三轮修复(安全+并发+性能,13个文件):
+           安全:
+             main.py: /api/lyrics/file 增加 _is_safe_path 校验(原可读取音乐库外任意
+                      .lrc/.txt 文件,路径遍历);
+             main.py: GET/POST /api/config 返回前脱敏(miot_token/miot_ssecurity/
+                      miot_pass_token/_auth_lp_url/netease.cookie 置空,原接口一次性
+                      泄露小米账号全部凭据);
+             auth.py: poll_qr_result 校验 lp_url 域名(仅允许 xiaomi.com/mi.com,
+                      原可被用来探测内网,SSRF);
+             config.py: 配置文件写入后 chmod 0600(含小米凭据与网易云Cookie);
+           并发与逻辑:
+             token_refresh.py: 刷新失败改为连续3次才判定token失效(原一次网络超时就
+                      永久置invalid,必须手动重登录才能恢复,"10秒后重试"是死代码);
+             auth.py: login_with_password 修复 passToken 为 JSON null 时 str(None)
+                      得到字符串"None"被持久化的问题;
+             auth.py: poll_qr_result 的 GET 纳入 _cookie_lock(原与 exchange_token
+                      并发清空cookie jar存在竞态);
+             monitor.py+media_watcher.py+main.py: 新增 try_claim_query 原子认领,
+                      语音指令双轨去重从"先检查后数秒才标记"改为入口原子认领,
+                      消除双轨道并发重复执行(重复创建闹钟/孤儿定时器/播放互相打断);
+             media_watcher.py: 状态机修复 — status回0时转回IDLE(原永不回IDLE导致
+                      自适应降频永久失效);拦截冷却时间戳改为拦截完成时刷新(原被
+                      拦截动作本身耗时吞掉);is_running 校验 task.done();
+             monitor.py: is_running 校验 task.done()(循环意外退出后可重新拉起);
+             worker.py: 同一首歌多任务并发下载加 per-path 锁(原两个协程同时写同一
+                      .part文件互相截断);下载心跳每60秒刷新updated_at(原大文件超
+                      60分钟被reset_stale误判为卡死,导致同任务并发执行两次);
+                      _process_task 标记loading失败 return False(原裸return返回None);
+                      歌单同步锚点仅在本轮无新任务时更新(原下载失败的歌曲永远不会
+                      自动重试);
+             main.py: logout/_do_restart_monitor 持有 _miot_init_lock 销毁/重建单例;
+                      _enrich_playlist_metadata 锁内校验歌单身份(原仅校验长度,
+                      await期间歌单被替换会把旧歌单元数据写进新歌单);
+             main.py: 中文数字解析支持百(一百零五=105,原返回15);晚上12点解析为
+                      午夜0点(原被当成正午12点);
+             main.py: 智能睡眠定时支持循环模式(单曲循环用播放进度超时长判定本曲
+                      结束;列表循环用专辑内曲目重复出现判定播完一轮);
+             aggregate.py: 酷我结果仅在有播放URL时+20分(原无URL也加分,会压过
+                      有URL的网易云结果);
+           性能(事件循环阻塞):
+             scanner.py: 目录遍历(rglob+stat)与缓存JSON写入放入线程;全量拷贝
+                      deepcopy改浅拷贝(歌曲为纯平dict);新增get_song_by_filepath;
+             main.py: 删除接口文件删除/os.walk/批量remove放入线程;封面缓存清理
+                      节流+线程化;封面提取改临时文件+原子替换(防并发读到半截图);
+                      disk_usage线程化;删除歌曲改用remove_by_filepath(原
+                      get_songs(limit=5000)[idx]超5000首越界且idx会失效);
+             scanner.py: 歌词目录缓存加60秒TTL(原永不失效,新放.lrc永远匹配不到);
+                      惰性校验失败后5分钟退避(原每次API请求都触发全量重扫);
+             lyrics.py: 歌词解析按mtime/size缓存(原歌词进度接口每次轮询都重新
+                      读盘+解析+多编码尝试);
+             worker.py: 歌单同步的本地搜索放入线程;
+             client.py: userprofile API 连续失败5次后冷却5分钟直接走UBus(原0.2s
+                      轮询下持续失败时请求量翻倍+日志刷屏);
   0.0.89 - 语音指令管理接入正则指令(9类F5/F14指令可见可禁用+旧配置自动升级):
            问题1(main.py 正则指令不在voice_commands中): F5睡眠定时/F14 seek/歌手播放等9类指令
                  由main.py正则直接匹配,不在voice_commands配置中,前端管理界面看不到;
@@ -972,4 +1025,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
 # F14: 语音指令自然语言增强 — "这是什么歌"(播报当前歌曲)、"快进30秒"/"后退10秒"(seek)、
 #   "回到开头"(重播)、"播放XX的歌"(按歌手搜索本地库播放)。
 
-__version__ = "0.0.89"
+__version__ = "0.0.90"

@@ -84,7 +84,10 @@ async def aggregate_search_by_keyword(keyword: str, timeout: float = 10.0) -> di
     if kuwo_result and kuwo_result.get("code") == 0 and kuwo_result.get("data"):
         data = kuwo_result["data"]
         score = _match_score(data.get("title", ""), data.get("artist", ""), keyword)
-        score += 20  # 有播放 URL 加分
+        # 仅在确有播放 URL 时加分：所有格式不可用时酷我会返回 url=None，
+        # 无条件 +20 会让无 URL 的酷我结果压过有 URL 的网易云结果
+        if data.get("url"):
+            score += 20
         candidates.append({
             "score": score,
             "data": data,

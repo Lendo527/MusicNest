@@ -1,7 +1,6 @@
 """NAS 音乐库扫描器 - 支持多层文件夹结构 + 歌词关联"""
 
 import asyncio
-import copy
 import logging
 import os
 import re
@@ -73,24 +72,27 @@ async def _probe_file_async(filepath: Path) -> dict:
 
 
 # O2: 目录文件列表缓存，避免 _find_lyrics 对同目录每个文件都遍历一次（O(n²)）
-_lyrics_dir_cache: dict[str, list] = {}
+# 缓存带 TTL：无失效机制的缓存会导致新放入的 .lrc 文件永远匹配不到
+_lyrics_dir_cache: dict[str, tuple[float, list]] = {}
 _LYRICS_CACHE_MAX = 200  # 最多缓存 200 个目录的文件列表
+_LYRICS_CACHE_TTL = 60.0  # 缓存有效期（秒）：新增歌词文件最迟 60 秒后可被关联
 
 
 def _get_dir_siblings(parent: Path) -> list:
-    """获取目录下的文件列表（带缓存）"""
+    """获取目录下的文件列表（带 TTL 缓存）"""
     parent_str = str(parent)
+    now = time.time()
     cached = _lyrics_dir_cache.get(parent_str)
-    if cached is not None:
-        return cached
+    if cached is not None and now - cached[0] < _LYRICS_CACHE_TTL:
+        return cached[1]
     try:
         siblings = list(parent.iterdir())
     except (PermissionError, FileNotFoundError, OSError):
         siblings = []
-    # LRU 淘汰
+    # 超上限时淘汰最旧条目（条目有 TTL，此处仅限制内存占用）
     if len(_lyrics_dir_cache) >= _LYRICS_CACHE_MAX:
         _lyrics_dir_cache.pop(next(iter(_lyrics_dir_cache)))
-    _lyrics_dir_cache[parent_str] = siblings
+    _lyrics_dir_cache[parent_str] = (now, siblings)
     return siblings
 
 
@@ -134,6 +136,7 @@ class MusicScanner:
         self._thread_lock = threading.RLock()  # 可重入锁，允许嵌套调用 _save_cache
         self._cache_validated: bool = True  # 文件存在性是否已校验（B13: 启动时惰性）
         self._validation_task: Optional["asyncio.Task"] = None  # B13: 后台惰性校验 task
+        self._validation_backoff_until: float = 0.0  # 校验失败后的退避截止时间
         self._load_cache()  # 启动时立即加载缓存
 
     def _get_async_lock(self) -> asyncio.Lock:
@@ -148,6 +151,10 @@ class MusicScanner:
         期间读取返回的是未校验缓存（可能含已删除文件），scan 完成后自动刷新。
         """
         if self._cache_validated or self._validation_task is not None:
+            return
+        # 失败退避：music_path 持续异常（NAS 掉线/挂载点丢失）时，
+        # 不再让每次 API 请求都触发一次全量目录遍历
+        if time.time() < self._validation_backoff_until:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -164,6 +171,8 @@ class MusicScanner:
             logger.info("[Scanner] 惰性校验完成")
         except Exception as e:
             logger.warning(f"[Scanner] 惰性校验扫描异常: {e}")
+            # 5 分钟内不再自动重试，避免故障期每次读取都触发全量扫描
+            self._validation_backoff_until = time.time() + 300.0
         finally:
             self._validation_task = None
 
@@ -180,6 +189,28 @@ class MusicScanner:
             return True
         except (ValueError, OSError):
             return False
+
+    def _collect_audio_files(self, root: Path) -> list[Path]:
+        """同步收集目录树下所有音频文件（供 to_thread 调用）"""
+        audio_files: list[Path] = []
+        # root_resolved 缓存到循环外：_is_path_safe 每次调用都会 resolve 音乐根目录，
+        # 万首库下是数万次冗余系统调用（NAS 上更是一次次网络往返）
+        root_resolved = Path(self._music_path).resolve()
+        for filepath in root.rglob("*"):
+            if filepath.is_symlink():
+                continue  # 跳过符号链接，防止越界
+            if not filepath.is_file():
+                continue
+            # L1: resolve() 后必须仍在 music_path 下，防止中间目录符号链接越界
+            try:
+                resolved = filepath.resolve()
+                resolved.relative_to(root_resolved)
+            except (ValueError, OSError):
+                continue
+            ext = filepath.suffix.lower()
+            if ext in SUPPORTED_EXTENSIONS:
+                audio_files.append(filepath)
+        return audio_files
 
     def _load_cache(self) -> bool:
         """从缓存文件加载歌曲列表。成功返回 True
@@ -398,18 +429,9 @@ class MusicScanner:
                 return []
 
             # 第一步：收集所有音乐文件
-            audio_files: list[Path] = []
-            for filepath in root.rglob("*"):
-                if filepath.is_symlink():
-                    continue  # 跳过符号链接，防止越界
-                if not filepath.is_file():
-                    continue
-                # L1: resolve() 后必须仍在 music_path 下，防止中间目录符号链接越界
-                if not self._is_path_safe(filepath):
-                    continue
-                ext = filepath.suffix.lower()
-                if ext in SUPPORTED_EXTENSIONS:
-                    audio_files.append(filepath)
+            # rglob + 每文件多次 stat 是同步 IO（NAS 上每次 stat 都是一次网络往返），
+            # 放入线程执行避免阻塞事件循环（万首库同步遍历会卡住 0.2s 轮询数秒）
+            audio_files = await asyncio.to_thread(self._collect_audio_files, root)
 
             # 第二步：并发解析歌曲信息
             sem = asyncio.Semaphore(10)  # 最多 10 个并发 ffprobe
@@ -432,8 +454,8 @@ class MusicScanner:
                 self._scan_time = time.time()
                 self._cache_validated = True  # scan 已全量校验文件存在性
                 snapshot = list(self._songs)
-            # 锁外写文件，snapshot 已固定
-            self._write_cache_with_snapshot(snapshot)
+            # 锁外写文件，snapshot 已固定；json 序列化大库可达数 MB，放入线程避免阻塞事件循环
+            await asyncio.to_thread(self._write_cache_with_snapshot, snapshot)
             return songs
 
     async def scan_new(self, filepaths: list[str]) -> int:
@@ -479,7 +501,7 @@ class MusicScanner:
                     self._songs.extend(new_songs)
                     self._songs.sort(key=lambda s: (s["artist"].lower(), s["album"].lower(), s["title"].lower()))
                     self._scan_time = time.time()  # 增量扫描也更新扫描时间
-                self._save_cache()
+                await asyncio.to_thread(self._save_cache)
             return len(new_songs)
 
     def get_index_by_filepath(self, filepath: str) -> Optional[int]:
@@ -490,6 +512,19 @@ class MusicScanner:
                 if s.get("filepath") == filepath:
                     return i
             return None
+
+    def get_song_by_filepath(self, filepath: str) -> Optional[dict]:
+        """通过 filepath 获取单首歌的副本（浅拷贝）
+
+        供删除等接口使用：get_songs(limit=5000)[idx] 在库超 5000 首时越界，
+        且索引在多个 await 点之间可能失效（TOCTOU），按 filepath 取无此问题。
+        """
+        self._ensure_validated()  # B13: 惰性校验
+        with self._thread_lock:
+            for s in self._songs:
+                if s.get("filepath") == filepath:
+                    return dict(s)
+        return None
 
     def remove_song(self, index: int) -> Optional[dict]:
         """移除指定索引的歌曲并保存缓存"""
@@ -505,8 +540,9 @@ class MusicScanner:
         """返回 songs 的快照副本，供外部安全迭代"""
         self._ensure_validated()  # B13: 惰性校验
         with self._thread_lock:
-            # M1: 深拷贝每首歌，避免外部修改污染内部缓存
-            return [copy.deepcopy(s) for s in self._songs]
+            # M1: 歌曲为纯平 dict（值均为 str/int），浅拷贝即可隔离外部修改，
+            # deepcopy 比浅拷贝慢一个数量级，万首库全量拷贝会阻塞调用方
+            return [dict(s) for s in self._songs]
 
     def remove_by_filepath(self, filepath: str) -> bool:
         """按文件路径删除歌曲（替代按位置 index 删除）"""
@@ -586,8 +622,8 @@ class MusicScanner:
         """获取歌曲列表（分页）"""
         self._ensure_validated()  # B13: 惰性校验
         with self._thread_lock:
-            # M1: 深拷贝每首歌，避免外部修改污染内部缓存
-            return [copy.deepcopy(s) for s in self._songs[offset:offset + limit]]
+            # M1: 浅拷贝即可隔离外部修改（值均为 str/int），避免 deepcopy 性能开销
+            return [dict(s) for s in self._songs[offset:offset + limit]]
 
     def search(self, keyword: str) -> list[dict]:
         """搜索本地歌曲"""
@@ -604,8 +640,8 @@ class MusicScanner:
                 or kw in (song.get("artist") or "").lower()
                 or kw in (song.get("album") or "").lower()
             ):
-                # M1: 深拷贝每首歌，避免外部修改污染内部缓存
-                results.append(copy.deepcopy(song))
+                # M1: 浅拷贝即可隔离外部修改（值均为 str/int）
+                results.append(dict(song))
         return results
 
     # ===== 定时扫描 =====

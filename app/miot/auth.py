@@ -61,6 +61,22 @@ def _compute_client_sign(nonce: str, ssecurity: str) -> str:
     return base64.b64encode(_sha1(raw)).decode()
 
 
+def _is_xiaomi_login_url(url: str) -> bool:
+    """校验 lp_url 是否为小米官方域名（防 SSRF）
+
+    lp_url 可由 API 请求方传入（poll_qr 接口 body），不校验域名会被用来
+    探测内网/云元数据地址。合法 lp_url 由 account.xiaomi.com 下发。
+    """
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:
+        return False
+    return (
+        host == "xiaomi.com" or host.endswith(".xiaomi.com")
+        or host == "mi.com" or host.endswith(".mi.com")
+    )
+
+
 def _extract_bigint_field(json_str: str, field: str) -> str:
     """从 JSON 字符串中用正则提取大整数字段（避免 JSON.parse 精度丢失）"""
     match = re.search(rf'"{field}"\s*:\s*(\d+)', json_str)
@@ -265,22 +281,30 @@ class MiAuth:
         if not self._user_agent:
             self._user_agent = _format_user_agent(device_id)
 
+        # SSRF 防护：lp_url 可由请求方传入，只允许小米官方域名
+        if not _is_xiaomi_login_url(lp_url):
+            logger.warning("[MiAuth] lp_url 域名校验失败，拒绝轮询: %s", lp_url[:80])
+            return {"state": "failed", "message": "登录链接无效"}
+
         try:
             headers = {
                 "User-Agent": self._user_agent,
                 "Content-Type": "application/x-www-form-urlencoded",
             }
 
-            cookie_header = self._build_cookie_header(lp_url)
-            if cookie_header:
-                headers["Cookie"] = cookie_header
+            # 锁覆盖 GET：防止响应 Set-Cookie 与 exchange_token 清空/重建
+            # cookie jar 并发交错破坏登录会话（与其他登录方法保持一致的锁纪律）
+            async with self._cookie_lock:
+                cookie_header = self._build_cookie_header(lp_url)
+                if cookie_header:
+                    headers["Cookie"] = cookie_header
 
-            logger.debug("[MiAuth] 轮询 QR 结果: lp_url=%s", lp_url[:80])
-            # 长轮询：服务端会阻塞约 30s，客户端 timeout 略大于服务端（35s）
-            resp = await client.get(
-                lp_url, headers=headers,
-                timeout=httpx.Timeout(35.0, connect=10.0),
-            )
+                logger.debug("[MiAuth] 轮询 QR 结果: lp_url=%s", lp_url[:80])
+                # 长轮询：服务端会阻塞约 30s，客户端 timeout 略大于服务端（35s）
+                resp = await client.get(
+                    lp_url, headers=headers,
+                    timeout=httpx.Timeout(35.0, connect=10.0),
+                )
 
             status = resp.status_code
             logger.debug("[MiAuth] QR 轮询响应: status=%d", status)
@@ -421,10 +445,8 @@ class MiAuth:
                 client_sign = _compute_client_sign(nonce, ssecurity)
                 location_with_sign = f"{location}&clientSign={client_sign}"
 
-                logger.info(
-                    f"exchange_token: nonce={nonce[:20]}..., "
-                    f"clientSign={client_sign[:20]}..."
-                )
+                # 不记录 clientSign（由长期凭据 ssecurity 派生的签名材料）
+                logger.debug("exchange_token: nonce=%s...", nonce[:20])
 
                 # ── Step 2: 跟随重定向获取 serviceToken ──
                 headers3 = {
@@ -521,12 +543,15 @@ class MiAuth:
 
             if result.get("code") == 0:
                 # 从响应或 cookie jar 中提取 passToken（用于后续自动刷新）
-                pass_token = str(result.get("passToken", "")) or self._get_cookie_value("passToken")
+                # 注意：passToken 字段可能为 JSON null，get 默认值不生效会返回 None，
+                # str(None) 是 truthy 字符串 "None"，会被当有效凭据持久化导致刷新永远失败
+                raw_pass_token = result.get("passToken") or ""
+                pass_token = str(raw_pass_token) or self._get_cookie_value("passToken")
                 return {
                     "ok": True,
-                    "userId": str(result.get("userId", "")),
-                    "serviceToken": result.get("serviceToken", ""),
-                    "ssecurity": result.get("ssecurity", ""),
+                    "userId": str(result.get("userId") or ""),
+                    "serviceToken": str(result.get("serviceToken") or ""),
+                    "ssecurity": str(result.get("ssecurity") or ""),
                     "passToken": pass_token,
                 }
 

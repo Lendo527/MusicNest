@@ -108,7 +108,8 @@ class MediaWatcher:
 
     @property
     def is_running(self) -> bool:
-        return self._enabled and self._task is not None
+        # 校验 task 存活：循环意外退出后 _enabled 仍为 True，不检查 done() 会误报运行中
+        return self._enabled and self._task is not None and not self._task.done()
 
     def register_intercept_callback(self, name: str, cb: InterceptCallback) -> None:
         """注册拦截回调（去重名称）"""
@@ -268,6 +269,12 @@ class MediaWatcher:
         prev_status = self._last_status.get(device_id, 0)
         self._last_status[device_id] = current_status
 
+        # status 回到 0（停止）时状态机转回 IDLE：
+        # 否则设备播放过一次后 _device_states 永远停留在 OWN/NATIVE_PLAYING，
+        # O4 自适应降频（全 IDLE 时 0.2s→1s）永久失效
+        if current_status == 0:
+            self._device_states[device_id] = DevicePlayState.IDLE
+
         # 首轮预热：只记录状态，不触发事件（避免对正在播放的设备触发误拦截）
         if not self._device_initialized.get(device_id, False):
             self._device_initialized[device_id] = True
@@ -325,10 +332,11 @@ class MediaWatcher:
             )
             return
 
-        # 2. 检查是否已被轨道1 处理过
-        if self._monitor.is_query_handled(device_id, recent_query, within_sec=RECENT_QUERY_WINDOW_SEC):
+        # 2. 原子认领：未被轨道1 处理过则立即标记，双轨道并发到达同一指令时
+        #    只有先到者能认领成功，消除"检查→数秒处理→标记"窗口内的重复执行
+        if not self._monitor.try_claim_query(device_id, recent_query, within_sec=RECENT_QUERY_WINDOW_SEC):
             logger.info(
-                "[MediaWatcher] 设备 %s 原生播放，但 query %r 已被轨道1处理，跳过",
+                "[MediaWatcher] 设备 %s 原生播放，但 query %r 已被处理，跳过",
                 device_id[:12], recent_query[:40]
             )
             return
@@ -338,10 +346,12 @@ class MediaWatcher:
             "[MediaWatcher] 设备 %s 确认拦截: query=%r",
             device_id[:12], recent_query[:80]
         )
+        # 决定拦截即记录时间戳（而非沿用函数开头的采样值），
+        # 防止拦截动作本身耗时（stop+回调可达数秒）把冷却窗口吞掉
+        self._last_intercept_at[device_id] = time.time()
         await self._client.stop_all_media(device_id)
 
         # 4. 触发拦截回调
-        self._last_intercept_at[device_id] = now
         success_count = 0
         for name, cb in self._intercept_callbacks:
             try:
@@ -352,13 +362,15 @@ class MediaWatcher:
                     "[MediaWatcher] 拦截回调 %s 执行异常: %s", name, e, exc_info=True
                 )
 
-        # 仅当至少一个回调成功时才标记 query 为已处理，避免全失败时用户指令被永久丢弃
-        if success_count > 0 and self._monitor:
-            self._monitor.mark_query_handled(device_id, recent_query)
-        elif success_count == 0:
+        # 拦截完成后刷新冷却时间戳，保证拦截结束后仍有完整 5s 冷却窗口
+        self._last_intercept_at[device_id] = time.time()
+
+        # 全部回调失败时释放认领，让轨道1 兜底重试（避免用户指令被永久丢弃）
+        if success_count == 0 and self._monitor:
+            self._monitor.unmark_query(device_id, recent_query)
             logger.warning(
-                "[MediaWatcher] 设备 %s 所有拦截回调均失败，query %r 未标记为已处理（轨道1可兜底）",
-                device_id[:12], recent_query[:40]
+                "[MediaWatcher] 设备 %s 所有拦截回调均失败，已释放认领（轨道1可兜底）",
+                device_id[:12]
             )
 
     @staticmethod

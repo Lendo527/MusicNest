@@ -48,7 +48,9 @@ class ConversationMonitor:
 
     @property
     def is_running(self) -> bool:
-        return self._enabled and self._task is not None
+        # 校验 task 存活：循环意外退出（非 stop 场景）后 _enabled 仍为 True，
+        # 若不检查 done() 会误报"运行中"，且 start() 的幂等保护会阻止重新拉起
+        return self._enabled and self._task is not None and not self._task.done()
 
     def register_callback(self, name: str, cb: MessageCallback) -> None:
         """注册回调（去重名称）"""
@@ -94,6 +96,32 @@ class ConversationMonitor:
                 and m.get("query", "") == query):
                 return m.get("handled", False)
         return False
+
+    def try_claim_query(self, device_id: str, query: str, within_sec: float = 30.0) -> bool:
+        """原子认领一条 query：未处理过则立即标记 handled 并返回 True
+
+        双轨道（对话监控/媒体拦截）并发到达同一指令时只有一个能认领成功，
+        消除"先检查、处理后标记"之间隔多个 await 点导致的 TOCTOU 重复执行。
+        认领后若处理全部失败，可调用 unmark_query 释放，让另一轨道兜底。
+        """
+        cutoff_ms = int((time.time() - within_sec) * 1000)
+        for m in reversed(self._message_buffer):
+            if (m.get("device_id") == device_id
+                and m.get("timestamp_ms", 0) >= cutoff_ms
+                and m.get("query", "") == query):
+                if m.get("handled", False):
+                    return False
+                m["handled"] = True
+                return True
+        # 缓冲区里找不到（如已滑出 500 条环形缓冲），按已处理对待避免重复执行
+        return False
+
+    def unmark_query(self, device_id: str, query: str) -> None:
+        """释放认领（认领后处理全部失败时调用，允许另一轨道兜底重试）"""
+        for m in reversed(self._message_buffer):
+            if (m.get("device_id") == device_id
+                and m.get("query", "") == query):
+                m["handled"] = False
 
     async def start(self, devices: Optional[list[dict]] = None) -> None:
         """启动监控
