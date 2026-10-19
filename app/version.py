@@ -7,6 +7,25 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.91 - 第三轮审阅修复(安全+日志红线):
+           安全:
+             index.html: 3 处 coverSrc 加 escAttr(封面URL来自第三方网关,原裸拼进
+                       img src,恶意 picUrl 可注入属性/事件,存储型XSS);
+             main.py: /api/config POST 增加键白名单(只接受 DEFAULT_CONFIG 声明的键),
+                      并校验 music_path 必须为存在的目录且不能是文件系统根
+                      (原 config.update(body) 全量覆盖,改 music_path="/" 后
+                       _is_safe_path 以 / 为根,扫描/删除端点等于放开全盘);
+             worker.py: 新增 is_safe_download_url(),_download_file 下载前校验
+                      host 属于已知音乐CDN白名单且拒绝内网地址/非http(s)
+                      (原 cover_url 前端直传即无条件 GET+follow_redirects,盲SSRF);
+             netease.py: picUrl 校验为合法 http(s) 且长度<=512 才透传(第二道防线);
+           日志红线:
+             client.py: UBus nlp_result_get 成功分支 logger.info → debug。
+                      原每 0.2s 轮询命中一次(代码注释自述"userprofile 无结果是常态"),
+                      每设备每小时约 18000 条刷屏;新消息 INFO 由 monitor.py 统一输出;
+           逻辑:
+             monitor.py: 首次拉取为空时也置 _initialized(原直接 return 不置位,
+                      设备启动时未说过话则之后第一条真实语音指令被当历史吞掉);
   0.0.90 - 全量代码审阅第三轮修复(安全+并发+性能,13个文件):
            安全:
              main.py: /api/lyrics/file 增加 _is_safe_path 校验(原可读取音乐库外任意
@@ -1025,4 +1044,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
 # F14: 语音指令自然语言增强 — "这是什么歌"(播报当前歌曲)、"快进30秒"/"后退10秒"(seek)、
 #   "回到开头"(重播)、"播放XX的歌"(按歌手搜索本地库播放)。
 
-__version__ = "0.0.90"
+__version__ = "0.0.91"

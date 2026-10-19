@@ -288,7 +288,9 @@ class MinaHTTPClient:
         logger.debug("[MIoT] userprofile API 无结果，尝试 UBus nlp_result_get...")
         messages = await self.get_latest_ask_by_ubus(device_id)
         if messages:
-            logger.info(f"[MIoT] UBus nlp_result_get 返回 {len(messages)} 条记录")
+            # 正常轮询路径（0.2s/次）：降到 debug，否则每设备每小时约 1.8 万条刷屏
+            # 新消息的 INFO 由 monitor.py 统一输出，此处不重复打
+            logger.debug(f"[MIoT] UBus nlp_result_get 返回 {len(messages)} 条记录")
         return messages
 
     def _note_userprofile_failure(self, reason: str) -> None:

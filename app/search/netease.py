@@ -229,7 +229,14 @@ def _parse_song(song: dict, source: str = "netease") -> Optional[SearchResult]:
     # 专辑 & 封面
     al = song.get("al") or {}
     album_name = al.get("name") or "未知专辑"
-    cover_url = al.get("picUrl") or None
+    # 封面 URL 来自第三方网关，必须是合法 http(s) 地址才能透传前端
+    # （前端 img src 已转义，这里做第二道防线，防畸形值污染缓存/下载路径）
+    _pic = al.get("picUrl") or None
+    cover_url = None
+    if isinstance(_pic, str) and _pic.strip():
+        _u = _pic.strip()
+        if _u.startswith(("http://", "https://")) and len(_u) <= 512:
+            cover_url = _u
     album_id = str(al.get("id", "")) if al.get("id") else ""
 
     # 时长: dt 是毫秒，转秒

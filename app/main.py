@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -35,7 +35,7 @@ def _render_template(name: str, request: Request) -> HTMLResponse:
     return HTMLResponse(html)
 
 
-from app.config import config
+from app.config import DEFAULT_CONFIG, config
 from app.version import __version__
 from app.miot.auth import MiAuth, _generate_device_id
 from app.miot.client import MinaHTTPClient
@@ -3977,6 +3977,24 @@ async def api_config(body: dict) -> dict:
         if isinstance(netease_config, dict):
             netease_config["cookie"] = cookie_val
             body["netease"] = netease_config
+
+    # 键白名单：只接受 DEFAULT_CONFIG 里声明过的键，防止任意键写入
+    # （典型攻击：把 music_path 改成 "/" 后，_is_safe_path 以 "/" 为根，
+    #   扫描/删除端点等于放开全盘）
+    unknown = [k for k in body if k not in DEFAULT_CONFIG and k != "netease_cookie"]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"未知配置键: {', '.join(sorted(unknown)[:5])}")
+
+    # music_path 校验：必须是绝对路径、存在、是目录，且不能是文件系统根
+    if "music_path" in body:
+        mp = str(body["music_path"] or "").strip()
+        if not mp:
+            raise HTTPException(status_code=400, detail="music_path 不能为空")
+        real = os.path.realpath(mp)
+        if real == os.path.sep:
+            raise HTTPException(status_code=400, detail="music_path 不允许为文件系统根目录")
+        if not os.path.isdir(real):
+            raise HTTPException(status_code=400, detail=f"music_path 不存在或不是目录: {mp}")
 
     config.update(body)
 

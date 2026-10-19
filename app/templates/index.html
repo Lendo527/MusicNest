@@ -3621,7 +3621,7 @@ function renderSongResults() {
     }
 
     tb.innerHTML = onlineSearchResults.map((s, gi) => {
-        const coverSrc = s.cover || '/static/vinyl.svg';
+        const coverSrc = escAttr(s.cover || '/static/vinyl.svg');
         const formats = (s.formats && s.formats.length > 0) ? s.formats : [
             {name: 'FLAC', bitrate: 2000, type: 'flac'},
             {name: '320K', bitrate: 320, type: 'mp3'},
@@ -3665,7 +3665,7 @@ function renderArtistResults() {
     }
 
     tb.innerHTML = onlineSearchResults.map(s => {
-        const coverSrc = s.cover || '/static/vinyl.svg';
+        const coverSrc = escAttr(s.cover || '/static/vinyl.svg');
         // 使用 artist_id 字段（后端已返回纯数字 ID，无需剥离前缀）
         const artistId = s.artist_id || s.id.replace(/^(kuwo_artist_|kuwo_album_|kuwo_|netease_)/, '');
         return '<tr style="cursor:pointer;" data-source="' + escAttr(s.source) + '" data-artist-id="' + escAttr(artistId) + '" onclick="openArtist(this.dataset.source, this.dataset.artistId)">' +
@@ -3689,7 +3689,7 @@ function renderAlbumResults() {
     }
 
     tb.innerHTML = onlineSearchResults.map(s => {
-        const coverSrc = s.cover || '/static/vinyl.svg';
+        const coverSrc = escAttr(s.cover || '/static/vinyl.svg');
         // 使用 album_id 字段（后端已返回纯数字 ID，无需剥离前缀）
         const albumId = s.album_id || s.id.replace(/^(kuwo_artist_|kuwo_album_|kuwo_|netease_)/, '');
         return '<tr style="cursor:pointer;" data-source="' + escAttr(s.source) + '" data-album-id="' + escAttr(albumId) + '" onclick="openAlbum(this.dataset.source, this.dataset.albumId)">' +

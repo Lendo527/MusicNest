@@ -11,6 +11,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -166,6 +167,44 @@ def _min_size_for_format(fmt: str) -> int:
     return 10 * 1024       # 10KB
 
 
+# ---------- 下载 URL 安全校验（SSRF 防护）----------
+# cover_url / download_url 由前端或第三方网关直传，若不校验，
+# 任意 LAN 用户可传 http://127.0.0.1:PORT/ 或 http://169.254.169.254/
+# 让服务端发起请求并把响应落盘（盲 SSRF）。
+_ALLOWED_DOWNLOAD_HOSTS = (
+    "kuwo.cn", "kuwo.com", "kwcdn.kuwo.cn", "sycdn.kuwo.cn",
+    "music.163.com", "163.com", "126.net", "127.net",
+    "qq.com", "gtimg.cn", "kugou.com",
+)
+_PRIVATE_HOST_PREFIXES = (
+    "127.", "10.", "192.168.", "169.254.", "0.", "localhost",
+)
+_PRIVATE_HOST_PREFIX17 = ("172.16.", "172.17.", "172.18.", "172.19.",
+                          "172.20.", "172.21.", "172.22.", "172.23.",
+                          "172.24.", "172.25.", "172.26.", "172.27.",
+                          "172.28.", "172.29.", "172.30.", "172.31.")
+
+
+def is_safe_download_url(url: str) -> bool:
+    """仅允许 http/https 且 host 属于已知音乐 CDN 域名，拒绝内网地址。"""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        u = urlsplit(url.strip())
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https"):
+        return False
+    host = (u.hostname or "").lower()
+    if not host:
+        return False
+    if host in ("[::1]", "::1") or host.startswith(_PRIVATE_HOST_PREFIXES):
+        return False
+    if host.startswith(_PRIVATE_HOST_PREFIX17):
+        return False
+    return any(host == h or host.endswith("." + h) for h in _ALLOWED_DOWNLOAD_HOSTS)
+
+
 async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float = 120.0) -> bool:
     """下载文件到目标路径，含进度日志
 
@@ -176,6 +215,9 @@ async def _download_file(url: str, dest: Path, task_id: str = "", timeout: float
     O5: 支持 HTTP Range 断点续传，大文件失败后可从已下载位置继续。
     """
     dest_part = dest.with_suffix(dest.suffix + ".part")
+    if not is_safe_download_url(url):
+        logger.warning("[Download] 拒绝不安全下载 URL（SSRF 防护）: %s", (url or "")[:120])
+        return False
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",

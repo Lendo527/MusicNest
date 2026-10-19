@@ -242,6 +242,11 @@ class ConversationMonitor:
         messages = await self._client.get_latest_ask(device_id, hardware, limit=5)
 
         if not messages:
+            # 首拉为空也要置 _initialized：否则设备启动时没说过话，
+            # 之后第一条真实语音指令会被当历史消息吞掉（每次重启都重现）
+            if not self._initialized.get(device_id, False):
+                self._initialized[device_id] = True
+                self._last_timestamps[device_id] = 0
             return
 
         # 首次拉取：只更新 _last_timestamps，不触发回调
