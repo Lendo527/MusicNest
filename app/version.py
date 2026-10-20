@@ -7,6 +7,22 @@ app/main.py 和 build_oci.py 也从本文件读取；
 每次发版只需修改本文件的 __version__ 和下方版本历史注释。
 
 版本历史：
+  0.0.92 - 第四轮收尾修复(seek边界clamp+代理域名白名单):
+           seek边界clamp:
+             main.py: api_player_seek 的 position 增加 int 类型转换 + clamp 到
+                      [0,duration],duration 未知(<=0)时拒绝跳转(原直接
+                      body.get("position",0) 透传,负数/超大值/非数值会下发给音箱);
+             main.py: 语音快进 pos=info["position"]+seconds 增加上界 clamp
+                      (duration>0 时 min(pos,duration)),原仅后退做了 max(0,...),
+                      快进无上界;
+             index.html: seekTo 入口统一 clamp position 到 [0,duration],duration 未知
+                       (None/0/NaN)按 0 处理,原直接信任 pct*currentDuration,时长异常
+                       时可能传 NaN/负数给后端;
+           代理域名白名单:
+             main.py: 新增 _is_allowed_proxy_host() 校验 /api/music/proxy 代理目标
+                      域名属于已知音源 CDN 白名单(酷我/网易云)且拒绝内网地址,
+                      原代理 URL 未校验域名且 follow_redirects=True,网关被污染时
+                      可被打成 SSRF 跳板;重定向逐跳校验(httpx request hook);
   0.0.91 - 第三轮审阅修复(安全+日志红线):
            安全:
              index.html: 3 处 coverSrc 加 escAttr(封面URL来自第三方网关,原裸拼进
@@ -1044,4 +1060,4 @@ app/main.py 和 build_oci.py 也从本文件读取；
 # F14: 语音指令自然语言增强 — "这是什么歌"(播报当前歌曲)、"快进30秒"/"后退10秒"(seek)、
 #   "回到开头"(重播)、"播放XX的歌"(按歌手搜索本地库播放)。
 
-__version__ = "0.0.91"
+__version__ = "0.0.92"

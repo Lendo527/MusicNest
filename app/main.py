@@ -302,6 +302,51 @@ KUWO_HEADERS = {
     "Referer": "http://www.kuwo.cn/",
 }
 
+# ===== 代理目标域名白名单（SSRF 纵深防御）=====
+# /api/music/proxy 只代理在线播放 URL（酷我 CDN + 网易云 CDN），域名必须命中白名单。
+# 网关搜索结果虽非前端直传，但若被污染或存在开放重定向，代理可被打成 SSRF 跳板，
+# 因此对初始 URL 与每一跳重定向都做域名校验。
+_PROXY_ALLOWED_HOSTS = (
+    "kuwo.cn", "kuwo.com",        # 酷我 API/CDN（mobi.kuwo.cn / antiserver.kuwo.cn 等）
+    "music.163.com", "163.com",   # 网易云 CDN
+    "126.net", "127.net",         # 网易云 CDN（m7/p2.music.126.net 等）
+)
+_PROXY_PRIVATE_PREFIXES = (
+    "127.", "10.", "192.168.", "169.254.", "0.", "localhost", "::1",
+    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+    "172.28.", "172.29.", "172.30.", "172.31.",
+)
+
+
+def _is_allowed_proxy_host(url: str) -> bool:
+    """校验代理目标 URL：仅 http/https 且 host 属于已知音源 CDN 白名单，拒绝内网地址。"""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        from urllib.parse import urlsplit
+        u = urlsplit(url.strip())
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https"):
+        return False
+    host = (u.hostname or "").lower()
+    if not host:
+        return False
+    if host.startswith(_PROXY_PRIVATE_PREFIXES):
+        return False
+    return any(host == h or host.endswith("." + h) for h in _PROXY_ALLOWED_HOSTS)
+
+
+async def _validate_proxy_request_hook(request: httpx.Request) -> None:
+    """httpx request 事件钩子：代理发起的每一跳请求（含重定向）域名都必须在白名单内。
+
+    AsyncClient 会 await 该钩子，因此必须是 async 函数。
+    """
+    if not _is_allowed_proxy_host(str(request.url)):
+        raise httpx.RequestError(f"代理目标域名不在白名单: {request.url.host}")
+
+
 # 共享 httpx 客户端（复用连接池，避免每次代理请求都新建 TCP 连接）
 _proxy_client: Optional[httpx.AsyncClient] = None
 
@@ -313,6 +358,7 @@ async def _get_proxy_client() -> httpx.AsyncClient:
         _proxy_client = httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=15.0),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            event_hooks={"request": [_validate_proxy_request_hook]},
         )
     return _proxy_client
 
@@ -1018,6 +1064,11 @@ async def _on_voice_message(device_id: str, msg: dict, _claimed: bool = False) -
                     if progress_resp:
                         info = _parse_player_info(progress_resp)
                         pos = info["position"] + seconds
+                        # 上界 clamp：快进不能越过歌曲时长（duration 未知时不做上界限制）
+                        duration = info.get("duration", 0)
+                        if duration and duration > 0:
+                            pos = min(pos, duration)
+                        pos = max(0, pos)
                         await miot_client.seek(play_state.device_id, int(pos))
                         logger.info(f"[VoiceCmd] 快进 {seconds}s -> pos={int(pos)}s")
                 except Exception as e:
@@ -2581,6 +2632,12 @@ async def api_music_proxy(url_hash: str) -> Response:
     # 更新访问时间，避免 LRU 驱逐正在播放的 URL
     _online_urls.move_to_end(url_hash)
 
+    # SSRF 纵深防御：代理目标 URL 域名必须在已知音源 CDN 白名单内
+    # （重定向由 _validate_proxy_request_hook 逐跳校验）
+    if not _is_allowed_proxy_host(kuwo_url):
+        logger.warning(f"[API] /api/music/proxy 拒绝非白名单域名: {kuwo_url[:100]}")
+        return JSONResponse({"code": 1, "msg": "代理目标域名不在白名单"}, status_code=403)
+
     # 使用共享客户端复用连接池（不在请求结束时关闭）
     client = await _get_proxy_client()
     try:
@@ -3692,9 +3749,17 @@ async def api_lyrics_file(filepath: str) -> dict:
 @app.post("/api/player/seek")
 async def api_player_seek(body: dict) -> dict:
     """跳转到指定位置"""
-    position = body.get("position", 0)
     if not play_state.device_id:
         return {"code": 1, "msg": "没有活动的播放设备"}
+    try:
+        position = int(body.get("position", 0))
+    except (TypeError, ValueError):
+        return {"code": 1, "msg": "position 必须是整数"}
+    # seek 边界 clamp：duration 未知(<=0)时拒绝跳转，已知时 clamp 到 [0, duration]，
+    # 避免负数/超大值下发给音箱被拒或行为异常
+    if play_state.duration <= 0:
+        return {"code": 1, "msg": "歌曲时长未知，无法跳转"}
+    position = max(0, min(position, play_state.duration))
     try:
         client = await _check_miot()
         ok = await client.seek(play_state.device_id, position)

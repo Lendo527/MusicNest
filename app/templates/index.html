@@ -2415,6 +2415,9 @@ function seekProgress(event) {
 
 let _seekDebounceTimer = null;
 function seekTo(seconds) {
+    // seek 边界 clamp：position 必须落在 [0, duration]，duration 未知(NaN/0/负)按 0 处理，
+    // 防止 NaN/负数/超大值下发给后端或播放器
+    seconds = Math.max(0, Math.min(Number(seconds) || 0, currentDuration > 0 ? currentDuration : 0));
     // 立即更新本地UI，让用户即时看到进度变化
     localPosition = seconds;
     updateProgress(seconds, currentDuration);
